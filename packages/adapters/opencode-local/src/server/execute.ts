@@ -216,6 +216,11 @@ export async function prepareOpenCodeSkillIsolation(
     await fs.mkdir(skillsDir, { recursive: true });
     const { denied, included } = selectOpenCodeSkills(entries, desired);
     for (const entry of included) {
+      try {
+        await fs.access(path.join(entry.source, "SKILL.md"));
+      } catch {
+        throw new Error(`OpenCode skill source unavailable: ${entry.runtimeName}`);
+      }
       await fs.symlink(entry.source, path.join(skillsDir, entry.runtimeName));
     }
     const home = env.HOME ?? process.env.HOME ?? os.homedir();

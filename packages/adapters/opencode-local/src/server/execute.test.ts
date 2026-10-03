@@ -254,6 +254,118 @@ describe("OpenCode local skill injection", () => {
     }
   }, 60000);
 
+  it("exercises the real OpenCode skill loader for assigned, bundled, and denied names", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-real-loader-"));
+    const home = path.join(root, "home");
+    const workspace = path.join(root, "workspace");
+    const add = async (name: string) => {
+      const directory = path.join(root, "sources", name);
+      await fs.mkdir(directory, { recursive: true });
+      await fs.writeFile(path.join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: Test ${name}\n---\nLoader marker for ${name}\n`);
+      return directory;
+    };
+    try {
+      await fs.mkdir(workspace, { recursive: true });
+      const entries = await Promise.all(["assigned", "unassigned", "bundled"].map(async (name) => ({
+        key: name, runtimeName: name, source: await add(name),
+      })));
+      const isolated = await prepareOpenCodeSkillIsolation({ HOME: home }, entries, ["assigned", "bundled"]);
+      try {
+        const env = {
+          ...process.env,
+          HOME: home,
+          XDG_CONFIG_HOME: path.join(root, "xdg-config"),
+          XDG_DATA_HOME: path.join(root, "xdg-data"),
+          XDG_CACHE_HOME: path.join(root, "xdg-cache"),
+          XDG_STATE_HOME: path.join(root, "xdg-state"),
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+          ...isolated.env,
+        };
+        const prompt = "Call the skill tool once for assigned, once for bundled, and once for unassigned. Do not use another tool. Report each tool result.";
+        const output = execFileSync("opencode", ["run", "--pure", "--format", "json", "--model", "opencode/longcat-2.5-preview-free", prompt], {
+          cwd: workspace, env, encoding: "utf8", timeout: 120000,
+        });
+        const events = output.trim().split("\n").map((line) => JSON.parse(line) as {
+          type: string; part?: { tool?: string; state?: { input?: { name?: string }; output?: string; error?: string } };
+        });
+        const skillCalls = events.filter((event) => event.type === "tool_use" && event.part?.tool === "skill");
+        const result = (name: string) => skillCalls.find((event) => event.part?.state?.input?.name === name)?.part?.state;
+        expect(result("assigned")?.output).toContain("Loader marker for assigned");
+        expect(result("bundled")?.output).toContain("Loader marker for bundled");
+        expect(result("unassigned")?.output ?? "").not.toContain("Loader marker for unassigned");
+        expect(result("unassigned")?.error).toBeTruthy();
+      } finally {
+        await isolated.cleanup();
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 150000);
+
+  it("fails closed before OpenCode execution for invalid config and missing assigned source", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-fail-closed-"));
+    try {
+      for (const [env, entries, desired, error] of [
+        [{ OPENCODE_CONFIG_CONTENT: "{" }, [], [], SyntaxError],
+        [{}, [{ key: "missing", runtimeName: "missing", source: path.join(root, "absent") }], ["missing"], /OpenCode skill source unavailable: missing/],
+      ] as const) {
+        await expect(prepareOpenCodeSkillIsolation(env, [...entries], [...desired])).rejects.toThrow(error);
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not invoke OpenCode when an assigned source is missing", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-missing-source-"));
+    runProcessMock.mockReset();
+    try {
+      await expect(execute({
+        runId: "missing-source-run",
+        agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          cwd: root, model: "opencode/longcat-2.5-preview-free",
+          paperclipRuntimeSkills: [{ key: "missing", runtimeName: "missing", source: path.join(root, "absent") }],
+          paperclipSkillSync: { desiredSkills: ["missing"] },
+        },
+        context: {},
+        onLog: async () => {},
+      })).rejects.toThrow("OpenCode skill source unavailable: missing");
+      expect(runProcessMock).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the real OpenCode startup on invalid isolated config", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-invalid-config-"));
+    try {
+      const isolated = await prepareOpenCodeSkillIsolation({
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ skills: { paths: 42 } }),
+      }, [], []);
+      try {
+        const env = {
+          ...process.env,
+          HOME: root,
+          XDG_CONFIG_HOME: path.join(root, "xdg-config"),
+          XDG_DATA_HOME: path.join(root, "xdg-data"),
+          XDG_CACHE_HOME: path.join(root, "xdg-cache"),
+          XDG_STATE_HOME: path.join(root, "xdg-state"),
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+          ...isolated.env,
+        };
+        expect(() => execFileSync("opencode", ["debug", "skill", "--pure"], {
+          cwd: root, env, encoding: "utf8", timeout: 20000, stdio: "pipe",
+        })).toThrow();
+      } finally {
+        await isolated.cleanup();
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 30000);
+
   it("retains a string default permission when adding skill denials", async () => {
     const isolated = await prepareOpenCodeSkillIsolation({ OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: "allow" }) }, [
       { key: "excluded", runtimeName: "excluded", source: "/unused" },
