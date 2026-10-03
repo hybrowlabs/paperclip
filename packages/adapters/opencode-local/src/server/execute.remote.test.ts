@@ -240,6 +240,9 @@ describe("opencode remote execution", () => {
      expect(call?.[3].env.OPENCODE_CONFIG_DIR).toBe(path.posix.dirname(remoteSkillsDir));
      expect(modelProbeCall?.[3].env.OPENCODE_CONFIG_DIR).toBe(path.posix.dirname(remoteSkillsDir));
      expect(JSON.parse(call?.[3].env.OPENCODE_CONFIG_CONTENT ?? "{}").permission.skill).toBeDefined();
+     expect(call?.[3].env.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe("1");
+     expect(call?.[3].env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS).toBe("1");
+     expect(modelProbeCall?.[3].env.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe("1");
      if (managed) {
        const home = `${managedRemoteWorkspace}/.paperclip-runtime/opencode/managed-auth/run-1`;
        expect(call?.[3].env.HOME).toBe(home);

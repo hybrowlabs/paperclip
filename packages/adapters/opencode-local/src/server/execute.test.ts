@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
@@ -193,6 +194,65 @@ describe("OpenCode local skill injection", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  it("hides stale HOME and adjacent project skills from real OpenCode discovery and load", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-real-discovery-"));
+    const home = path.join(root, "home");
+    const workspace = path.join(root, "project", "workspace");
+    const skillText = (name: string) => `---\nname: ${name}\ndescription: Test ${name}\n---\nSecret marker for ${name}\n`;
+    const add = async (directory: string, name: string) => {
+      const skill = path.join(directory, name);
+      await fs.mkdir(skill, { recursive: true });
+      await fs.writeFile(path.join(skill, "SKILL.md"), skillText(name));
+      return skill;
+    };
+    try {
+      await fs.mkdir(workspace, { recursive: true });
+      const allowed = await add(path.join(root, "sources"), "assigned");
+      await add(path.join(home, ".claude", "skills"), "unassigned");
+      await add(path.join(home, ".claude", "skills"), "personal");
+      await add(path.join(home, ".agents", "skills"), "stale-agent");
+      await add(path.join(root, "project", ".claude", "skills"), "adjacent");
+      await add(path.join(root, "project", ".agents", "skills"), "adjacent-agent");
+      const isolated = await prepareOpenCodeSkillIsolation({ HOME: home }, [
+        { key: "assigned", runtimeName: "assigned", source: allowed },
+        { key: "unassigned", runtimeName: "unassigned", source: path.join(home, ".claude", "skills", "unassigned") },
+      ], ["assigned"], true);
+      try {
+        const baseEnv = {
+          ...process.env,
+          HOME: home,
+          XDG_CONFIG_HOME: path.join(root, "xdg-config"),
+          XDG_DATA_HOME: path.join(root, "xdg-data"),
+          XDG_CACHE_HOME: path.join(root, "xdg-cache"),
+          XDG_STATE_HOME: path.join(root, "xdg-state"),
+          ...isolated.env,
+        };
+        const discover = (env: NodeJS.ProcessEnv) => JSON.parse(execFileSync("opencode", ["debug", "skill", "--pure"], {
+          cwd: workspace, env, encoding: "utf8", timeout: 20000,
+        })) as Array<{ name: string; content: string; location: string }>;
+        const unsafe = discover({ ...baseEnv, OPENCODE_DISABLE_EXTERNAL_SKILLS: "0", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "0" });
+        expect(unsafe.some((skill) => skill.name === "unassigned" && skill.content.includes("Secret marker"))).toBe(true);
+        const visible = discover(baseEnv);
+        expect(visible.find((skill) => skill.name === "assigned")?.content).toContain("Secret marker for assigned");
+        expect(visible.find((skill) => skill.name === "personal")?.content).toContain("Secret marker for personal");
+        expect(visible.find((skill) => skill.name === "stale-agent")?.content).toContain("Secret marker for stale-agent");
+        for (const name of ["unassigned", "adjacent", "adjacent-agent"]) {
+          expect(visible.some((skill) => skill.name === name)).toBe(false);
+          expect(JSON.stringify(visible)).not.toContain(`Secret marker for ${name}`);
+        }
+        const config = JSON.parse(execFileSync("opencode", ["debug", "config", "--pure"], {
+          cwd: workspace, env: baseEnv, encoding: "utf8", timeout: 20000,
+        })) as { permission: { skill: Record<string, string> } };
+        expect(config.permission.skill.unassigned).toBe("deny");
+        expect(config.permission.skill.assigned).not.toBe("deny");
+      } finally {
+        await isolated.cleanup();
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 60000);
 
   it("retains a string default permission when adding skill denials", async () => {
     const isolated = await prepareOpenCodeSkillIsolation({ OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: "allow" }) }, [

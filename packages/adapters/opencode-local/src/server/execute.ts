@@ -207,6 +207,7 @@ export async function prepareOpenCodeSkillIsolation(
   env: Record<string, string>,
   entries: Array<{ key: string; runtimeName: string; source: string; sourceStatus?: "available" | "missing" }>,
   desired: string[],
+  includePersonal = false,
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-skills-"));
   const configDir = path.join(root, "config");
@@ -217,12 +218,33 @@ export async function prepareOpenCodeSkillIsolation(
     for (const entry of included) {
       await fs.symlink(entry.source, path.join(skillsDir, entry.runtimeName));
     }
+    const home = env.HOME ?? process.env.HOME ?? os.homedir();
+    for (const personalDir of includePersonal ? [path.join(home, ".claude", "skills"), path.join(home, ".agents", "skills")] : []) {
+      let personal: string[];
+      try {
+        personal = await fs.readdir(personalDir);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      for (const name of personal) {
+        if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || denied.has(name)) continue;
+        const target = path.join(skillsDir, name);
+        try {
+          await fs.symlink(path.join(personalDir, name), target);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+      }
+    }
     return {
       root,
       configDir,
       skillsDir,
       env: {
         OPENCODE_CONFIG_DIR: configDir,
+        OPENCODE_DISABLE_EXTERNAL_SKILLS: "1",
+        OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1",
         OPENCODE_CONFIG_CONTENT: buildOpenCodeSkillConfigContent(env, denied),
       },
       cleanup: () => fs.rm(root, { recursive: true, force: true }),
@@ -340,6 +362,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         preparedRuntimeConfig.env,
         openCodeSkillEntries,
         desiredOpenCodeSkillNames,
+        true,
       );
       Object.assign(preparedRuntimeConfig.env, isolatedSkills.env);
     }
@@ -404,6 +427,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         preparedRuntimeConfig.env,
         openCodeSkillEntries,
         desiredOpenCodeSkillNames,
+        false,
       );
       await onLog(
         "stdout",
@@ -477,7 +501,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           });
       if (preparedExecutionTargetRuntime.assetDirs.skills) {
         preparedRuntimeConfig.env.OPENCODE_CONFIG_DIR = path.posix.dirname(preparedExecutionTargetRuntime.assetDirs.skills);
-        preparedRuntimeConfig.env.OPENCODE_CONFIG_CONTENT = isolatedSkills.env.OPENCODE_CONFIG_CONTENT;
+        Object.assign(preparedRuntimeConfig.env, isolatedSkills.env, {
+          OPENCODE_CONFIG_DIR: path.posix.dirname(preparedExecutionTargetRuntime.assetDirs.skills),
+        });
       }
       if (remoteHomeDir) {
         preparedRuntimeConfig.env.HOME ??= remoteHomeDir;
