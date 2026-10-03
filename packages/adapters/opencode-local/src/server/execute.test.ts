@@ -8,7 +8,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) =>
   return { ...actual, runAdapterExecutionTargetProcess: vi.fn() };
 });
 
-import { ensureRemoteOpenCodeModelConfiguredAndAvailable, execute } from "./execute.js";
+import { ensureRemoteOpenCodeModelConfiguredAndAvailable, execute, prepareOpenCodeSkillIsolation } from "./execute.js";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 
 const runProcessMock = vi.mocked(runAdapterExecutionTargetProcess);
@@ -140,13 +140,116 @@ describe("OpenCode local skill injection", () => {
       });
 
       expect(result.exitCode).toBe(0);
-      const installedSkill = path.join(configuredHome, ".claude", "skills", "paperclip");
-      expect((await fs.lstat(installedSkill)).isSymbolicLink()).toBe(true);
-      expect(await fs.realpath(installedSkill)).toBe(await fs.realpath(skillSource));
+      const call = runProcessMock.mock.calls.at(-1)!;
+      const invocationEnv = (call[4] as { env: Record<string, string> }).env;
+      expect(invocationEnv.HOME).toBe(configuredHome);
+      expect(invocationEnv.OPENCODE_CONFIG_DIR).toContain("paperclip-opencode-skills-");
+      await expect(fs.lstat(path.join(configuredHome, ".claude", "skills", "paperclip"))).rejects.toThrow();
       await expect(fs.lstat(path.join(processHome, ".claude", "skills", "paperclip"))).rejects.toThrow();
+      await expect(fs.access(invocationEnv.OPENCODE_CONFIG_DIR)).rejects.toThrow();
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("isolates four agents' selections across runs without altering personal skills", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-isolation-"));
+    const names = Array.from({ length: 16 }, (_, index) => `skill-${index.toString().padStart(2, "0")}`);
+    try {
+      const entries = await Promise.all(names.map(async (name) => ({
+        key: name,
+        runtimeName: name,
+        source: await createSkillDir(root, name),
+      })));
+      const personalHome = path.join(root, "home");
+      const personal = await createSkillDir(path.join(personalHome, ".claude", "skills"), "personal");
+      const selections = [
+        ["Warden", names.slice(0, 14)],
+        ["Sentinel", names.slice(0, 3)],
+        ["Atlas", names.slice(0, 4)],
+        ["Compass", names.slice(0, 2)],
+      ] as const;
+      for (const [agent, selected] of selections) {
+        const isolated = await prepareOpenCodeSkillIsolation({}, entries, selected);
+        try {
+          const visible = await fs.readdir(isolated.skillsDir);
+          expect(visible.sort(), agent).toEqual([...selected].sort());
+          for (const name of names) {
+            if (selected.includes(name)) expect(await fs.realpath(path.join(isolated.skillsDir, name))).toBe(await fs.realpath(path.join(root, name)));
+            else await expect(fs.lstat(path.join(isolated.skillsDir, name))).rejects.toThrow();
+          }
+          const policy = JSON.parse(isolated.env.OPENCODE_CONFIG_CONTENT).permission.skill;
+          expect(Object.keys(policy).sort()).toEqual(names.filter((name) => !selected.includes(name)).sort());
+          expect(Object.values(policy)).toEqual(Array(names.length - selected.length).fill("deny"));
+          expect(await fs.readFile(path.join(personal, "SKILL.md"), "utf8")).toContain("personal");
+        } finally {
+          await isolated.cleanup();
+          await expect(fs.access(isolated.root)).rejects.toThrow();
+        }
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains a string default permission when adding skill denials", async () => {
+    const isolated = await prepareOpenCodeSkillIsolation({ OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: "allow" }) }, [
+      { key: "excluded", runtimeName: "excluded", source: "/unused" },
+    ], []);
+    try {
+      expect(JSON.parse(isolated.env.OPENCODE_CONFIG_CONTENT).permission).toEqual({ "*": "allow", skill: { excluded: "deny" } });
+    } finally {
+      await isolated.cleanup();
+    }
+  });
+
+  it("denies excluded and missing skills despite stale shared-home links without changing that home", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-shared-home-"));
+    try {
+      const homeSkills = path.join(root, "home", ".claude", "skills");
+      await fs.mkdir(homeSkills, { recursive: true });
+      const included = await createSkillDir(root, "included");
+      const excluded = await createSkillDir(root, "excluded");
+      const stale = path.join(homeSkills, "excluded");
+      await fs.symlink(excluded, stale);
+      const isolated = await prepareOpenCodeSkillIsolation({}, [
+        { key: "included", runtimeName: "included", source: included },
+        { key: "excluded", runtimeName: "excluded", source: excluded },
+        { key: "missing", runtimeName: "missing", source: path.join(root, "missing"), sourceStatus: "missing" },
+      ], ["included", "missing"]);
+      try {
+        expect(await fs.readdir(isolated.skillsDir)).toEqual(["included"]);
+        expect(path.join(isolated.env.OPENCODE_CONFIG_DIR, "skills")).toBe(isolated.skillsDir);
+        expect(JSON.parse(isolated.env.OPENCODE_CONFIG_CONTENT).permission.skill).toEqual({ excluded: "deny", missing: "deny" });
+        expect(await fs.readlink(stale)).toBe(excluded);
+      } finally {
+        await isolated.cleanup();
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains inline settings while denying excluded skills, including when permissions are skipped", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-inline-"));
+    try {
+      const entries = await Promise.all(["included", "excluded"].map(async (name) => ({
+        key: name, runtimeName: name, source: await createSkillDir(root, name),
+      })));
+      const isolated = await prepareOpenCodeSkillIsolation({
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { custom: {} }, permission: { skill: { excluded: "allow", personal: "allow" } } }),
+      }, entries, ["included"]);
+      try {
+        const inline = JSON.parse(isolated.env.OPENCODE_CONFIG_CONTENT);
+        expect(inline.provider).toEqual({ custom: {} });
+        expect(inline.permission.skill).toEqual({ excluded: "deny", personal: "allow" });
+        expect(await fs.readdir(isolated.skillsDir)).toEqual(["included"]);
+      } finally {
+        await isolated.cleanup();
+      }
+    } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
