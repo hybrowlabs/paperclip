@@ -216,11 +216,7 @@ describe("opencode remote execution", () => {
       remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/opencode/skills`,
       followSymlinks: true,
     }));
-    expect(runSshCommand).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.stringContaining(".claude/skills"),
-      expect.anything(),
-    );
+     expect(runSshCommand.mock.calls.some((entry) => String((entry as unknown as unknown[])[1]).includes(".claude/skills"))).toBe(false);
     const runCall = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run")) as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
@@ -240,17 +236,16 @@ describe("opencode remote execution", () => {
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
-    if (managed) {
-      const home = `${managedRemoteWorkspace}/.paperclip-runtime/opencode/managed-auth/run-1`;
-      expect(call?.[3].env.HOME).toBe(home);
-      expect(call?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
-      expect(modelProbeCall?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
-      expect(runSshCommand).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.stringContaining(`${home}/.claude/skills`),
-        expect.anything(),
-      );
-    }
+     const remoteSkillsDir = `${managedRemoteWorkspace}/.paperclip-runtime/opencode/skills`;
+     expect(call?.[3].env.OPENCODE_CONFIG_DIR).toBe(path.posix.dirname(remoteSkillsDir));
+     expect(modelProbeCall?.[3].env.OPENCODE_CONFIG_DIR).toBe(path.posix.dirname(remoteSkillsDir));
+     expect(JSON.parse(call?.[3].env.OPENCODE_CONFIG_CONTENT ?? "{}").permission.skill).toBeDefined();
+     if (managed) {
+       const home = `${managedRemoteWorkspace}/.paperclip-runtime/opencode/managed-auth/run-1`;
+       expect(call?.[3].env.HOME).toBe(home);
+       expect(call?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
+       expect(modelProbeCall?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
+     }
     expect(JSON.parse(call?.[3].env.PAPERCLIP_WORKSPACES_JSON ?? "[]")).toEqual([
       {
         workspaceId: "workspace-1",
@@ -270,6 +265,46 @@ describe("opencode remote execution", () => {
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves remote inline config and denies excluded or missing skills", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-policy-"));
+    cleanupDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const included = path.join(root, "included");
+    await mkdir(workspace);
+    await mkdir(included);
+    await execute({
+      runId: "run-remote-policy",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "opencode", model: "opencode/gpt-5-nano", dangerouslySkipPermissions: false,
+        env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({ provider: { custom: {} }, permission: { skill: { excluded: "allow", personal: "allow" } } }) },
+        paperclipRuntimeSkills: [
+          { key: "included", runtimeName: "included", source: included },
+          { key: "excluded", runtimeName: "excluded", source: included },
+          { key: "missing", runtimeName: "missing", source: path.join(root, "missing"), sourceStatus: "missing" },
+        ],
+        paperclipSkillSync: { desiredSkills: ["included", "missing"] },
+      },
+      context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
+      executionTransport: { remoteExecution: {
+        host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/remote/workspace",
+        remoteCwd: "/remote/workspace", privateKey: "PRIVATE KEY",
+        knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
+      } },
+      onLog: async () => {},
+    });
+    const runCall = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run")) as unknown as
+      [string, string, string[], { env: Record<string, string> }] | undefined;
+    expect(runCall).toBeDefined();
+    const env = runCall![3].env;
+    const content = JSON.parse(env.OPENCODE_CONFIG_CONTENT);
+    expect(content.provider).toEqual({ custom: {} });
+    expect(content.permission.skill).toMatchObject({ excluded: "deny", missing: "deny", personal: "allow" });
+    expect(env.OPENCODE_CONFIG_DIR).toBe("/remote/workspace/.paperclip-runtime/runs/run-remote-policy/workspace/.paperclip-runtime/opencode");
+    expect(runSshCommand.mock.calls.some((entry) => String((entry as unknown as unknown[])[1]).includes(".claude/skills"))).toBe(false);
   });
 
   it("fails before the remote run when the configured model is unavailable on the SSH target", async () => {

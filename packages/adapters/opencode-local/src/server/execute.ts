@@ -23,7 +23,6 @@ import {
   resolveAdapterExecutionTargetTimeoutSec,
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
-  runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
@@ -36,7 +35,6 @@ import {
   joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
-  ensurePaperclipSkillSymlink,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
@@ -58,10 +56,8 @@ import {
   parseOpenCodeModelsOutput,
   requireOpenCodeModelId,
 } from "./models.js";
-import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
-import { resolveOpenCodeSkillsHome } from "./skills.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -169,56 +165,72 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   }
 }
 
-async function ensureOpenCodeSkillsInjected(
-  onLog: AdapterExecutionContext["onLog"],
-  skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
-  desiredSkillNames?: string[],
-  skillsHome = resolveOpenCodeSkillsHome({}),
-) {
-  await fs.mkdir(skillsHome, { recursive: true });
-  const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
-  const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
-  const removedSkills = await removeMaintainerOnlySkillSymlinks(
-    skillsHome,
-    selectedEntries.map((entry) => entry.runtimeName),
-  );
-  for (const skillName of removedSkills) {
-    await onLog(
-      "stderr",
-      `[paperclip] Removed maintainer-only OpenCode skill "${skillName}" from ${skillsHome}\n`,
-    );
+function buildOpenCodeSkillConfigContent(env: Record<string, string>, denied: Set<string>): string {
+  const existingContent = env.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT;
+  const parsed = existingContent ? JSON.parse(existingContent) as unknown : {};
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("OPENCODE_CONFIG_CONTENT must be a JSON object for skill isolation.");
   }
-  for (const entry of selectedEntries) {
-    const target = path.join(skillsHome, entry.runtimeName);
-
-    try {
-      const result = await ensurePaperclipSkillSymlink(entry.source, target);
-      if (result === "skipped") continue;
-      await onLog(
-        "stderr",
-        `[paperclip] ${result === "repaired" ? "Repaired" : "Injected"} OpenCode skill "${entry.key}" into ${skillsHome}\n`,
-      );
-    } catch (err) {
-      await onLog(
-        "stderr",
-        `[paperclip] Failed to inject OpenCode skill "${entry.key}" into ${skillsHome}: ${err instanceof Error ? err.message : String(err)}\n`,
-      );
-    }
-  }
+  const content = parsed as Record<string, unknown>;
+  const permission = typeof content.permission === "object" && content.permission !== null && !Array.isArray(content.permission)
+    ? content.permission as Record<string, unknown>
+    : typeof content.permission === "string" ? { "*": content.permission } : {};
+  const skill = typeof permission.skill === "object" && permission.skill !== null && !Array.isArray(permission.skill)
+    ? permission.skill as Record<string, unknown> : {};
+  return JSON.stringify({
+    ...content,
+    permission: { ...permission, skill: { ...skill, ...Object.fromEntries([...denied].sort().map((name) => [name, "deny"])) } },
+  });
 }
 
-async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<string> {
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-skills-"));
-  const target = path.join(tmp, "skills");
-  await fs.mkdir(target, { recursive: true });
-  const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredNames = new Set(resolveLegacyPaperclipDesiredSkillNames(config, availableEntries));
-  for (const entry of availableEntries) {
-    if (!desiredNames.has(entry.key)) continue;
-    if (isPaperclipSkillSourceMissing(entry)) continue;
-    await fs.symlink(entry.source, path.join(target, entry.runtimeName));
+function selectOpenCodeSkills(
+  entries: Array<{ key: string; runtimeName: string; source: string; sourceStatus?: "available" | "missing" }>,
+  desired: string[],
+) {
+  const selected = new Set(desired);
+  const denied = new Set<string>();
+  const included: typeof entries = [];
+  for (const entry of entries) {
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(entry.runtimeName)) {
+      throw new Error(`Invalid OpenCode skill name: ${entry.runtimeName}`);
+    }
+    if (!selected.has(entry.key) || isPaperclipSkillSourceMissing(entry)) {
+      denied.add(entry.runtimeName);
+    } else {
+      included.push(entry);
+    }
   }
-  return target;
+  return { denied, included };
+}
+
+export async function prepareOpenCodeSkillIsolation(
+  env: Record<string, string>,
+  entries: Array<{ key: string; runtimeName: string; source: string; sourceStatus?: "available" | "missing" }>,
+  desired: string[],
+) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-skills-"));
+  const configDir = path.join(root, "config");
+  const skillsDir = path.join(configDir, "skills");
+  try {
+    await fs.mkdir(skillsDir, { recursive: true });
+    const { denied, included } = selectOpenCodeSkills(entries, desired);
+    for (const entry of included) {
+      await fs.symlink(entry.source, path.join(skillsDir, entry.runtimeName));
+    }
+    return {
+      root,
+      configDir,
+      skillsDir,
+      env: {
+        OPENCODE_CONFIG_DIR: configDir,
+        OPENCODE_CONFIG_CONTENT: buildOpenCodeSkillConfigContent(env, denied),
+      },
+      cleanup: () => fs.rm(root, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    await fs.rm(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -260,14 +272,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const openCodeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredOpenCodeSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, openCodeSkillEntries);
-  if (!executionTargetIsRemote) {
-    await ensureOpenCodeSkillsInjected(
-      onLog,
-      openCodeSkillEntries,
-      desiredOpenCodeSkillNames,
-      resolveOpenCodeSkillsHome(config),
-    );
-  }
 
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = {
@@ -328,6 +332,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     env.PAPERCLIP_API_KEY = authToken;
   }
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  let isolatedSkills: Awaited<ReturnType<typeof prepareOpenCodeSkillIsolation>> | null = null;
+  try {
+    if (!executionTargetIsRemote) {
+      isolatedSkills = await prepareOpenCodeSkillIsolation(
+        preparedRuntimeConfig.env,
+        openCodeSkillEntries,
+        desiredOpenCodeSkillNames,
+      );
+      Object.assign(preparedRuntimeConfig.env, isolatedSkills.env);
+    }
+  } catch (error) {
+    await preparedRuntimeConfig.cleanup();
+    throw error;
+  }
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
@@ -377,12 +395,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return asStringArray(config.args);
     })();
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
-    let localSkillsDir: string | null = null;
     let remoteRuntimeRootDir: string | null = null;
     let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
     if (executionTarget?.kind === "remote") {
-      localSkillsDir = await buildOpenCodeSkillsDir(config);
+      isolatedSkills = await prepareOpenCodeSkillIsolation(
+        preparedRuntimeConfig.env,
+        openCodeSkillEntries,
+        desiredOpenCodeSkillNames,
+      );
       await onLog(
         "stdout",
         `[paperclip] Syncing workspace and OpenCode runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
@@ -400,7 +421,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         assets: [
           {
             key: "skills",
-            localDir: localSkillsDir,
+            localDir: isolatedSkills.skillsDir,
             followSymlinks: true,
           },
           ...(localRuntimeConfigHome
@@ -453,14 +474,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             graceSec,
             onLog,
           });
-      if (remoteHomeDir && preparedExecutionTargetRuntime.assetDirs.skills) {
-        const remoteSkillsDir = path.posix.join(remoteHomeDir, ".claude", "skills");
-        await runAdapterExecutionTargetShellCommand(
-          runId,
-          executionTarget,
-          `mkdir -p ${JSON.stringify(path.posix.dirname(remoteSkillsDir))} && rm -rf ${JSON.stringify(remoteSkillsDir)} && cp -a ${JSON.stringify(preparedExecutionTargetRuntime.assetDirs.skills)} ${JSON.stringify(remoteSkillsDir)}`,
-          { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
-        );
+      if (preparedExecutionTargetRuntime.assetDirs.skills) {
+        preparedRuntimeConfig.env.OPENCODE_CONFIG_DIR = path.posix.dirname(preparedExecutionTargetRuntime.assetDirs.skills);
+        preparedRuntimeConfig.env.OPENCODE_CONFIG_CONTENT = isolatedSkills.env.OPENCODE_CONFIG_CONTENT;
+      }
+      if (remoteHomeDir) {
+        preparedRuntimeConfig.env.HOME ??= remoteHomeDir;
       }
       await ensureRemoteOpenCodeModelConfiguredAndAvailable({
         runId,
@@ -765,11 +784,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await Promise.all([
           paperclipBridge?.stop(),
           restoreRemoteWorkspace?.(),
-          localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
         ]);
       }
     }
   } finally {
-    await preparedRuntimeConfig.cleanup();
+    await Promise.all([preparedRuntimeConfig.cleanup(), isolatedSkills?.cleanup()]);
   }
 }
