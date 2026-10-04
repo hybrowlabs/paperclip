@@ -277,6 +277,8 @@ export interface IssueWakeDiagnosticWakeRequest {
   claimedAt: string | null;
   finishedAt: string | null;
   failureClass: IssueWakeDiagnosticWakeFailureClass | null;
+  /** Fixed cause code when the wake is waiting on an execution gate (for example `execution_owner_active`). */
+  waitCause?: string | null;
 }
 
 export interface IssueWakeDiagnosticActivityRecord {

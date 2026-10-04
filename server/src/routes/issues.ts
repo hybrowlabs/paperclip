@@ -1,4 +1,4 @@
-import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { retryNativeWorkspaceExport } from "../services/native-runtime/native-workspace-export-retry.js";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
@@ -1412,7 +1412,35 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  "heartbeat.scheduling_suppressed",
+  "heartbeat.worktree_execution_cutoff",
+  "heartbeat.daily_run_limit",
+  "heartbeat.daily_cost_limit",
+  "execution_review_requested",
+  "execution_approval_requested",
+  "execution_changes_requested",
+  "execution_reconciliation_required",
+  "issue_state_guard_mismatch",
+  "issue_rewake_throttled",
+  "agent.not_invokable",
+  "budget.blocked",
+  "company.inactive",
 ]);
+
+// Only fixed cause codes are exposed; free-text errors and payloads stay private.
+const ISSUE_WAKE_DIAGNOSTIC_KNOWN_WAIT_CAUSES = new Set([
+  "execution_owner_active",
+  ...EXECUTION_RECONCILIATION_CAUSES,
+]);
+
+function projectWakeDiagnosticWaitCause(payload: unknown) {
+  if (!payload || typeof payload !== "object") return null;
+  const wait = (payload as Record<string, unknown>).executionWait;
+  if (!wait || typeof wait !== "object") return null;
+  const cause = (wait as Record<string, unknown>).cause;
+  if (typeof cause !== "string") return null;
+  return ISSUE_WAKE_DIAGNOSTIC_KNOWN_WAIT_CAUSES.has(cause) ? cause : "other";
+}
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
   "queued",
@@ -1468,6 +1496,7 @@ function projectIssueWakeRequest(
     claimedAt: Date | string | null;
     finishedAt: Date | string | null;
     error: string | null;
+    payload?: unknown;
   },
   options: { includeInternalIds: boolean },
 ): IssueWakeDiagnosticWakeRequest {
@@ -1484,6 +1513,7 @@ function projectIssueWakeRequest(
     claimedAt: dateToIso(row.claimedAt),
     finishedAt: dateToIso(row.finishedAt),
     failureClass: wakeFailureClass(status, row.error),
+    waitCause: projectWakeDiagnosticWaitCause(row.payload),
   };
 }
 
@@ -1689,6 +1719,7 @@ function buildIssueWakeDiagnosticsResponse(input: {
     claimedAt: Date | string | null;
     finishedAt: Date | string | null;
     error: string | null;
+    payload?: unknown;
   }>;
   activityRecords: Array<{
     action: string;

@@ -542,6 +542,58 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(serialized).not.toContain("\"error\"");
   });
 
+  it("shows the real execution-gate reason and cause instead of other", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Stage handoff",
+      status: "in_review",
+      assigneeAgentId: agent.id,
+    });
+    const rawMarker = `RAW-DETAIL-${randomUUID()}`;
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "assignment",
+      reason: "execution_reconciliation_required",
+      status: "skipped",
+      payload: {
+        issueId: issue.id,
+        executionWait: { cause: "execution_owner_active", recoveryActionId: null, message: rawMarker },
+      },
+      error: `lease detail ${rawMarker}`,
+      requestedAt: new Date(Date.now() - 2_000),
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "assignment",
+      reason: "execution_review_requested",
+      status: "deferred_issue_execution",
+      payload: { issueId: issue.id, executionWait: { cause: rawMarker } },
+      requestedAt: new Date(Date.now() - 1_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events[0]).toMatchObject({
+      reason: "execution_review_requested",
+      status: "deferred_issue_execution",
+      waitCause: "other",
+    });
+    expect(res.body.events[1]).toMatchObject({
+      reason: "execution_reconciliation_required",
+      status: "skipped",
+      waitCause: "execution_owner_active",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(rawMarker);
+  });
+
   it("caps wake output and reports truncation", async () => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);
