@@ -1,5 +1,5 @@
 {
-  "id": "9bbe4b27-192a-408c-8cd4-469d327b32ef",
+  "id": "e474d26e-9147-49a7-800f-b8d4cd27e5cc",
   "prevId": "770b6d59-6346-4c92-8e49-0b71cf4819ab",
   "version": "7",
   "dialect": "postgresql",
@@ -48390,6 +48390,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "credential_fingerprint": {
+          "name": "credential_fingerprint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
         "recipe": {
           "name": "recipe",
           "type": "text",
@@ -48554,6 +48560,268 @@
             "id"
           ],
           "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.warden_recipient_check_receipts": {
+      "name": "warden_recipient_check_receipts",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "grant_id": {
+          "name": "grant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "issue_id": {
+          "name": "issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "checker_agent_id": {
+          "name": "checker_agent_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "recipient_agent_id": {
+          "name": "recipient_agent_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "check_id": {
+          "name": "check_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "recipe": {
+          "name": "recipe",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "config_revision": {
+          "name": "config_revision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "credential_fingerprint": {
+          "name": "credential_fingerprint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "alias_names_match": {
+          "name": "alias_names_match",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expected_principal_match": {
+          "name": "expected_principal_match",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "codebuild_project_found": {
+          "name": "codebuild_project_found",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "eks_cluster_active": {
+          "name": "eks_cluster_active",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "overall": {
+          "name": "overall",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lease_fresh": {
+          "name": "lease_fresh",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lease_egress_verified": {
+          "name": "lease_egress_verified",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lease_destroyed": {
+          "name": "lease_destroyed",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lease_destroy_verified_absent": {
+          "name": "lease_destroy_verified_absent",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lease_job_uid_digest": {
+          "name": "lease_job_uid_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "finished_at": {
+          "name": "finished_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "warden_recipient_check_receipts_grant_uq": {
+          "name": "warden_recipient_check_receipts_grant_uq",
+          "columns": [
+            {
+              "expression": "grant_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "warden_recipient_check_receipts_issue_idx": {
+          "name": "warden_recipient_check_receipts_issue_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "warden_recipient_check_receipts_company_id_companies_id_fk": {
+          "name": "warden_recipient_check_receipts_company_id_companies_id_fk",
+          "tableFrom": "warden_recipient_check_receipts",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "warden_recipient_check_receipts_grant_id_warden_recipient_check_grants_id_fk": {
+          "name": "warden_recipient_check_receipts_grant_id_warden_recipient_check_grants_id_fk",
+          "tableFrom": "warden_recipient_check_receipts",
+          "tableTo": "warden_recipient_check_grants",
+          "columnsFrom": [
+            "grant_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "warden_recipient_check_receipts_issue_id_issues_id_fk": {
+          "name": "warden_recipient_check_receipts_issue_id_issues_id_fk",
+          "tableFrom": "warden_recipient_check_receipts",
+          "tableTo": "issues",
+          "columnsFrom": [
+            "issue_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "warden_recipient_check_receipts_checker_agent_id_agents_id_fk": {
+          "name": "warden_recipient_check_receipts_checker_agent_id_agents_id_fk",
+          "tableFrom": "warden_recipient_check_receipts",
+          "tableTo": "agents",
+          "columnsFrom": [
+            "checker_agent_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "warden_recipient_check_receipts_recipient_agent_id_agents_id_fk": {
+          "name": "warden_recipient_check_receipts_recipient_agent_id_agents_id_fk",
+          "tableFrom": "warden_recipient_check_receipts",
+          "tableTo": "agents",
+          "columnsFrom": [
+            "recipient_agent_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },

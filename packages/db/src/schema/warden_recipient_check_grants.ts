@@ -13,6 +13,7 @@ export const wardenRecipientCheckGrants = pgTable(
     checkerAgentId: uuid("checker_agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
     recipientAgentId: uuid("recipient_agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
     configRevision: text("config_revision").notNull(),
+    credentialFingerprint: text("credential_fingerprint").notNull(),
     recipe: text("recipe").notNull(),
     approvalId: uuid("approval_id").notNull().references(() => approvals.id),
     createdByUserId: text("created_by_user_id").notNull(),

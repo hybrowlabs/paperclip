@@ -4,12 +4,13 @@ import { eq } from "drizzle-orm";
 import { issues, type Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { notFound } from "../errors.js";
-import { assertBoard, assertCompanyAccess } from "./authz.js";
+import { assertCompanyAccess, assertInstanceAdmin } from "./authz.js";
 import { logActivity } from "../services/activity-log.js";
 import {
   assertAgentChecker,
   wardenRecipientCheckService,
   type CheckerActor,
+  type WardenCheckReceiptInput,
   type WardenSecretResolver,
   type WardenServerPorts,
 } from "../services/warden-recipient-check.js";
@@ -40,15 +41,16 @@ export type WardenCheckRunner = (
 
 export interface WardenRecipientCheckRouteDeps {
   secrets: WardenSecretResolver;
+  wardenRecipientAgentId?: string | null;
   createRunner?: (ports: WardenServerPorts) => WardenCheckRunner;
 }
 
 export function wardenRecipientCheckRoutes(db: Db, deps: WardenRecipientCheckRouteDeps) {
   const router = Router();
-  const svc = wardenRecipientCheckService(db, deps.secrets);
+  const svc = wardenRecipientCheckService(db, deps.secrets, { wardenRecipientAgentId: deps.wardenRecipientAgentId });
 
   router.post("/companies/:companyId/warden-recipient-check-grants", validate(createGrantSchema), async (req, res) => {
-    assertBoard(req);
+    assertInstanceAdmin(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const userId = req.actor.userId;
@@ -84,7 +86,7 @@ export function wardenRecipientCheckRoutes(db: Db, deps: WardenRecipientCheckRou
   });
 
   router.post("/companies/:companyId/warden-recipient-check-grants/:grantId/revoke", async (req, res) => {
-    assertBoard(req);
+    assertInstanceAdmin(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const userId = req.actor.userId;
@@ -116,19 +118,19 @@ export function wardenRecipientCheckRoutes(db: Db, deps: WardenRecipientCheckRou
     if (!issue) throw notFound("Issue not found");
     assertCompanyAccess(req, issue.companyId);
     const actor = assertAgentChecker(req.actor);
-    if (!deps.createRunner) {
+    if (!deps.createRunner || !deps.wardenRecipientAgentId) {
       res.status(501).json({ error: "Recipient runner is not configured" });
       return;
     }
-    const run = deps.createRunner(svc.buildPorts(actor, issueId));
+    const grantId = req.body.grantId as string;
+    const run = deps.createRunner(svc.buildPorts(actor, issueId, grantId));
     const controller = new AbortController();
     res.on("close", () => {
       if (!res.writableEnded) controller.abort();
     });
+    let receipt: unknown;
     try {
-      const receipt = await run(actor, { ...req.body, issueId }, controller.signal);
-      const authorization = await svc.getGrantAudit(actor.companyId, req.body.grantId);
-      res.json({ receipt, authorization });
+      receipt = await run(actor, { ...req.body, issueId }, controller.signal);
     } catch (err) {
       const named = err as { name?: string; code?: unknown };
       if (named?.name === "CheckDenied" && typeof named.code === "string") {
@@ -136,6 +138,14 @@ export function wardenRecipientCheckRoutes(db: Db, deps: WardenRecipientCheckRou
         return;
       }
       res.status(500).json({ error: "check_failed" });
+      return;
+    }
+    try {
+      await svc.recordReceipt(actor, issueId, grantId, receipt as WardenCheckReceiptInput);
+      const authorization = await svc.getGrantAudit(actor.companyId, grantId);
+      res.json({ receipt, authorization });
+    } catch {
+      res.status(500).json({ error: "receipt_not_persisted" });
     }
   });
 
