@@ -98,6 +98,8 @@ import { announcementRoutes } from "./routes/announcements.js";
 import { serverVersion } from "./version.js";
 import { resourceMembershipRoutes } from "./routes/resource-memberships.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
+import { wardenRecipientCheckRoutes } from "./routes/warden-recipient-checks.js";
+import { secretService } from "./services/secrets.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
 import { instanceSettingsService } from "./services/instance-settings.js";
 import { openApiRoutes } from "./routes/openapi.js";
@@ -798,6 +800,7 @@ export async function createApp(
   api.use(announcementRoutes(db, { ...opts.announcements, version: opts.hostVersion ?? serverVersion }));
   api.use(resourceMembershipRoutes(db));
   api.use(inboxDismissalRoutes(db));
+  api.use(wardenRecipientCheckRoutes(db, { secrets: secretService(db) }));
   api.use(instanceSettingsRoutes(db));
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
