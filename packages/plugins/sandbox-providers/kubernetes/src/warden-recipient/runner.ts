@@ -489,7 +489,7 @@ class RecipientLease {
       ciliumPolicies: items(cnp),
       ciliumClusterwidePolicies: items(ccnp),
     };
-    verifyEffectiveEgress({ expectedPolicy: this.policy, podLabels: this.podLabels, listing });
+    verifyEffectiveEgress({ expectedPolicy: this.policy, podLabels: this.podLabels, namespace: this.namespace, listing });
   }
 
   async start(): Promise<void> {

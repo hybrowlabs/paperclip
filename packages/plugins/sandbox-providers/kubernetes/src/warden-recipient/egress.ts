@@ -48,10 +48,29 @@ interface Selector {
   matchExpressions?: unknown[];
 }
 
+const CILIUM_NAMESPACE_LABEL = "io.kubernetes.pod.namespace";
+
 function selects(selector: Selector | undefined, labels: Record<string, string>): boolean {
   if (!selector) return true;
   if (selector.matchExpressions && selector.matchExpressions.length > 0) return true;
   return Object.entries(selector.matchLabels ?? {}).every(([k, v]) => labels[k] === v);
+}
+
+function selectsCilium(selector: Selector | undefined, labels: Record<string, string>, namespace: string): boolean {
+  if (!selector) return true;
+  if (selector.matchExpressions && selector.matchExpressions.length > 0) return true;
+  return Object.entries(selector.matchLabels ?? {}).every(([rawKey, value]) => {
+    let key = rawKey;
+    const sep = key.indexOf(":");
+    if (sep >= 0) {
+      const source = key.slice(0, sep);
+      if (source !== "k8s" && source !== "any") return true;
+      key = key.slice(sep + 1);
+    }
+    if (key === CILIUM_NAMESPACE_LABEL) return value === namespace;
+    if (key.startsWith("io.cilium.") || key.startsWith("io.kubernetes.")) return true;
+    return labels[key] === value;
+  });
 }
 
 function stable(value: unknown): string {
@@ -92,6 +111,7 @@ function ciliumRuleSets(spec: Record<string, unknown> | undefined): unknown[] {
 export function verifyEffectiveEgress(input: {
   expectedPolicy: Record<string, unknown>;
   podLabels: Record<string, string>;
+  namespace: string;
   listing: EgressListing;
 }): void {
   const expectedName = (input.expectedPolicy.metadata as { name: string }).name;
@@ -105,7 +125,7 @@ export function verifyEffectiveEgress(input: {
     if ((np.spec?.egress?.length ?? 0) > 0) throw new EgressConstraintError("egress_not_effective");
   }
   for (const cnp of input.listing.ciliumPolicies) {
-    if (!selects(cnp.spec?.endpointSelector, input.podLabels)) continue;
+    if (!selectsCilium(cnp.spec?.endpointSelector, input.podLabels, input.namespace)) continue;
     if (cnp.metadata?.name === expectedName && stable(cnp.spec) === expectedSpec) {
       ours += 1;
       continue;
@@ -115,7 +135,7 @@ export function verifyEffectiveEgress(input: {
     }
   }
   for (const ccnp of input.listing.ciliumClusterwidePolicies) {
-    if (!selects(ccnp.spec?.endpointSelector, input.podLabels)) continue;
+    if (!selectsCilium(ccnp.spec?.endpointSelector, input.podLabels, input.namespace)) continue;
     if (ciliumRuleSets(ccnp.spec).length > 0) throw new EgressConstraintError("egress_not_effective");
   }
   if (ours !== 1) throw new EgressConstraintError("egress_not_effective");

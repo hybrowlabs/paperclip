@@ -336,6 +336,55 @@ describe("warden recipient runner: egress isolation proven after policy combinat
     const w = makeWorld({ extraEgressNetworkPolicies: [other] });
     expect((await runWardenRecipientCheck(w.deps, actor, request)).overall).toBe("PASS");
   });
+  describe("Cilium source-prefixed selectors", () => {
+    const widen = (matchLabels: Record<string, string>) => ({
+      metadata: { name: "tenant-baseline" },
+      spec: { endpointSelector: { matchLabels }, egress: [{ toCIDR: ["0.0.0.0/0"] }] },
+    });
+    const selectorCases: Array<[string, Record<string, string>]> = [
+      ["plain role", { "paperclip.io/role": "warden-recipient" }],
+      ["k8s: role", { "k8s:paperclip.io/role": "warden-recipient" }],
+      ["any: managed-by", { "any:paperclip.io/managed-by": "paperclip-k8s-plugin" }],
+      ["k8s: namespace pseudo-label", { "k8s:io.kubernetes.pod.namespace": "wr-ns" }],
+      ["plain namespace pseudo-label", { "io.kubernetes.pod.namespace": "wr-ns" }],
+      ["any: namespace pseudo-label", { "any:io.kubernetes.pod.namespace": "wr-ns" }],
+      ["namespace + k8s: role", { "k8s:io.kubernetes.pod.namespace": "wr-ns", "k8s:paperclip.io/role": "warden-recipient" }],
+      ["unknown source prefix", { "reserved:host": "" }],
+      ["cilium internal label", { "io.cilium.k8s.policy.cluster": "default" }],
+    ];
+    for (const [name, labels] of selectorCases) {
+      it(`denies a namespaced CiliumNetworkPolicy widening egress selected by ${name}`, async () => {
+        const w = makeWorld({ extraCilium: [widen(labels)] });
+        const r = await runWardenRecipientCheck(w.deps, actor, request);
+        expect(w.calls).not.toContain("job.create");
+        expect(r.overall).toBe("INCONCLUSIVE");
+        expect(r.leaseAttestation?.egressVerified).toBe(false);
+        expect(w.state).toEqual({ job: false, secret: false, policy: false, pods: 0 });
+      });
+      it(`denies a clusterwide Cilium policy widening egress selected by ${name}`, async () => {
+        const w = makeWorld({ extraClusterwide: [widen(labels)] });
+        const r = await runWardenRecipientCheck(w.deps, actor, request);
+        expect(w.calls).not.toContain("job.create");
+        expect(r.overall).toBe("INCONCLUSIVE");
+        expect(w.state).toEqual({ job: false, secret: false, policy: false, pods: 0 });
+      });
+    }
+    const nonMatching: Array<[string, Record<string, string>]> = [
+      ["other namespace (k8s:)", { "k8s:io.kubernetes.pod.namespace": "other-ns" }],
+      ["other namespace (plain)", { "io.kubernetes.pod.namespace": "other-ns" }],
+      ["other role (k8s:)", { "k8s:paperclip.io/role": "agent" }],
+      ["other role (any:)", { "any:paperclip.io/role": "agent" }],
+      ["matching namespace but other role", { "k8s:io.kubernetes.pod.namespace": "wr-ns", "k8s:paperclip.io/role": "agent" }],
+    ];
+    for (const [name, labels] of nonMatching) {
+      it(`ignores a non-selecting prefixed policy: ${name}`, async () => {
+        const ns = makeWorld({ extraCilium: [widen(labels)] });
+        expect((await runWardenRecipientCheck(ns.deps, actor, request)).overall).toBe("PASS");
+        const cw = makeWorld({ extraClusterwide: [widen(labels)] });
+        expect((await runWardenRecipientCheck(cw.deps, actor, request)).overall).toBe("PASS");
+      });
+    }
+  });
   it("fails closed when policies cannot be listed", async () => {
     const w = makeWorld();
     w.clients.networking.listNamespacedNetworkPolicy = vi.fn(async () => { throw new Error("rbac"); });

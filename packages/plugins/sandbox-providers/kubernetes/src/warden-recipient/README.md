@@ -30,3 +30,10 @@ Dedicated, no-model, single-recipe recipient lease. It is not wired to a route, 
 ## Rollback
 
 Delete this directory and `test/unit/warden-recipient`; nothing else is modified.
+
+## Residual risks (Compass review of b524b0c, advisory)
+
+- Cilium selectors: `k8s:`/`any:` source prefixes and the `io.kubernetes.pod.namespace` pseudo-label are normalised against the pod labels and lease namespace; any other source prefix, `io.cilium.*` label or `matchExpressions` fails closed (treated as selecting).
+- Egress is verified once, before the Job exists. A policy added afterwards is not detected; the live Cilium proof owed by the deployment gate must cover this.
+- `imageAllowPrefixes` is a string prefix match: configure `/`- or `@`-terminated prefixes (or the exact digest) so sibling repositories are not admitted.
+- Cross-process single use depends on the real `GrantPort` (atomic compare-and-set) implemented outside this module.
