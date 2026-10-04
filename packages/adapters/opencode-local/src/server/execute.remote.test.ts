@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -277,6 +277,7 @@ describe("opencode remote execution", () => {
     const included = path.join(root, "included");
     await mkdir(workspace);
     await mkdir(included);
+    await writeFile(path.join(included, "SKILL.md"), "---\nname: included\ndescription: Remote policy fixture\n---\nIncluded skill.\n");
     await execute({
       runId: "run-remote-policy",
       agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },

@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { createServer } from "node:http";
 
 vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
@@ -258,38 +259,92 @@ describe("OpenCode local skill injection", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-real-loader-"));
     const home = path.join(root, "home");
     const workspace = path.join(root, "workspace");
+    const names = ["assigned", "bundled", "unassigned"];
+    let modelCalls = 0;
     const add = async (name: string) => {
       const directory = path.join(root, "sources", name);
       await fs.mkdir(directory, { recursive: true });
       await fs.writeFile(path.join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: Test ${name}\n---\nLoader marker for ${name}\n`);
       return directory;
     };
+    const server = createServer(async (request, response) => {
+      try {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        const input = JSON.parse(body) as { messages?: Array<{ role: string }>; tools?: unknown[] };
+        if (!input.tools) throw new Error("Expected the OpenCode tool-enabled model request");
+        modelCalls++;
+        const completed = input.messages?.filter((message) => message.role === "tool").length ?? 0;
+        if (completed > names.length) throw new Error("Unexpected extra skill tool result");
+        const name = names[completed];
+        const delta = name
+          ? { role: "assistant", tool_calls: [{ index: 0, id: `call_${completed}`, type: "function", function: { name: "skill", arguments: JSON.stringify({ name }) } }] }
+          : { role: "assistant", content: "Finished." };
+        const chunk = (payload: object, finishReason: string | null) => JSON.stringify({
+          id: "chatcmpl-skill-fixture", object: "chat.completion.chunk", created: 0, model: "fixture",
+          choices: [{ index: 0, delta: payload, finish_reason: finishReason }],
+        });
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.write(`data: ${chunk(delta, null)}\n\n`);
+        response.write(`data: ${chunk({}, name ? "tool_calls" : "stop")}\n\n`);
+        response.end("data: [DONE]\n\n");
+      } catch (error) {
+        response.writeHead(500);
+        response.end(String(error));
+      }
+    });
     try {
       await fs.mkdir(workspace, { recursive: true });
-      const entries = await Promise.all(["assigned", "unassigned", "bundled"].map(async (name) => ({
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("OpenCode fixture server did not bind to TCP");
+      const entries = await Promise.all(names.map(async (name) => ({
         key: name, runtimeName: name, source: await add(name),
       })));
       const isolated = await prepareOpenCodeSkillIsolation({ HOME: home }, entries, ["assigned", "bundled"]);
       try {
         const env = {
           ...process.env,
+          PWD: workspace,
           HOME: home,
           XDG_CONFIG_HOME: path.join(root, "xdg-config"),
           XDG_DATA_HOME: path.join(root, "xdg-data"),
           XDG_CACHE_HOME: path.join(root, "xdg-cache"),
           XDG_STATE_HOME: path.join(root, "xdg-state"),
           OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+          OPENCODE_DISABLE_DEFAULT_PLUGINS: "1",
+          OPENCODE_DISABLE_SHARE: "1",
+          OPENCODE_DISABLE_LSP: "1",
+          OPENCODE_DISABLE_FORMATTER: "1",
+          OPENCODE_DISABLE_MODELS_FETCH: "1",
           ...isolated.env,
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({
+            ...JSON.parse(isolated.env.OPENCODE_CONFIG_CONTENT),
+            provider: {
+              fixture: {
+                npm: "@ai-sdk/openai-compatible", name: "Fixture",
+                options: { baseURL: `http://127.0.0.1:${address.port}/v1`, apiKey: "fixture-only" },
+                models: { probe: { name: "Probe", limit: { context: 32768, output: 4096 }, cost: { input: 0, output: 0 } } },
+              },
+            },
+          }),
         };
         const prompt = "Call the skill tool once for assigned, once for bundled, and once for unassigned. Do not use another tool. Report each tool result.";
-        const output = execFileSync("opencode", ["run", "--pure", "--format", "json", "--model", "opencode/longcat-2.5-preview-free", prompt], {
-          cwd: workspace, env, encoding: "utf8", timeout: 120000,
+        const output = await new Promise<string>((resolve, reject) => {
+          const child = execFile("opencode", ["run", "--pure", "--format", "json", "--model", "fixture/probe", prompt], {
+            cwd: workspace, env, encoding: "utf8", timeout: 30000,
+          }, (error, stdout) => error ? reject(error) : resolve(stdout));
+          child.stdin?.end();
         });
         const events = output.trim().split("\n").map((line) => JSON.parse(line) as {
           type: string; part?: { tool?: string; state?: { input?: { name?: string }; output?: string; error?: string } };
         });
+        expect(modelCalls).toBe(4);
         const skillCalls = events.filter((event) => event.type === "tool_use" && event.part?.tool === "skill");
         const result = (name: string) => skillCalls.find((event) => event.part?.state?.input?.name === name)?.part?.state;
+        expect(skillCalls).toHaveLength(3);
+        expect(result("assigned")?.error).toBeUndefined();
+        expect(result("bundled")?.error).toBeUndefined();
         expect(result("assigned")?.output).toContain("Loader marker for assigned");
         expect(result("bundled")?.output).toContain("Loader marker for bundled");
         expect(result("unassigned")?.output ?? "").not.toContain("Loader marker for unassigned");
@@ -298,9 +353,10 @@ describe("OpenCode local skill injection", () => {
         await isolated.cleanup();
       }
     } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       await fs.rm(root, { recursive: true, force: true });
     }
-  }, 150000);
+  }, 40000);
 
   it("fails closed before OpenCode execution for invalid config and missing assigned source", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-fail-closed-"));
