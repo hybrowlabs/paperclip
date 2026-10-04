@@ -81,10 +81,18 @@ function stable(value: unknown): string {
   );
 }
 
+type CiliumRule = Record<string, unknown> & { endpointSelector?: Selector };
+
+interface CiliumItem {
+  metadata?: { name?: string };
+  spec?: CiliumRule;
+  specs?: CiliumRule[];
+}
+
 export interface EgressListing {
   networkPolicies: Array<{ metadata?: { name?: string }; spec?: { podSelector?: Selector; policyTypes?: string[]; egress?: unknown[] } }>;
-  ciliumPolicies: Array<{ metadata?: { name?: string }; spec?: Record<string, unknown> & { endpointSelector?: Selector } }>;
-  ciliumClusterwidePolicies: Array<{ metadata?: { name?: string }; spec?: Record<string, unknown> & { endpointSelector?: Selector } }>;
+  ciliumPolicies: CiliumItem[];
+  ciliumClusterwidePolicies: CiliumItem[];
 }
 
 const CILIUM_EGRESS_KEYS = [
@@ -99,13 +107,41 @@ const CILIUM_EGRESS_KEYS = [
   "toGroups",
 ];
 
-function ciliumRuleSets(spec: Record<string, unknown> | undefined): unknown[] {
-  if (!spec) return [];
-  const rules: unknown[] = [];
-  if (spec.egress) rules.push(...(spec.egress as unknown[]));
-  const specs = spec.specs as Array<Record<string, unknown>> | undefined;
-  for (const s of specs ?? []) rules.push(...ciliumRuleSets(s));
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function flattenRule(rule: unknown, depth = 0): CiliumRule[] {
+  if (!isObject(rule) || depth > 8) throw new EgressConstraintError("egress_unverifiable");
+  const out: CiliumRule[] = [rule as CiliumRule];
+  const nested = rule.specs;
+  if (nested !== undefined && nested !== null) {
+    if (!Array.isArray(nested)) throw new EgressConstraintError("egress_unverifiable");
+    for (const child of nested) out.push(...flattenRule(child, depth + 1));
+  }
+  return out;
+}
+
+function ciliumRules(item: CiliumItem): CiliumRule[] {
+  const rules: CiliumRule[] = [];
+  const hasSpec = item.spec !== undefined && item.spec !== null;
+  const hasSpecs = item.specs !== undefined && item.specs !== null;
+  if (!hasSpec && !hasSpecs) throw new EgressConstraintError("egress_unverifiable");
+  if (hasSpec) rules.push(...flattenRule(item.spec));
+  if (hasSpecs) {
+    if (!Array.isArray(item.specs)) throw new EgressConstraintError("egress_unverifiable");
+    for (const rule of item.specs) rules.push(...flattenRule(rule));
+  }
   return rules;
+}
+
+function ruleWidensEgress(rule: CiliumRule): boolean {
+  return CILIUM_EGRESS_KEYS.some((k) => {
+    const v = rule[k];
+    if (v === undefined || v === null) return false;
+    if (k === "egress" && Array.isArray(v)) return v.length > 0;
+    return true;
+  });
 }
 
 export function verifyEffectiveEgress(input: {
@@ -125,18 +161,25 @@ export function verifyEffectiveEgress(input: {
     if ((np.spec?.egress?.length ?? 0) > 0) throw new EgressConstraintError("egress_not_effective");
   }
   for (const cnp of input.listing.ciliumPolicies) {
-    if (!selectsCilium(cnp.spec?.endpointSelector, input.podLabels, input.namespace)) continue;
-    if (cnp.metadata?.name === expectedName && stable(cnp.spec) === expectedSpec) {
-      ours += 1;
+    const isOurs =
+      cnp.metadata?.name === expectedName &&
+      (cnp.specs === undefined || cnp.specs === null) &&
+      isObject(cnp.spec) &&
+      stable(cnp.spec) === expectedSpec;
+    if (isOurs) {
+      if (selectsCilium(cnp.spec?.endpointSelector, input.podLabels, input.namespace)) ours += 1;
       continue;
     }
-    if (ciliumRuleSets(cnp.spec).length > 0 || CILIUM_EGRESS_KEYS.some((k) => cnp.spec && k !== "egress" && k in cnp.spec)) {
-      throw new EgressConstraintError("egress_not_effective");
+    for (const rule of ciliumRules(cnp)) {
+      if (!selectsCilium(rule.endpointSelector, input.podLabels, input.namespace)) continue;
+      if (ruleWidensEgress(rule)) throw new EgressConstraintError("egress_not_effective");
     }
   }
   for (const ccnp of input.listing.ciliumClusterwidePolicies) {
-    if (!selectsCilium(ccnp.spec?.endpointSelector, input.podLabels, input.namespace)) continue;
-    if (ciliumRuleSets(ccnp.spec).length > 0) throw new EgressConstraintError("egress_not_effective");
+    for (const rule of ciliumRules(ccnp)) {
+      if (!selectsCilium(rule.endpointSelector, input.podLabels, input.namespace)) continue;
+      if (ruleWidensEgress(rule)) throw new EgressConstraintError("egress_not_effective");
+    }
   }
   if (ours !== 1) throw new EgressConstraintError("egress_not_effective");
 }

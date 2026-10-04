@@ -690,6 +690,59 @@ describe("repair: single-use GrantPort contract (P4)", () => {
   });
 });
 
+describe("repair 2: Cilium top-level specs[] bypass and hardening (Sentinel 02188df)", () => {
+  const wide = [{ toCIDR: ["0.0.0.0/0"] }];
+  const sel = { matchLabels: { "paperclip.io/role": "warden-recipient" } };
+  const benign = { endpointSelector: { matchLabels: { "paperclip.io/role": "agent" } }, ingress: [{}] };
+  const cases: Array<[string, any]> = [
+    ["specs only", { metadata: { name: "s" }, specs: [{ endpointSelector: sel, egress: wide }] }],
+    ["specs beside a benign spec", { metadata: { name: "s" }, spec: benign, specs: [{ endpointSelector: sel, egress: wide }] }],
+    ["specs nested in spec", { metadata: { name: "s" }, spec: { ...benign, specs: [{ endpointSelector: sel, egress: wide }] } }],
+    ["specs with prefixed selector", { metadata: { name: "s" }, specs: [{ endpointSelector: { matchLabels: { "k8s:paperclip.io/role": "warden-recipient" } }, egress: wide }] }],
+    ["specs entry with empty selector", { metadata: { name: "s" }, specs: [{ endpointSelector: {}, egress: wide }] }],
+    ["malformed specs", { metadata: { name: "s" }, spec: benign, specs: "x" }],
+    ["no spec and no specs", { metadata: { name: "s" } }],
+    ["non-object specs entry", { metadata: { name: "s" }, specs: [null] }],
+  ];
+  for (const [name, policy] of cases) {
+    it(`denies a namespaced policy: ${name}`, async () => {
+      const w = makeWorld({ extraCilium: [policy] });
+      const r = await runWardenRecipientCheck(w.deps, actor, request);
+      expect(w.calls).not.toContain("job.create");
+      expect(r.overall).toBe("INCONCLUSIVE");
+      expect(r.leaseAttestation?.egressVerified).toBe(false);
+      expect(w.state).toEqual({ job: false, secret: false, policy: false, pods: 0 });
+    });
+    it(`denies a clusterwide policy: ${name}`, async () => {
+      const w = makeWorld({ extraClusterwide: [policy] });
+      const r = await runWardenRecipientCheck(w.deps, actor, request);
+      expect(w.calls).not.toContain("job.create");
+      expect(r.overall).toBe("INCONCLUSIVE");
+      expect(w.state).toEqual({ job: false, secret: false, policy: false, pods: 0 });
+    });
+  }
+  it("ignores specs entries that do not select the recipient", async () => {
+    const policy = { metadata: { name: "s" }, specs: [{ endpointSelector: { matchLabels: { "paperclip.io/role": "agent" } }, egress: wide }] };
+    expect((await runWardenRecipientCheck(makeWorld({ extraCilium: [policy] }).deps, actor, request)).overall).toBe("PASS");
+    expect((await runWardenRecipientCheck(makeWorld({ extraClusterwide: [policy] }).deps, actor, request)).overall).toBe("PASS");
+  });
+  it("rejects an empty or blank expectedRecipientAgentId before any preflight, grant or lease", async () => {
+    for (const id of ["", "   "]) {
+      const w = makeWorld({ config: { expectedRecipientAgentId: id } });
+      expect(await denied(w)).toBe("internal_denial");
+      expect(w.deps.preflight.resolve).not.toHaveBeenCalled();
+      expect(w.deps.grants.consume).not.toHaveBeenCalled();
+    }
+  });
+  it("maps an unknown GrantPort outcome to internal_denial, with no lease", async () => {
+    for (const bad of ["CONSUMED", undefined, "ok"]) {
+      const w = makeWorld();
+      w.deps.grants = { consume: vi.fn(async () => bad as never) };
+      expect(await denied(w)).toBe("internal_denial");
+    }
+  });
+});
+
 describe("repair: sweeper is schedulable", () => {
   it("startRecipientLeaseSweeper sweeps on its interval and can be stopped", async () => {
     vi.useFakeTimers();

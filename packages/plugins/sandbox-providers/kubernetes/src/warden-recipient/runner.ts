@@ -251,6 +251,9 @@ export async function runWardenRecipientCheck(deps: RunnerDeps, actor: CheckActo
   if (signal?.aborted) return deny("cancelled", ctx);
 
   if (deps.config.driver !== "kubernetes" || deps.config.backend !== "job") return deny("host_execution_rejected", ctx);
+  if (typeof deps.config.expectedRecipientAgentId !== "string" || deps.config.expectedRecipientAgentId.trim() === "") {
+    return deny("internal_denial", ctx);
+  }
   try {
     assertEgressModeSupported(deps.config.egressMode);
   } catch {
@@ -301,13 +304,13 @@ export async function runWardenRecipientCheck(deps: RunnerDeps, actor: CheckActo
   });
   if (outcome !== "consumed") {
     releaseGrantLocally(deps.grants, request.grantId);
-    const map: Record<Exclude<GrantOutcome, "consumed">, DenialCode> = {
+    const map: Partial<Record<GrantOutcome, DenialCode>> = {
       not_found: "grant_not_found",
       expired: "grant_expired",
       already_consumed: "grant_already_consumed",
       mismatch: "grant_mismatch",
     };
-    return deny(map[outcome], tctx);
+    return deny(Object.prototype.hasOwnProperty.call(map, outcome) ? (map[outcome] as DenialCode) : "internal_denial", tctx);
   }
   await guard(() => deps.audit.record(base("grant_consumed", tctx)), tctx);
 
