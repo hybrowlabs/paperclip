@@ -294,4 +294,81 @@ describe("plugin SDK test harness", () => {
       body: "relayed reply",
     });
   });
+
+  describe("issues.createAttachment", () => {
+    const attachmentManifest = (capabilities: PaperclipPluginManifestV1["capabilities"]): PaperclipPluginManifestV1 => ({
+      id: "paperclip.test-create-attachment",
+      apiVersion: 1,
+      version: "0.1.0",
+      displayName: "Create Attachment",
+      description: "Test plugin",
+      author: "Paperclip",
+      categories: ["automation"],
+      capabilities,
+      entrypoints: { worker: "./dist/worker.js" },
+    });
+    const seedIssues = (harness: ReturnType<typeof createTestHarness>) =>
+      harness.seed({
+        issues: [
+          { id: "issue-1", companyId: "company-1", title: "Mine", status: "todo", priority: "medium" },
+          { id: "issue-2", companyId: "company-2", title: "Theirs", status: "todo", priority: "medium" },
+        ],
+      });
+    const png = Buffer.from("not-really-a-png").toString("base64");
+
+    it("requires the issue.attachments.create capability", async () => {
+      const harness = createTestHarness({ manifest: attachmentManifest(["issue.attachments.read"]) });
+      seedIssues(harness);
+      await expect(
+        harness.ctx.issues.createAttachment({
+          issueId: "issue-1", companyId: "company-1", filename: "a.png", contentType: "image/png", contentBase64: png,
+        }),
+      ).rejects.toThrow("issue.attachments.create");
+    });
+
+    it("stores the attachment and exposes it through the read APIs", async () => {
+      const harness = createTestHarness({
+        manifest: attachmentManifest(["issue.attachments.create", "issue.attachments.read"]),
+      });
+      seedIssues(harness);
+      const created = await harness.ctx.issues.createAttachment({
+        issueId: "issue-1", companyId: "company-1", filename: "a.png", contentType: "image/png", contentBase64: png,
+      });
+      expect(created).toMatchObject({
+        issueId: "issue-1", companyId: "company-1", originalFilename: "a.png", contentType: "image/png",
+        byteSize: Buffer.from(png, "base64").length,
+      });
+      const listed = await harness.ctx.issues.listAttachments("issue-1", "company-1");
+      expect(listed.map((row) => row.id)).toEqual([created.id]);
+      const content = await harness.ctx.issues.getAttachmentContent(created.id, "company-1");
+      expect(content?.contentBase64).toBe(png);
+    });
+
+    it("rejects an issue from another company", async () => {
+      const harness = createTestHarness({ manifest: attachmentManifest(["issue.attachments.create"]) });
+      seedIssues(harness);
+      await expect(
+        harness.ctx.issues.createAttachment({
+          issueId: "issue-2", companyId: "company-1", filename: "a.png", contentType: "image/png", contentBase64: png,
+        }),
+      ).rejects.toThrow("Issue not found");
+    });
+
+    it("rejects payloads over the size cap, empty payloads and invalid base64", async () => {
+      const harness = createTestHarness({
+        manifest: attachmentManifest(["issue.attachments.create"]),
+        maxAttachmentBytes: 8,
+      });
+      seedIssues(harness);
+      const base = { issueId: "issue-1", companyId: "company-1", filename: "a.png", contentType: "image/png" };
+      await expect(
+        harness.ctx.issues.createAttachment({ ...base, contentBase64: Buffer.alloc(9).toString("base64") }),
+      ).rejects.toThrow("over the");
+      await expect(harness.ctx.issues.createAttachment({ ...base, contentBase64: "" })).rejects.toThrow("empty");
+      await expect(harness.ctx.issues.createAttachment({ ...base, contentBase64: "***" })).rejects.toThrow("base64");
+      await expect(
+        harness.ctx.issues.createAttachment({ ...base, contentBase64: Buffer.alloc(8).toString("base64") }),
+      ).resolves.toMatchObject({ byteSize: 8 });
+    });
+  });
 });

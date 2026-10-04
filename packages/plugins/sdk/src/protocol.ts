@@ -1653,6 +1653,15 @@ export interface WorkerToHostMethods {
     params: { url: string; init?: Record<string, unknown> },
     result: { status: number; statusText: string; headers: Record<string, string>; body: string },
   ];
+  /**
+   * Binary-safe variant of `http.fetch`: the response body is returned
+   * base64-encoded instead of UTF-8 decoded. Same SSRF guard, same
+   * `http.outbound` capability. `maxBytes` aborts the download once exceeded.
+   */
+  "http.fetchBinary": [
+    params: { url: string; init?: Record<string, unknown>; maxBytes?: number | null },
+    result: { status: number; statusText: string; headers: Record<string, string>; bodyBase64: string },
+  ];
 
   // Secrets
   "secrets.resolve": [
@@ -2035,6 +2044,19 @@ export interface WorkerToHostMethods {
   "issues.getAttachmentContent": [
     params: { attachmentId: string; companyId: string; maxBytes?: number | null },
     result: PluginIssueAttachmentContent | null,
+  ];
+  "issues.createAttachment": [
+    params: {
+      issueId: string;
+      companyId: string;
+      filename: string;
+      contentType: string;
+      /** The attachment's raw bytes, base64-encoded. */
+      contentBase64: string;
+      /** Optional comment on the same issue to bind the attachment to. */
+      commentId?: string | null;
+    },
+    result: IssueAttachment,
   ];
 
   // Issue Documents
