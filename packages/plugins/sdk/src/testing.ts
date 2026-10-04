@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import type {
   PaperclipPluginManifestV1,
@@ -81,6 +81,11 @@ export interface TestHarnessOptions {
   capabilities?: PluginCapability[];
   /** Initial config returned by `ctx.config.get(companyId)`. */
   config?: Record<string, unknown>;
+  /**
+   * Size cap (bytes) enforced by `ctx.issues.createAttachment`. Defaults to
+   * 10 MiB, the host's default attachment limit.
+   */
+  maxAttachmentBytes?: number;
 }
 
 export interface TestHarnessLogEntry {
@@ -1851,6 +1856,53 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           originalFilename: attachment.originalFilename ?? null,
           contentBase64,
         };
+      },
+      async createAttachment(input) {
+        requireCapability(manifest, capabilitySet, "issue.attachments.create");
+        const parentIssue = issues.get(input.issueId);
+        if (!isInCompany(parentIssue, input.companyId)) {
+          throw new Error(`Issue not found: ${input.issueId}`);
+        }
+        if (input.commentId) {
+          const comment = (issueComments.get(input.issueId) ?? []).find((entry) => entry.id === input.commentId);
+          if (!comment) throw new Error(`Issue comment not found: ${input.commentId}`);
+        }
+        const base64 = input.contentBase64 ?? "";
+        if (base64.length > 0 && !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
+          throw new Error("contentBase64 is not valid base64");
+        }
+        const bytes = Buffer.from(base64, "base64");
+        if (bytes.length === 0) throw new Error("attachment is empty");
+        const cap = options.maxAttachmentBytes ?? 10 * 1024 * 1024;
+        if (bytes.length > cap) {
+          throw new Error(`attachment is ${bytes.length} bytes, over the ${cap}-byte cap`);
+        }
+        const now = new Date();
+        const id = randomUUID();
+        const attachment: IssueAttachment = {
+          id,
+          companyId: parentIssue.companyId,
+          issueId: input.issueId,
+          issueCommentId: input.commentId ?? null,
+          originatingRunId: null,
+          assetId: randomUUID(),
+          provider: "test_harness",
+          objectKey: `test/${id}`,
+          contentType: input.contentType,
+          byteSize: bytes.length,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          originalFilename: input.filename || null,
+          createdByAgentId: null,
+          createdByUserId: null,
+          createdAt: now,
+          updatedAt: now,
+          contentPath: `/api/attachments/${id}/content`,
+        };
+        const list = issueAttachments.get(input.issueId) ?? [];
+        list.push(attachment);
+        issueAttachments.set(input.issueId, list);
+        attachmentContentById.set(id, bytes.toString("base64"));
+        return attachment;
       },
       documents: {
         async list(issueId, companyId) {

@@ -1416,6 +1416,7 @@ export interface PluginIssueAttachmentContent {
  * - `issue.interactions.read` for `listInteractions`
  * - `issue.interactions.respond` for `respondInteraction`
  * - `issue.attachments.read` for `listAttachments` and `getAttachmentContent`
+ * - `issue.attachments.create` for `createAttachment`
  * - `issue.documents.read` for `documents.list` and `documents.get`
  * - `issue.documents.write` for `documents.upsert` and `documents.delete`
  */
@@ -1613,6 +1614,25 @@ export interface PluginIssuesClient {
     companyId: string,
     options?: { maxBytes?: number | null },
   ): Promise<PluginIssueAttachmentContent | null>;
+  /**
+   * Create an attachment on an issue from raw bytes. Requires
+   * `issue.attachments.create`.
+   *
+   * The host decodes `contentBase64`, enforces the deployment attachment size
+   * cap and content-type allow-list, stores the bytes with the existing
+   * attachment storage and audit-logs the creation. The issue must belong to
+   * `companyId` (otherwise the call fails with "Issue not found"). Pass
+   * `commentId` to bind the attachment to a comment on the same issue.
+   */
+  createAttachment(input: {
+    issueId: string;
+    companyId: string;
+    filename: string;
+    contentType: string;
+    /** The attachment's raw bytes, base64-encoded. */
+    contentBase64: string;
+    commentId?: string | null;
+  }): Promise<IssueAttachment>;
   /** Read and write issue documents. Requires `issue.documents.read` / `issue.documents.write`. */
   documents: PluginIssueDocumentsClient;
   /** Read and write blocker relationships. */

@@ -2036,6 +2036,19 @@ export interface WorkerToHostMethods {
     params: { attachmentId: string; companyId: string; maxBytes?: number | null },
     result: PluginIssueAttachmentContent | null,
   ];
+  "issues.createAttachment": [
+    params: {
+      issueId: string;
+      companyId: string;
+      filename: string;
+      contentType: string;
+      /** The attachment's raw bytes, base64-encoded. */
+      contentBase64: string;
+      /** Optional comment on the same issue to bind the attachment to. */
+      commentId?: string | null;
+    },
+    result: IssueAttachment,
+  ];
 
   // Issue Documents
   "issues.documents.list": [

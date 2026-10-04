@@ -1037,6 +1037,17 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           });
         },
 
+        async createAttachment(input) {
+          return callHost("issues.createAttachment", {
+            issueId: input.issueId,
+            companyId: input.companyId,
+            filename: input.filename,
+            contentType: input.contentType,
+            contentBase64: input.contentBase64,
+            commentId: input.commentId ?? null,
+          });
+        },
+
         documents: {
           async list(issueId: string, companyId: string) {
             return callHost("issues.documents.list", { issueId, companyId });

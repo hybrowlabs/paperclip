@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -31,6 +31,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
@@ -1283,5 +1284,140 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(
       services.issues.getAttachmentContent({ attachmentId, companyId, maxBytes: 1_000_000 }),
     ).rejects.toThrow("over the");
+  });
+
+  describe("issues.createAttachment", () => {
+    const PNG_BYTES = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
+    let previousStorageDir: string | undefined;
+    let previousProvider: string | undefined;
+
+    beforeEach(async () => {
+      previousStorageDir = process.env.PAPERCLIP_STORAGE_LOCAL_DIR;
+      previousProvider = process.env.PAPERCLIP_STORAGE_PROVIDER;
+      process.env.PAPERCLIP_STORAGE_LOCAL_DIR = await makeLocalRoot();
+      process.env.PAPERCLIP_STORAGE_PROVIDER = "local_disk";
+      vi.stubEnv("PAPERCLIP_DEPLOYMENT_MODE", "local_trusted");
+      vi.stubEnv("PAPERCLIP_DEPLOYMENT_EXPOSURE", "private");
+      vi.stubEnv("PAPERCLIP_BIND", "loopback");
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      if (previousStorageDir === undefined) delete process.env.PAPERCLIP_STORAGE_LOCAL_DIR;
+      else process.env.PAPERCLIP_STORAGE_LOCAL_DIR = previousStorageDir;
+      if (previousProvider === undefined) delete process.env.PAPERCLIP_STORAGE_PROVIDER;
+      else process.env.PAPERCLIP_STORAGE_PROVIDER = previousProvider;
+    });
+
+    async function seedIssue(companyId: string, title = "Target") {
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title, status: "todo", priority: "medium" });
+      return issueId;
+    }
+
+    it("stores the bytes, links the attachment to the issue and round-trips through getAttachmentContent", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const issueId = await seedIssue(companyId);
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+
+      const created = await services.issues.createAttachment({
+        issueId,
+        companyId,
+        filename: "photo.png",
+        contentType: "image/png",
+        contentBase64: PNG_BYTES.toString("base64"),
+      });
+
+      expect(created).toMatchObject({
+        issueId,
+        companyId,
+        originalFilename: "photo.png",
+        contentType: "image/png",
+        byteSize: PNG_BYTES.length,
+        issueCommentId: null,
+      });
+      const [row] = await db.select().from(issueAttachments).where(eq(issueAttachments.id, created.id));
+      expect(row?.issueId).toBe(issueId);
+      const content = await services.issues.getAttachmentContent({ attachmentId: created.id, companyId });
+      expect(Buffer.from(content!.contentBase64, "base64").equals(PNG_BYTES)).toBe(true);
+      const [audit] = await db
+        .select()
+        .from(activityLog)
+        .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.attachment.created")));
+      expect(audit?.actorType).toBe("plugin");
+      expect(JSON.stringify(audit?.details)).not.toContain(PNG_BYTES.toString("base64"));
+    });
+
+    it("binds the attachment to a comment on the same issue", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const issueId = await seedIssue(companyId);
+      const commentId = randomUUID();
+      await db.insert(issueComments).values({ id: commentId, companyId, issueId, body: "hi", authorType: "system" } as any);
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      const created = await services.issues.createAttachment({
+        issueId, companyId, commentId, filename: "a.png", contentType: "image/png",
+        contentBase64: PNG_BYTES.toString("base64"),
+      });
+      expect(created.issueCommentId).toBe(commentId);
+    });
+
+    it("rejects a comment that belongs to a different issue", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const issueId = await seedIssue(companyId);
+      const otherIssueId = await seedIssue(companyId, "Other");
+      const commentId = randomUUID();
+      await db.insert(issueComments).values({ id: commentId, companyId, issueId: otherIssueId, body: "hi", authorType: "system" } as any);
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      await expect(
+        services.issues.createAttachment({
+          issueId, companyId, commentId, filename: "a.png", contentType: "image/png",
+          contentBase64: PNG_BYTES.toString("base64"),
+        }),
+      ).rejects.toThrow();
+      expect(await db.select().from(issueAttachments)).toHaveLength(0);
+    });
+
+    it("rejects an issue that belongs to another company and writes nothing", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const otherCompany = randomUUID();
+      await db.insert(companies).values({
+        id: otherCompany, name: "Other", issuePrefix: issuePrefix(otherCompany), requireBoardApprovalForNewAgents: false,
+      });
+      const otherIssueId = await seedIssue(otherCompany, "Theirs");
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      await expect(
+        services.issues.createAttachment({
+          issueId: otherIssueId, companyId, filename: "a.png", contentType: "image/png",
+          contentBase64: PNG_BYTES.toString("base64"),
+        }),
+      ).rejects.toThrow("Issue not found");
+      expect(await db.select().from(issueAttachments)).toHaveLength(0);
+      expect(await db.select().from(assets)).toHaveLength(0);
+    });
+
+    it("rejects over-cap, empty and invalid-base64 payloads", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const issueId = await seedIssue(companyId);
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      const base = { issueId, companyId, filename: "a.png", contentType: "image/png" };
+      await expect(
+        services.issues.createAttachment({ ...base, contentBase64: Buffer.alloc(MAX_ATTACHMENT_BYTES + 1).toString("base64") }),
+      ).rejects.toThrow("over the");
+      await expect(services.issues.createAttachment({ ...base, contentBase64: "" })).rejects.toThrow("empty");
+      await expect(services.issues.createAttachment({ ...base, contentBase64: "@@not base64@@" })).rejects.toThrow("base64");
+      expect(await db.select().from(assets)).toHaveLength(0);
+    });
+
+    it("rejects a content type outside the deployment allow-list", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const issueId = await seedIssue(companyId);
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      await expect(
+        services.issues.createAttachment({
+          issueId, companyId, filename: "evil.exe", contentType: "application/x-msdownload",
+          contentBase64: PNG_BYTES.toString("base64"),
+        }),
+      ).rejects.toThrow("content type");
+    });
   });
 });

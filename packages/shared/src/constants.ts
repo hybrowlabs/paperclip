@@ -1359,6 +1359,10 @@ export const PLUGIN_CAPABILITIES = [
   "issues.wakeup",
   "issue.comments.create",
   "issue.comments.create_human_attributed",
+  // Create an issue attachment from plugin-supplied bytes (base64). The host
+  // enforces company scoping, the deployment size cap and the attachment
+  // content-type allow-list, and audit-logs every creation.
+  "issue.attachments.create",
   "issue.interactions.create",
   // Respond to (accept/reject) an issue-thread interaction on behalf of a
   // paired board user. Impersonation surface: the host independently

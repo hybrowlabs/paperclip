@@ -42,6 +42,13 @@ import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
 import { getStorageService } from "../storage/index.js";
+import {
+  MAX_ATTACHMENT_BYTES,
+  formatAttachmentSize,
+  isAllowedContentType,
+  normalizeUploadAttachmentContentType,
+} from "../attachment-types.js";
+import { HttpError } from "../errors.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -2583,6 +2590,104 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         return (await issues.listAttachments(params.issueId)) as any;
+      },
+      async createAttachment(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+
+        const base64 = typeof params.contentBase64 === "string" ? params.contentBase64 : "";
+        if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64) || base64.length % 4 === 1) {
+          throw new Error("contentBase64 is not valid base64");
+        }
+        // Cheap pre-decode bound so an oversized payload is refused before
+        // allocating a buffer for it.
+        const decodedUpperBound = Math.ceil((base64.length * 3) / 4);
+        if (decodedUpperBound > MAX_ATTACHMENT_BYTES + 2) {
+          throw new Error(
+            `attachment is over the ${formatAttachmentSize(MAX_ATTACHMENT_BYTES)} limit`,
+          );
+        }
+        const bytes = Buffer.from(base64, "base64");
+        if (bytes.length === 0) throw new Error("attachment is empty");
+        if (bytes.length > MAX_ATTACHMENT_BYTES) {
+          throw new Error(
+            `attachment is ${bytes.length} bytes, over the ${formatAttachmentSize(MAX_ATTACHMENT_BYTES)} limit`,
+          );
+        }
+
+        const filename = typeof params.filename === "string" ? params.filename.trim() : "";
+        const contentType = normalizeUploadAttachmentContentType({
+          contentType: params.contentType,
+          originalFilename: filename || null,
+          isAllowedContentType,
+        });
+        if (!isAllowedContentType(contentType)) {
+          throw new Error(`attachment content type ${contentType} is not allowed`);
+        }
+
+        const storage = getStorageService();
+        const stored = await storage.putFile({
+          companyId,
+          namespace: `issues/${issue.id}`,
+          originalFilename: filename || null,
+          contentType,
+          body: bytes,
+        });
+
+        let attachment: Awaited<ReturnType<typeof issues.createAttachment>>;
+        try {
+          attachment = await issues.createAttachment({
+            issueId: issue.id,
+            issueCommentId: params.commentId ?? null,
+            provider: stored.provider,
+            objectKey: stored.objectKey,
+            contentType: stored.contentType,
+            byteSize: stored.byteSize,
+            sha256: stored.sha256,
+            originalFilename: stored.originalFilename,
+          });
+        } catch (err) {
+          // Only a definite 4xx rejection proves the registration did not
+          // commit; an ambiguous/database error must not delete an object a
+          // committed row may reference.
+          if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
+            try {
+              await storage.deleteObject(companyId, stored.objectKey);
+            } catch (cleanupErr) {
+              logger.warn(
+                { cleanupErr, companyId, issueId: issue.id },
+                "failed to remove stored object after plugin attachment registration was rejected",
+              );
+            }
+          }
+          throw err;
+        }
+
+        await logPluginActivity({
+          companyId,
+          action: "issue.attachment.created",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            attachmentId: attachment.id,
+            originalFilename: attachment.originalFilename,
+            contentType: attachment.contentType,
+            byteSize: attachment.byteSize,
+            commentId: attachment.issueCommentId,
+          },
+        });
+
+        const contentPath = `/api/attachments/${attachment.id}/content`;
+        const { artifactWorkProductId: _artifactWorkProductId, ...row } = attachment as typeof attachment & {
+          artifactWorkProductId?: string | null;
+        };
+        return {
+          ...row,
+          contentPath,
+          openPath: contentPath,
+          downloadPath: `${contentPath}?download=1`,
+        } as any;
       },
       async getAttachmentContent(params) {
         const companyId = ensureCompanyId(params.companyId);

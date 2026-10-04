@@ -417,4 +417,59 @@ describe("createHostClientHandlers capability gating for LOOA-641 methods", () =
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     expect(list).not.toHaveBeenCalled();
   });
+
+  describe("issues.createAttachment", () => {
+    const params = {
+      issueId: "issue-a",
+      companyId: "company-a",
+      filename: "photo.png",
+      contentType: "image/png",
+      contentBase64: "aGVsbG8=",
+    };
+
+    it("denies the call without issue.attachments.create (read capability is not enough)", async () => {
+      const createAttachment = vi.fn(async () => ({ id: "att-1" }));
+      const services = { issues: { createAttachment } } as unknown as HostServices;
+      const handlers = createHostClientHandlers({
+        pluginId: "paperclip.test",
+        capabilities: ["issue.attachments.read"],
+        services,
+      });
+      await expect(
+        handlers["issues.createAttachment"](params, { invocationScope: { companyId: "company-a" } }),
+      ).rejects.toBeInstanceOf(CapabilityDeniedError);
+      expect(createAttachment).not.toHaveBeenCalled();
+    });
+
+    it("forwards the call once issue.attachments.create is granted", async () => {
+      const createAttachment = vi.fn(async () => ({ id: "att-1" }));
+      const services = { issues: { createAttachment } } as unknown as HostServices;
+      const handlers = createHostClientHandlers({
+        pluginId: "paperclip.test",
+        capabilities: ["issue.attachments.create"],
+        services,
+      });
+      await expect(
+        handlers["issues.createAttachment"](params, { invocationScope: { companyId: "company-a" } }),
+      ).resolves.toEqual({ id: "att-1" });
+      expect(createAttachment).toHaveBeenCalledWith(params);
+    });
+
+    it("rejects a worker-selected company that differs from the invocation scope", async () => {
+      const createAttachment = vi.fn(async () => ({ id: "att-1" }));
+      const services = { issues: { createAttachment } } as unknown as HostServices;
+      const handlers = createHostClientHandlers({
+        pluginId: "paperclip.test",
+        capabilities: ["issue.attachments.create"],
+        services,
+      });
+      await expect(
+        handlers["issues.createAttachment"](
+          { ...params, companyId: "company-b" },
+          { invocationScope: { companyId: "company-a" } },
+        ),
+      ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+      expect(createAttachment).not.toHaveBeenCalled();
+    });
+  });
 });
