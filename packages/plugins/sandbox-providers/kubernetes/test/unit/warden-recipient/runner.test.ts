@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   CheckDenied,
   WARDEN_RECIPE,
+  type GrantPort,
+  startRecipientLeaseSweeper,
   runWardenRecipientCheck,
   sweepExpiredRecipientLeases,
   buildWardenRecipientEgressPolicy,
@@ -103,6 +105,7 @@ function makeWorld(opts: {
   const deps: RunnerDeps = {
     clients,
     config: {
+      expectedRecipientAgentId: WARDEN,
       driver: "kubernetes",
       backend: "job",
       egressMode: "cilium",
@@ -390,9 +393,9 @@ describe("warden recipient runner: lease destroyed on every terminal path", () =
     const w = makeWorld();
     const ac = new AbortController();
     ac.abort();
-    const r = await runWardenRecipientCheck(w.deps, actor, request, ac.signal);
-    expect(r.outcome).toBe("cancelled");
-    expect(w.calls).not.toContain("job.create");
+    const err = await runWardenRecipientCheck(w.deps, actor, request, ac.signal).then(() => null, (e) => e);
+    expect((err as CheckDenied).code).toBe("cancelled");
+    expect(w.calls).toEqual([]);
     expect(w.state).toEqual(empty);
   });
   it("Job creation failure still removes Secret and policy", async () => {
@@ -487,5 +490,171 @@ describe("values-free alias projection", () => {
     const w = makeWorld();
     w.deps.aliases = { project: vi.fn(async () => { throw new Error("403"); }) };
     expect((await runWardenRecipientCheck(w.deps, actor, request)).aliasNamesMatch).toBe("INCONCLUSIVE");
+  });
+});
+
+
+const EMPTY = { job: false, secret: false, policy: false, pods: 0 };
+const AUDIT_EVENTS = ["grant_consumed", "lease_created", "egress_verified", "run_finished", "lease_destroyed"] as const;
+
+describe("repair: audit sink failure never strands a credential-bearing lease (P1)", () => {
+  it.each(AUDIT_EVENTS)("audit port throws at %s -> lease fully destroyed", async (failAt) => {
+    const w = makeWorld();
+    const original = w.deps.audit.record;
+    w.deps.audit = {
+      record: vi.fn(async (e: AuditEvent) => {
+        if (e.event === failAt) throw new Error(`sink down ${SECRET_SK}`);
+        return original(e);
+      }),
+    };
+    const result = await runWardenRecipientCheck(w.deps, actor, request).then((r) => ({ r }), (e) => ({ e }));
+    expect(w.state).toEqual(EMPTY);
+    if ("e" in result) {
+      expect(String(result.e)).not.toContain(SECRET_SK);
+      expect(result.e).toBeInstanceOf(CheckDenied);
+      if (failAt !== "grant_consumed") throw new Error("only the pre-lease audit may deny");
+      expect(w.calls).toEqual([]);
+    }
+  });
+  it("audit port throws on every record -> still no lease and no leak", async () => {
+    const w = makeWorld();
+    w.deps.audit = { record: vi.fn(async () => { throw new Error(`down ${SECRET_AK}`); }) };
+    const result = await runWardenRecipientCheck(w.deps, actor, request).then((r) => ({ r }), (e) => ({ e }));
+    expect(w.state).toEqual(EMPTY);
+    expect(JSON.stringify(result, (_k, v) => (v instanceof Error ? v.message : v))).not.toContain(SECRET_AK);
+  });
+  it("destroy() throwing unexpectedly is reported as not verified absent, never PASS", async () => {
+    const w = makeWorld();
+    w.clients.core.listNamespacedPod = vi.fn(async () => { throw new Error("api down"); });
+    const r = await runWardenRecipientCheck(w.deps, actor, request);
+    expect(r.overall).toBe("INCONCLUSIVE");
+    expect(r.leaseAttestation?.destroyVerifiedAbsent).toBe(false);
+  });
+  it("abort fired during lease creation still destroys what was created", async () => {
+    const w = makeWorld();
+    const ac = new AbortController();
+    w.clients.core.createNamespacedSecret = vi.fn(async () => { w.state.secret = true; ac.abort(); });
+    const r = await runWardenRecipientCheck(w.deps, actor, request, ac.signal);
+    expect(r.outcome).toBe("cancelled");
+    expect(w.state).toEqual(EMPTY);
+  });
+});
+
+describe("repair: port exceptions map to internal_denial without raw messages (P10)", () => {
+  it.each(["preflight", "grants", "audit-grant_consumed"])("%s throws -> internal_denial, no lease, no raw text", async (which) => {
+    const w = makeWorld();
+    const boom = () => { throw new Error(`db down ${SECRET_SK}`); };
+    if (which === "preflight") w.deps.preflight = { resolve: vi.fn(async () => boom()) };
+    if (which === "grants") w.deps.grants = { consume: vi.fn(async () => boom()) };
+    if (which === "audit-grant_consumed") {
+      const orig = w.deps.audit.record;
+      w.deps.audit = { record: vi.fn(async (e: AuditEvent) => (e.event === "grant_consumed" ? boom() : orig(e))) };
+    }
+    const err = await runWardenRecipientCheck(w.deps, actor, request).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(CheckDenied);
+    expect((err as CheckDenied).code).toBe("internal_denial");
+    expect(String(err)).not.toContain(SECRET_SK);
+    expect(w.calls).toEqual([]);
+    expect(w.deps.delivery.resolveRecipientEnv).not.toHaveBeenCalled();
+  });
+  it("an audit failure while recording a denial still yields the original denial code", async () => {
+    const w = makeWorld({ target: { currentConfigRevision: "rev-8" } });
+    w.deps.audit = { record: vi.fn(async () => { throw new Error(SECRET_SK); }) };
+    const err = await runWardenRecipientCheck(w.deps, actor, request).then(() => null, (e) => e);
+    expect((err as CheckDenied).code).toBe("stale_config_revision");
+  });
+});
+
+describe("repair: abort ordering (P2)", () => {
+  it("pre-aborted signal creates nothing and consumes no grant", async () => {
+    const w = makeWorld();
+    const ac = new AbortController();
+    ac.abort();
+    const err = await runWardenRecipientCheck(w.deps, actor, request, ac.signal).then(() => null, (e) => e);
+    expect((err as CheckDenied).code).toBe("cancelled");
+    expect(w.calls).toEqual([]);
+    expect(w.deps.grants.consume).not.toHaveBeenCalled();
+    expect(w.clients.custom.createNamespacedCustomObject).not.toHaveBeenCalled();
+    expect(w.clients.core.createNamespacedSecret).not.toHaveBeenCalled();
+  });
+  it("abort after the grant is consumed but before lease creation creates no policy or Secret", async () => {
+    const w = makeWorld();
+    const ac = new AbortController();
+    const orig = w.deps.delivery.resolveRecipientEnv;
+    w.deps.delivery = { resolveRecipientEnv: vi.fn(async (i) => { ac.abort(); return orig(i); }) };
+    const r = await runWardenRecipientCheck(w.deps, actor, request, ac.signal);
+    expect(r.outcome).toBe("cancelled");
+    expect(r.leaseAttestation).toBeNull();
+    expect(w.clients.custom.createNamespacedCustomObject).not.toHaveBeenCalled();
+    expect(w.clients.core.createNamespacedSecret).not.toHaveBeenCalled();
+  });
+});
+
+describe("repair: recipient pinned in the runner (P3)", () => {
+  it("preflight returning a different recipient agent is denied before grant/lease/delivery", async () => {
+    const w = makeWorld({ target: { recipientAgentId: "some-other-agent" } });
+    const err = await runWardenRecipientCheck(w.deps, actor, request).then(() => null, (e) => e);
+    expect((err as CheckDenied).code).toBe("wrong_recipient");
+    expect(w.deps.grants.consume).not.toHaveBeenCalled();
+    expect(w.deps.delivery.resolveRecipientEnv).not.toHaveBeenCalled();
+    expect(w.calls).toEqual([]);
+  });
+});
+
+describe("repair: single-use GrantPort contract (P4)", () => {
+  function atomicGrantStore(): GrantPort {
+    const state = new Map<string, "open" | "consumed">([[GRANT, "open"]]);
+    return {
+      consume: async (i) => {
+        await Promise.resolve();
+        const s = state.get(i.grantId);
+        if (!s) return "not_found";
+        if (s === "consumed") return "already_consumed";
+        state.set(i.grantId, "consumed");
+        return "consumed";
+      },
+    };
+  }
+  it("10 concurrent invocations against a compliant atomic grant store yield exactly one lease", async () => {
+    const w = makeWorld();
+    w.deps.grants = atomicGrantStore();
+    const results = await Promise.allSettled(Array.from({ length: 10 }, () => runWardenRecipientCheck(w.deps, actor, request)));
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const codes = results.filter((r): r is PromiseRejectedResult => r.status === "rejected").map((r) => (r.reason as CheckDenied).code);
+    expect(codes).toHaveLength(9);
+    expect(new Set(codes)).toEqual(new Set(["grant_already_consumed"]));
+    expect(w.calls.filter((c) => c === "job.create")).toHaveLength(1);
+  });
+  it("process-local guard blocks concurrent replay even against a NON-atomic (non-compliant) store in the same process", async () => {
+    const w = makeWorld();
+    let consumed = false;
+    w.deps.grants = { consume: async () => { await Promise.resolve(); const was = consumed; consumed = false; return was ? "already_consumed" : "consumed"; } };
+    const results = await Promise.allSettled(Array.from({ length: 10 }, () => runWardenRecipientCheck(w.deps, actor, request)));
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+  });
+  it("a denied (non-consumed) outcome does not poison the grant for a later legitimate call", async () => {
+    const w = makeWorld();
+    let first = true;
+    w.deps.grants = { consume: vi.fn(async () => { if (first) { first = false; return "mismatch"; } return "consumed"; }) };
+    await expect(runWardenRecipientCheck(w.deps, actor, request)).rejects.toBeInstanceOf(CheckDenied);
+    expect((await runWardenRecipientCheck(w.deps, actor, request)).overall).toBe("PASS");
+  });
+});
+
+describe("repair: sweeper is schedulable", () => {
+  it("startRecipientLeaseSweeper sweeps on its interval and can be stopped", async () => {
+    vi.useFakeTimers();
+    try {
+      const w = makeWorld();
+      w.clients.core.listNamespacedSecret = vi.fn(async () => ({ items: [] }));
+      const sweeper = startRecipientLeaseSweeper(w.clients, { namespace: "wr-ns", intervalMs: 1000 });
+      await vi.advanceTimersByTimeAsync(2500);
+      expect(w.clients.core.listNamespacedSecret).toHaveBeenCalledTimes(2);
+      sweeper.stop();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(w.clients.core.listNamespacedSecret).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

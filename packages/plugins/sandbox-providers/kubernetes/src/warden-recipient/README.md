@@ -13,6 +13,14 @@ Dedicated, no-model, single-recipe recipient lease. It is not wired to a route, 
 - Teardown on success, error, timeout, cancellation, and creation failure: delete Job, pods, Secret, policy, then read back absence; the attestation reports `destroyVerifiedAbsent`. A failed teardown can never be PASS. `sweepExpiredRecipientLeases` removes leases orphaned by a server crash.
 - Audit events: denied, grant_consumed, lease_created, egress_verified, run_finished, lease_destroyed|lease_destroy_failed (ids only, no values).
 
+## Port contracts (repair of Sentinel checker findings on 955a9b5)
+
+- `GrantPort.consume` MUST be one atomic compare-and-set in the system of record (single winner across processes). The runner only adds a process-local guard; it cannot give cross-process single use. Tested against a compliant atomic fake (10 concurrent -> 1 lease).
+- Recipient is pinned by `RunnerConfig.expectedRecipientAgentId` (server config); a preflight port returning any other agent is denied before grant/delivery/lease.
+- Port exceptions (preflight, grant, pre-lease audit) -> `CheckDenied("internal_denial")`; raw messages never reach the caller. Denial-audit failure never masks the denial code.
+- After the first Kubernetes object is created, `destroy()` runs in a `finally` before any audit write; post-lease audit is best-effort. Abort is checked before the grant, before policy and before Secret creation.
+- Operator must run `startRecipientLeaseSweeper` (or equivalent) in the server process as backstop for crash-orphaned leases.
+
 ## Not included (separate work)
 
 - Server adapters for the four ports (grant store, preflight against agent config revisions, delivery, metadata projection) and the route. Alias predicate is INCONCLUSIVE without `AliasProjectionPort` or without metadata authority.

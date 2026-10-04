@@ -45,6 +45,7 @@ export type DenialCode =
   | "missing_egress_constraint"
   | "delivery_unavailable"
   | "image_rejected"
+  | "cancelled"
   | "internal_denial";
 
 export class CheckDenied extends Error {
@@ -69,6 +70,15 @@ export interface RecipientPreflightPort {
 
 export type GrantOutcome = "consumed" | "not_found" | "expired" | "already_consumed" | "mismatch";
 
+/**
+ * Contract: `consume` MUST be a single atomic compare-and-set in the system of
+ * record (for example `UPDATE ... SET consumed_at = now() WHERE id = $1 AND
+ * consumed_at IS NULL AND expires_at > $now AND <all bound fields match>`), so
+ * that at most one caller ever receives "consumed" for a grant, including
+ * across processes and concurrent calls. A non-atomic read-then-write
+ * implementation is non-compliant. The runner adds only a process-local
+ * defense-in-depth guard; it cannot provide cross-process single use.
+ */
 export interface GrantPort {
   consume(input: {
     grantId: string;
@@ -121,6 +131,8 @@ export interface AuditPort {
 }
 
 export interface RunnerConfig {
+  /** The only agent this runner may ever provision a lease for (Warden). Pinned by server configuration, not by the preflight port. */
+  expectedRecipientAgentId: string;
   driver: "kubernetes";
   backend: "job";
   egressMode: "cilium";
@@ -178,6 +190,25 @@ export interface CheckReceipt {
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const digest = (v: string) => createHash("sha256").update(v).digest("hex").slice(0, 16);
 
+const seenGrants = new WeakMap<object, Set<string>>();
+const SEEN_GRANTS_MAX = 10_000;
+
+function releaseGrantLocally(port: object, grantId: string): void {
+  seenGrants.get(port)?.delete(grantId);
+}
+
+function claimGrantLocally(port: object, grantId: string): boolean {
+  let set = seenGrants.get(port);
+  if (!set) {
+    set = new Set();
+    seenGrants.set(port, set);
+  }
+  if (set.has(grantId)) return false;
+  if (set.size >= SEEN_GRANTS_MAX) set.delete(set.values().next().value as string);
+  set.add(grantId);
+  return true;
+}
+
 export async function runWardenRecipientCheck(deps: RunnerDeps, actor: CheckActor, rawRequest: unknown, signal?: AbortSignal): Promise<CheckReceipt> {
   const now = deps.now ?? (() => new Date());
   const checkId = (deps.newCheckId ?? randomUUID)();
@@ -194,15 +225,30 @@ export async function runWardenRecipientCheck(deps: RunnerDeps, actor: CheckActo
     grantId: null,
     ...extra,
   });
+  const bestEffortAudit = async (event: AuditEvent): Promise<void> => {
+    try {
+      await deps.audit.record(event);
+    } catch {
+      // Audit sink failure must never keep a credential-bearing lease alive.
+    }
+  };
   const deny = async (code: DenialCode, extra: Partial<AuditEvent> = {}): Promise<never> => {
-    await deps.audit.record(base("denied", { code, ...extra }));
+    await bestEffortAudit(base("denied", { code, ...extra }));
     throw new CheckDenied(code);
+  };
+  const guard = async <T,>(fn: () => Promise<T>, extra: Partial<AuditEvent> = {}): Promise<T> => {
+    try {
+      return await fn();
+    } catch {
+      return deny("internal_denial", extra);
+    }
   };
 
   const parsed = checkRequestSchema.safeParse(rawRequest);
   if (!parsed.success) return deny("invalid_request");
   const request = parsed.data;
   const ctx = { issueId: request.issueId, grantId: request.grantId };
+  if (signal?.aborted) return deny("cancelled", ctx);
 
   if (deps.config.driver !== "kubernetes" || deps.config.backend !== "job") return deny("host_execution_rejected", ctx);
   try {
@@ -211,8 +257,9 @@ export async function runWardenRecipientCheck(deps: RunnerDeps, actor: CheckActo
     return deny("missing_egress_constraint", ctx);
   }
 
-  const target = await deps.preflight.resolve(actor, request);
+  const target = await guard(() => deps.preflight.resolve(actor, request), ctx);
   if (!target) return deny("wrong_recipient", ctx);
+  if (target.recipientAgentId !== deps.config.expectedRecipientAgentId) return deny("wrong_recipient", ctx);
   const tctx = { ...ctx, recipientAgentId: target.recipientAgentId, configRevision: target.currentConfigRevision };
   if (target.environmentDriver !== "kubernetes") return deny("host_execution_rejected", tctx);
   if (target.checkerAgentId !== actor.agentId || target.checkerRunId !== actor.runId) return deny("wrong_actor", tctx);
@@ -234,17 +281,26 @@ export async function runWardenRecipientCheck(deps: RunnerDeps, actor: CheckActo
     throw err;
   }
 
-  const outcome = await deps.grants.consume({
-    grantId: request.grantId,
-    checkerAgentId: actor.agentId,
-    checkerRunId: actor.runId,
-    issueId: request.issueId,
-    recipientAgentId: target.recipientAgentId,
-    configRevision: target.currentConfigRevision,
-    recipe: WARDEN_RECIPE.version,
-    now: now(),
+  if (!claimGrantLocally(deps.grants, request.grantId)) return deny("grant_already_consumed", tctx);
+  const outcome = await guard(
+    () =>
+      deps.grants.consume({
+        grantId: request.grantId,
+        checkerAgentId: actor.agentId,
+        checkerRunId: actor.runId,
+        issueId: request.issueId,
+        recipientAgentId: target.recipientAgentId,
+        configRevision: target.currentConfigRevision,
+        recipe: WARDEN_RECIPE.version,
+        now: now(),
+      }),
+    tctx,
+  ).catch((err) => {
+    releaseGrantLocally(deps.grants, request.grantId);
+    throw err;
   });
   if (outcome !== "consumed") {
+    releaseGrantLocally(deps.grants, request.grantId);
     const map: Record<Exclude<GrantOutcome, "consumed">, DenialCode> = {
       not_found: "grant_not_found",
       expired: "grant_expired",
@@ -253,7 +309,7 @@ export async function runWardenRecipientCheck(deps: RunnerDeps, actor: CheckActo
     };
     return deny(map[outcome], tctx);
   }
-  await deps.audit.record(base("grant_consumed", tctx));
+  await guard(() => deps.audit.record(base("grant_consumed", tctx)), tctx);
 
   const startedAt = now().toISOString();
   let env: Record<string, string> | null;
@@ -289,26 +345,39 @@ export async function runWardenRecipientCheck(deps: RunnerDeps, actor: CheckActo
   let jobUid = "";
   let egressVerified = false;
   const createdAt = now().toISOString();
-  try {
-    await lease.create(env, tctx.configRevision, signal);
-    await deps.audit.record(base("lease_created", tctx));
-    await lease.verifyEgress();
-    egressVerified = true;
-    await deps.audit.record(base("egress_verified", tctx));
-    await lease.start();
-    jobUid = lease.currentJobUid();
-    const result = await lease.wait(signal);
-    pod = result.pod;
-    runOutcome = result.outcome;
-  } catch (err) {
-    runOutcome = err instanceof EgressConstraintError ? "error" : signal?.aborted ? "cancelled" : "error";
-  } finally {
+  let destroy: { deleted: boolean; verifiedAbsent: boolean } = { deleted: false, verifiedAbsent: false };
+  if (signal?.aborted) {
     env = null;
+    runOutcome = "cancelled";
+    destroy = { deleted: true, verifiedAbsent: true };
+  } else {
+    try {
+      try {
+        await lease.create(env, tctx.configRevision, signal);
+        await bestEffortAudit(base("lease_created", tctx));
+        await lease.verifyEgress();
+        egressVerified = true;
+        await bestEffortAudit(base("egress_verified", tctx));
+        await lease.start();
+        jobUid = lease.currentJobUid();
+        const result = await lease.wait(signal);
+        pod = result.pod;
+        runOutcome = result.outcome;
+      } catch (err) {
+        runOutcome = err instanceof EgressConstraintError ? "error" : signal?.aborted ? "cancelled" : "error";
+      } finally {
+        env = null;
+      }
+    } finally {
+      try {
+        destroy = await lease.destroy();
+      } catch {
+        destroy = { deleted: false, verifiedAbsent: false };
+      }
+    }
+    await bestEffortAudit(base("run_finished", { ...tctx, outcome: runOutcome }));
+    await bestEffortAudit(base(destroy.verifiedAbsent ? "lease_destroyed" : "lease_destroy_failed", tctx));
   }
-  await deps.audit.record(base("run_finished", { ...tctx, outcome: runOutcome }));
-
-  const destroy = await lease.destroy();
-  await deps.audit.record(base(destroy.verifiedAbsent ? "lease_destroyed" : "lease_destroy_failed", tctx));
 
   const predicates = {
     expectedPrincipalMatch: (pod?.expectedPrincipalMatch ?? "INCONCLUSIVE") as Tri,
@@ -374,6 +443,7 @@ class RecipientLease {
 
   async create(env: Record<string, string>, configRevision: string, signal?: AbortSignal): Promise<void> {
     const { clients } = this.deps;
+    if (signal?.aborted) throw new Error("cancelled");
     this.touched = true;
     await clients.custom.createNamespacedCustomObject({
       group: "cilium.io",
@@ -382,6 +452,7 @@ class RecipientLease {
       plural: "ciliumnetworkpolicies",
       body: this.policy,
     });
+    if (signal?.aborted) throw new Error("cancelled");
     await clients.core.createNamespacedSecret({
       namespace: this.namespace,
       body: {
@@ -465,6 +536,10 @@ class RecipientLease {
   }
 
   async destroy(): Promise<{ deleted: boolean; verifiedAbsent: boolean }> {
+    return this.destroyInner().catch(() => ({ deleted: false, verifiedAbsent: false }));
+  }
+
+  private async destroyInner(): Promise<{ deleted: boolean; verifiedAbsent: boolean }> {
     if (!this.touched) return { deleted: true, verifiedAbsent: true };
     const { clients } = this.deps;
     const ns = this.namespace;
@@ -511,6 +586,17 @@ class RecipientLease {
     }
     return { deleted, verifiedAbsent };
   }
+}
+
+export function startRecipientLeaseSweeper(
+  clients: KubeClients,
+  input: { namespace: string; intervalMs?: number; maxAgeSeconds?: number; onError?: (code: "sweep_failed") => void },
+): { stop(): void } {
+  const timer = setInterval(() => {
+    sweepExpiredRecipientLeases(clients, { namespace: input.namespace, maxAgeSeconds: input.maxAgeSeconds }).catch(() => input.onError?.("sweep_failed"));
+  }, input.intervalMs ?? 60_000);
+  timer.unref?.();
+  return { stop: () => clearInterval(timer) };
 }
 
 export async function sweepExpiredRecipientLeases(
