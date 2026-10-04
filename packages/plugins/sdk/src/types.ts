@@ -651,6 +651,23 @@ export interface PluginHttpClient {
    * @returns The response
    */
   fetch(url: string, init?: RequestInit): Promise<Response>;
+
+  /**
+   * Binary-safe outbound HTTP request. Use this (not `fetch`) for images,
+   * PDFs and other non-text bodies: `fetch` decodes the body as UTF-8 across
+   * the host bridge, which corrupts binary data.
+   *
+   * Requires `http.outbound`; same SSRF protections as `fetch`. Redirects are
+   * not followed. The host aborts the download once `options.maxBytes` is
+   * exceeded and the call rejects.
+   *
+   * @returns status, headers and the exact response bytes.
+   */
+  fetchBinary(
+    url: string,
+    init?: RequestInit,
+    options?: { maxBytes?: number },
+  ): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: Uint8Array }>;
 }
 
 /**

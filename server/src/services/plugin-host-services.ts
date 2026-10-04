@@ -272,11 +272,12 @@ function buildPinnedRequestOptions(
   };
 }
 
-async function executePinnedHttpRequest(
+export async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
   init: RequestInit | undefined,
   signal: AbortSignal,
-): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
+  mode: { binary?: boolean; maxBytes?: number } = {},
+): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string; bodyBase64?: string }> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
   const response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -291,7 +292,8 @@ async function executePinnedHttpRequest(
     req.end();
   });
 
-  const MAX_RESPONSE_BODY_BYTES = 200 * 1024 * 1024; // 200 MB
+  const MAX_RESPONSE_BODY_BYTES =
+    typeof mode.maxBytes === "number" && mode.maxBytes > 0 ? mode.maxBytes : 200 * 1024 * 1024; // default 200 MB
   const chunks: Buffer[] = [];
   let totalBytes = 0;
   await new Promise<void>((resolve, reject) => {
@@ -318,11 +320,15 @@ async function executePinnedHttpRequest(
     }
   }
 
+  const bodyBuffer = Buffer.concat(chunks);
   return {
     status: response.statusCode ?? 500,
     statusText: response.statusMessage ?? "",
     headers,
-    body: Buffer.concat(chunks).toString("utf8"),
+    // Binary responses must not pass through a UTF-8 decode: it would replace
+    // every invalid byte sequence and corrupt images/PDFs.
+    body: mode.binary ? "" : bodyBuffer.toString("utf8"),
+    ...(mode.binary ? { bodyBase64: bodyBuffer.toString("base64") } : {}),
   };
 }
 
@@ -1596,6 +1602,28 @@ export function buildHostServices(
         try {
           const init = params.init as RequestInit | undefined;
           return await executePinnedHttpRequest(target, init, controller.signal);
+        } finally {
+          clearTimeout(timeout);
+        }
+      },
+      async fetchBinary(params) {
+        const target = await validateAndResolveFetchUrl(params.url);
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), PLUGIN_FETCH_TIMEOUT_MS);
+
+        try {
+          const init = params.init as RequestInit | undefined;
+          const result = await executePinnedHttpRequest(target, init, controller.signal, {
+            binary: true,
+            maxBytes: params.maxBytes ?? undefined,
+          });
+          return {
+            status: result.status,
+            statusText: result.statusText,
+            headers: result.headers,
+            bodyBase64: result.bodyBase64 ?? "",
+          };
         } finally {
           clearTimeout(timeout);
         }

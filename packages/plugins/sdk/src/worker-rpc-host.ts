@@ -617,6 +617,36 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             headers: result.headers,
           });
         },
+
+        async fetchBinary(
+          url: string,
+          init?: RequestInit,
+          options?: { maxBytes?: number },
+        ) {
+          const serializedInit: Record<string, unknown> = {};
+          if (init) {
+            if (init.method) serializedInit.method = init.method;
+            if (init.headers) {
+              const obj: Record<string, string> = {};
+              new Headers(init.headers).forEach((v, k) => { obj[k] = v; });
+              serializedInit.headers = obj;
+            }
+            if (init.body !== undefined && init.body !== null) {
+              serializedInit.body = typeof init.body === "string" ? init.body : String(init.body);
+            }
+          }
+          const result = await callHost("http.fetchBinary", {
+            url,
+            init: Object.keys(serializedInit).length > 0 ? serializedInit : undefined,
+            maxBytes: options?.maxBytes ?? null,
+          });
+          return {
+            status: result.status,
+            statusText: result.statusText,
+            headers: result.headers,
+            body: new Uint8Array(Buffer.from(result.bodyBase64, "base64")),
+          };
+        },
       },
 
       secrets: {

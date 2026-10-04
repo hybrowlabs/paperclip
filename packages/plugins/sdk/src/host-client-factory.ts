@@ -146,6 +146,7 @@ export interface HostServices {
   /** Provides `http.fetch`. */
   http: {
     fetch(params: WorkerToHostMethods["http.fetch"][0]): Promise<WorkerToHostMethods["http.fetch"][1]>;
+    fetchBinary(params: WorkerToHostMethods["http.fetchBinary"][0]): Promise<WorkerToHostMethods["http.fetchBinary"][1]>;
   };
 
   /** Provides `secrets.resolve`. */
@@ -409,6 +410,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // HTTP
   "http.fetch": "http.outbound",
+  "http.fetchBinary": "http.outbound",
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
@@ -774,6 +776,9 @@ export function createHostClientHandlers(
     // HTTP
     "http.fetch": gated("http.fetch", async (params) => {
       return services.http.fetch(params);
+    }),
+    "http.fetchBinary": gated("http.fetchBinary", async (params) => {
+      return services.http.fetchBinary(params);
     }),
 
     // Secrets

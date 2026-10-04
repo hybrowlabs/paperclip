@@ -603,6 +603,7 @@ Required capabilities:
 | `ctx.issues.createComment` | `issue.comments.create` |
 | `ctx.issues.createComment` with `actorUserId` | `issue.comments.create` + `issue.comments.create_human_attributed` |
 | `ctx.issues.createAttachment` | `issue.attachments.create` |
+| `ctx.http.fetchBinary` | `http.outbound` (binary-safe: returns the exact response bytes; use for images/PDFs) |
 | `ctx.issues.requestWakeup` / `requestWakeups` | `issues.wakeup` |
 | `ctx.issues.summaries.getOrchestration` | `issues.orchestration.read` |
 

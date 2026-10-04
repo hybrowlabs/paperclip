@@ -917,6 +917,17 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "http.outbound");
         return fetch(url, init);
       },
+      async fetchBinary(url, init, options) {
+        requireCapability(manifest, capabilitySet, "http.outbound");
+        const response = await fetch(url, init);
+        const body = new Uint8Array(await response.arrayBuffer());
+        if (typeof options?.maxBytes === "number" && options.maxBytes > 0 && body.length > options.maxBytes) {
+          throw new Error(`Response body exceeded ${options.maxBytes} bytes`);
+        }
+        const headers: Record<string, string> = {};
+        response.headers.forEach((value, key) => { headers[key] = value; });
+        return { status: response.status, statusText: response.statusText, headers, body };
+      },
     },
     secrets: {
       async resolve(secretRef) {

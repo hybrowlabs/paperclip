@@ -472,4 +472,19 @@ describe("createHostClientHandlers capability gating for LOOA-641 methods", () =
       expect(createAttachment).not.toHaveBeenCalled();
     });
   });
+
+  describe("http.fetchBinary", () => {
+    const params = { url: "https://files.example.test/a.png", init: { headers: { Authorization: "Bearer t" } }, maxBytes: 1024 };
+
+    it("is gated by http.outbound", async () => {
+      const fetchBinary = vi.fn(async () => ({ status: 200, statusText: "OK", headers: {}, bodyBase64: "AAEC" }));
+      const services = { http: { fetchBinary } } as unknown as HostServices;
+      const denied = createHostClientHandlers({ pluginId: "paperclip.test", capabilities: [], services });
+      await expect(denied["http.fetchBinary"](params)).rejects.toBeInstanceOf(CapabilityDeniedError);
+      expect(fetchBinary).not.toHaveBeenCalled();
+      const allowed = createHostClientHandlers({ pluginId: "paperclip.test", capabilities: ["http.outbound"], services });
+      await expect(allowed["http.fetchBinary"](params)).resolves.toMatchObject({ bodyBase64: "AAEC" });
+      expect(fetchBinary).toHaveBeenCalledWith(params);
+    });
+  });
 });

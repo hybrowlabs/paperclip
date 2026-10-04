@@ -1653,6 +1653,15 @@ export interface WorkerToHostMethods {
     params: { url: string; init?: Record<string, unknown> },
     result: { status: number; statusText: string; headers: Record<string, string>; body: string },
   ];
+  /**
+   * Binary-safe variant of `http.fetch`: the response body is returned
+   * base64-encoded instead of UTF-8 decoded. Same SSRF guard, same
+   * `http.outbound` capability. `maxBytes` aborts the download once exceeded.
+   */
+  "http.fetchBinary": [
+    params: { url: string; init?: Record<string, unknown>; maxBytes?: number | null },
+    result: { status: number; statusText: string; headers: Record<string, string>; bodyBase64: string },
+  ];
 
   // Secrets
   "secrets.resolve": [
