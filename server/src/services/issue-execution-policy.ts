@@ -498,6 +498,51 @@ function selectStageParticipant(
   return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
 }
 
+function describePrincipal(principal: IssueExecutionStagePrincipal | null): string {
+  if (!principal) return "the return assignee";
+  return principal.type === "agent" ? `agent ${principal.agentId ?? "unknown"}` : `user ${principal.userId ?? "unknown"}`;
+}
+
+function noEligibleStageParticipantError(input: {
+  policy: IssueExecutionPolicy;
+  stage: IssueExecutionStage;
+  returnAssignee: IssueExecutionStagePrincipal | null;
+}) {
+  const stageIndex = input.policy.stages.findIndex((candidate) => candidate.id === input.stage.id);
+  const onlyReturnAssignee =
+    input.stage.participants.length > 0 &&
+    input.stage.participants.every((participant) => principalsEqual(participant, input.returnAssignee));
+  const conflict = onlyReturnAssignee
+    ? `its only participant is ${describePrincipal(input.returnAssignee)}, who is the return assignee (maker) and cannot ${input.stage.type === "approval" ? "approve" : "review"} their own work`
+    : "it has no configured participants";
+  return unprocessable(
+    `No eligible ${input.stage.type} participant is configured for this issue: stage ${stageIndex + 1} (${input.stage.type}) ${conflict}. Add a different participant to that stage before submitting.`,
+    {
+      code: "execution_stage_no_eligible_participant",
+      stageId: input.stage.id,
+      stageIndex,
+      stageType: input.stage.type,
+      conflict: onlyReturnAssignee ? "only_return_assignee" : "no_participants",
+    },
+  );
+}
+
+function assertLaterStagesHaveEligibleParticipants(input: {
+  policy: IssueExecutionPolicy;
+  fromStage: IssueExecutionStage;
+  completedStageIds: string[];
+  returnAssignee: IssueExecutionStagePrincipal | null;
+}) {
+  const completed = new Set(input.completedStageIds);
+  const fromIndex = input.policy.stages.findIndex((stage) => stage.id === input.fromStage.id);
+  for (const [index, stage] of input.policy.stages.entries()) {
+    if (index <= fromIndex || completed.has(stage.id)) continue;
+    if (!selectStageParticipant(stage, { exclude: input.returnAssignee })) {
+      throw noEligibleStageParticipantError({ policy: input.policy, stage, returnAssignee: input.returnAssignee });
+    }
+  }
+}
+
 function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
   if (!participant) return false;
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
@@ -814,7 +859,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           exclude: existingState?.returnAssignee ?? null,
         });
         if (!participant) {
-          throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
+          throw noEligibleStageParticipantError({
+            policy: input.policy,
+            stage: nextStage,
+            returnAssignee: existingState?.returnAssignee ?? null,
+          });
         }
 
         buildPendingStagePatch({
@@ -1019,8 +1068,14 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     });
   }
   if (!participant) {
-    throw unprocessable(`No eligible ${pendingStage.type} participant is configured for this issue`);
+    throw noEligibleStageParticipantError({ policy: input.policy, stage: pendingStage, returnAssignee });
   }
+  assertLaterStagesHaveEligibleParticipants({
+    policy: input.policy,
+    fromStage: pendingStage,
+    completedStageIds: skippedStageIds,
+    returnAssignee,
+  });
 
   buildPendingStagePatch({
     patch,
