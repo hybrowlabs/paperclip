@@ -12,6 +12,8 @@ import {
   authUsers,
   agentWakeupRequests,
   activityLog,
+  chatConversations,
+  chatEndpoints,
   companies,
   createDb,
   environmentLeases,
@@ -24,6 +26,8 @@ import {
   issueThreadInteractions,
   workspaceOperations,
   issues,
+  toolApplications,
+  toolConnections,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -158,6 +162,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
     await db.delete(issueInboxArchives);
+    await db.delete(chatConversations);
+    await db.delete(chatEndpoints);
+    await db.delete(toolConnections);
+    await db.delete(toolApplications);
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
@@ -2981,6 +2989,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       await db.update(issues).set({ assigneeAgentId: otherAssignee }).where(eq(issues.id, sourceIssueId));
       await request(createApp(await agentActor(managerId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body()).expect(409);
       await db.update(issues).set({ assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));
+      await expectHoldUntouched(sourceIssueId, action.id, "active");
+    });
+
+    it.each(["active", "settled"] as const)("denies a low-trust direct supervisor on a %s hold and leaves it untouched", async (variant) => {
+      const { companyId, managerId, sourceIssueId, action, body, agentActor } = await seedRunLossHold(variant);
+      await db.update(agents).set({
+        permissions: {
+          authorizationPolicy: {
+            trustPreset: "low_trust_review",
+            trustBoundary: { mode: "low_trust_review", companyId, rootIssueId: sourceIssueId },
+          },
+        },
+      }).where(eq(agents.id, managerId));
+      const res = await request(createApp(await agentActor(managerId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body());
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Low-trust actors cannot use this control-plane surface");
+      await expectHoldUntouched(sourceIssueId, action.id, variant);
+      const logs = await db.select().from(activityLog).where(and(
+        eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.recovery_action_resolved"),
+      ));
+      expect(logs).toHaveLength(0);
+    });
+
+    it("keeps chat-bound restricted conversations board-only for the supervisor", async () => {
+      const { companyId, managerId, sourceIssueId, action, body, agentActor } = await seedRunLossHold("active");
+      const endpointId = randomUUID();
+      const [application] = await db.insert(toolApplications).values({
+        companyId, applicationKey: `chat-app-${endpointId}`, name: "Chat app", type: "mcp", status: "active",
+      }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId, applicationId: application!.id, name: "Chat connection", uid: `chat-conn-${endpointId}`,
+        connectionKind: "managed", ownership: "customer", transport: "mcp_remote", authKind: "none", status: "active", enabled: true,
+      }).returning();
+      await db.insert(chatEndpoints).values({
+        id: endpointId,
+        companyId,
+        connectionId: connection!.id,
+        provider: "slack",
+        publicId: `ep-${endpointId.slice(0, 8)}`,
+        externalExecutionPolicy: "restricted",
+        assignedAgentId: managerId,
+        status: "active",
+      });
+      await db.insert(chatConversations).values({
+        companyId,
+        endpointId,
+        issueId: sourceIssueId,
+        externalConversationId: `conv-${endpointId.slice(0, 8)}`,
+        externalLabel: "Restricted chat",
+      });
+      const prepareFailedChatRunRetry = vi.fn();
+      const res = await request(createApp(await agentActor(managerId), { chatRunRetries: { prepareFailedChatRunRetry } as any }))
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body());
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details?.code).toBe("chat_recovery_requires_authorized_context");
+      expect(prepareFailedChatRunRetry).not.toHaveBeenCalled();
       await expectHoldUntouched(sourceIssueId, action.id, "active");
     });
 
