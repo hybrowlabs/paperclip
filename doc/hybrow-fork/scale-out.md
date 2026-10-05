@@ -22,6 +22,9 @@ than one server:
 | The per-agent start lock was in memory, so two replicas overran an agent's concurrency | Patch 1: Postgres advisory try-lock |
 | A live event on replica A never reached a browser on replica B | Patch 5: Postgres `LISTEN/NOTIFY` |
 | A slow tick was followed by a second tick that stacked on it | Patch 4: tick overlap guard |
+| Lock transactions could take every pooled connection and stall the work inside them | Patch 6: separate small lock pool |
+| A new leader took over, or a stopping replica suspended, a native run another replica still controls | Patch 6: lease fence (`PAPERCLIP_MULTI_REPLICA=true`) |
+| A traffic-only replica (`HEARTBEAT_SCHEDULER_ENABLED=false`) still ran the singleton sweeps | Patch 6: cluster-wide single-flight, none on traffic-only replicas |
 
 ### Known limit: agent runs stay on the replica that claimed them
 
@@ -35,6 +38,28 @@ retry), not handed over live. Spreading runs across replicas, with
 Plugin worker processes and plugin artifacts are also per replica
 (upstream issue #7996); do not rely on a plugin being installed on only one
 replica.
+
+What this means in practice:
+
+- **Legacy runs** (for example `opencode_local`, `codex_local`) hold a database
+  lease (`controller_lease_expires_at`, 60 s, renewed every 10 s). A new leader
+  does not reap a run while that lease is live, and takes it over only after
+  the lease expires (the owning replica died). Tested in
+  `leader-failover-live-runs.test.ts`.
+- **Native runner runs** (`paperclip_runner`) record the controlling process id
+  on the replica that started them, which another replica cannot probe. With
+  `PAPERCLIP_MULTI_REPLICA=true` a live controller lease (20 minutes, renewed
+  every 5) held by another boot is waited out: no claim, no reap, no suspend on
+  shutdown. If that replica dies, the run is taken over after the lease expires,
+  so recovery of a native run after a crash can take up to 20 minutes. Even with
+  the fence, two failed-run sweeps probe local process ids (see "Background
+  sweeps"), so **native runner agents are not supported on more than one
+  replica in this phase**. Fail closed: keep `paperclip_runner` agents off a
+  multi-replica deployment until Phase B. Hybrow's agents all use
+  `opencode_local`.
+- **Start-up delay (agent-start lock).** The per-agent start lock skips instead
+  of blocking. If a run is queued just after another replica read the queue, it
+  can wait up to one scheduler tick (30 s by default) before it starts.
 
 Because of this limit, scaling replicas up spreads **API and WebSocket load**.
 It does not by itself spread agent CPU. Move agent CPU off the API pods with the
@@ -56,6 +81,7 @@ commit message names the upstream PR.
 | 3 | `feat(scale-out): run the heartbeat scheduler only on the elected leader` | #7995, re-wired by hand; includes the Greptile must-fix (recovery completes before the tick timer starts) | none | **Highest**: `server/src/index.ts` scheduler body and shutdown |
 | 4 | `fix(scale-out): never start a scheduler tick while the previous one runs` | New in this fork (scale-out review, Phase 1) | none | Low (`scheduler-runtime.ts`) |
 | 5 | `feat(scale-out): cross-replica live events over Postgres LISTEN/NOTIFY` | [#5875](https://github.com/paperclipai/paperclip/pull/5875), by Jannes Stubbemann (closed, not merged), without its Redis transport | none | Medium: `services/live-events.ts`, `index.ts`, `routes/health.ts` |
+| 6 | `fix(scale-out): ...` (review fixes M1, M2, M3: lock pool, native lease fence, singleton sweeps) | New in this fork (HYBA-1317 review) | none | Medium: `heartbeat.ts` (`reapOrphanedRuns`, `drainRunningRunsForShutdown`), `native-restart-recovery.ts`, `index.ts`, `packages/db/src/client.ts` |
 
 Migration numbers `0296` and `0297` are this fork's. Upstream numbered the same
 files `0102` and `0100`/`0103`. When upstream adds migrations, renumber ours
@@ -112,6 +138,25 @@ after theirs (see the runbook).
      (`PAPERCLIP_DB_BACKUP_ENABLED=false`) and back up at the database layer
      (managed snapshots). Do not run the in-app backup through
      transaction pooling.
+7a. **Background sweeps.** The execution-control reconcilers, the GitHub event
+   poll and continuity sweep, the sandbox cleanup and the external-object
+   refresh are singletons. Each runs under a cluster-wide advisory lock
+   (`sweep:<name>`): if another replica is already running it, this one skips and
+   the next interval covers it. They run on the elected leader. A replica with
+   `HEARTBEAT_SCHEDULER_ENABLED=false` and `PAPERCLIP_MULTI_REPLICA=true` runs
+   none of them. Review note O2, checked against the code: the GitHub poll and
+   continuity sweeps, the sandbox cleanup, the external-object refresh and the
+   finalization, dispatch-checkpoint, status-delivery and login-cleanup
+   reconcilers read and write only the database (the sandbox cleanup calls the
+   provider by lease id). **Two do probe local process ids, and only for native
+   runner runs that already failed:** `replacement`
+   (`reconcileSafeNativeReplacements`) and `automatic_disposition`
+   (`settleUnrecoverableExecutions`). On a different replica than the one that
+   ran the provider, that probe cannot see the process. This is why native
+   runner agents are **not supported on more than one replica** (see the known
+   limit above); legacy adapters such as `opencode_local` are unaffected. The
+   scheduler leader runs all of the sweeps, so a deployment with only
+   traffic-only replicas and no candidate has no sweeps at all.
 8. **Sticky sessions are not required for correctness.** WebSockets work from any
    replica because events fan out over Postgres. Stickiness only avoids
    reconnect churn.
@@ -124,6 +169,8 @@ after theirs (see the runbook).
 |---|---|---|
 | `HEARTBEAT_SCHEDULER_ENABLED` | `true` | Be a candidate for scheduler leader. `false` means **serve traffic only, never become leader**. |
 | `HEARTBEAT_SCHEDULER_INTERVAL_MS` | `30000` (min `10000`) | Tick interval on the leader. A new tick never starts while the previous one is still running. |
+| `PAPERCLIP_MULTI_REPLICA` | unset (`false`) | Set `true` on **every** replica when running more than one. A native runner run whose controller lease is live on another replica is never claimed, reaped or suspended by this one, and a `HEARTBEAT_SCHEDULER_ENABLED=false` replica runs no background sweeps. Unset with one replica: nothing changes. |
+| `DATABASE_ADVISORY_LOCK_POOL_MAX` | `16` | Size of the separate pool that holds advisory lock transactions. Lock holders wait on this pool, never on the main pool. Count it in `replicas * (DATABASE_POOL_MAX + this)` against the pooler and `max_connections`. |
 | `PAPERCLIP_LIVE_EVENTS_TRANSPORT` | `postgres` | `postgres` or `off` (in-process only; multi-replica UIs go stale). |
 | `PAPERCLIP_LIVE_EVENTS_DATABASE_URL` | unset | Direct connection string for `LISTEN`. Falls back to `DATABASE_MIGRATION_URL`, then `DATABASE_URL`. |
 
@@ -177,6 +224,8 @@ pnpm exec vitest run \
   server/src/__tests__/plugin-webhook-dedup.test.ts \
   server/src/__tests__/advisory-locks.test.ts \
   server/src/__tests__/health-scheduler.test.ts \
+  server/src/__tests__/singleton-sweep.test.ts \
+  server/src/__tests__/leader-failover-live-runs.test.ts \
   packages/db/src/migration-lock.test.ts \
   --testTimeout=600000 --hookTimeout=200000
 ```
@@ -195,6 +244,9 @@ several minutes on 4 vCPU because each replica is a full server process.
 | (d) plugin jobs do not run twice | `plugin-job-scheduler-claim.test.ts` |
 | (e) agent-start lock across replicas | `agent-start-lock-cross-replica.test.ts` |
 | Tick does not start before recovery; no overlapping ticks | `scheduler-runtime.test.ts` |
+| Lock holders cannot starve a small pool (M1) | `advisory-locks.test.ts` |
+| A new leader does not take over live runs on another replica (M2) | `leader-failover-live-runs.test.ts` |
+| Singleton sweeps single-flight; traffic-only replica runs none (M3) | `singleton-sweep.test.ts`; `multi-replica-cluster.test.ts` (a2) |
 
 ## Monthly upstream sync runbook
 
