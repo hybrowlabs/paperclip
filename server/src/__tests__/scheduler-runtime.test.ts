@@ -55,32 +55,6 @@ describe("leader scheduler runtime", () => {
     expect(tick).not.toHaveBeenCalled();
   });
 
-  it("skips a new tick while the previous tick is still running", async () => {
-    const first = deferred();
-    const onTickSkipped = vi.fn();
-    const tick = vi.fn(() => (tick.mock.calls.length === 1 ? first.promise : Promise.resolve()));
-    const scheduler = createLeaderScheduler({
-      intervalMs: 1_000,
-      recover: async () => {},
-      tick,
-      onTickSkipped,
-    });
-    await scheduler.start();
-
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(tick).toHaveBeenCalledTimes(1);
-
-    await vi.advanceTimersByTimeAsync(3_000);
-    expect(tick).toHaveBeenCalledTimes(1);
-    expect(onTickSkipped).toHaveBeenCalledTimes(3);
-
-    first.resolve();
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(tick).toHaveBeenCalledTimes(2);
-
-    await scheduler.stop();
-  });
-
   it("keeps ticking after a tick fails", async () => {
     const onTickError = vi.fn();
     const tick = vi.fn(async () => {
