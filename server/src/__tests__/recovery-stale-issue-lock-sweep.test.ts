@@ -329,7 +329,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // never awaits the emission, so wait for it here instead of asserting
     // it fired synchronously.
     await vi.waitFor(() => {
-      expect(mockTelemetryClient.track).toHaveBeenCalledTimes(1);
+      expect(mockTelemetryClient.track.mock.calls.filter(([event]) => event === "agent.task_run")).toHaveLength(1);
     });
     expect(mockTelemetryClient.track).toHaveBeenCalledWith(
       "agent.task_run",
@@ -605,7 +605,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // The terminal write never awaits the telemetry emission, so wait for
     // it here instead of asserting it fired synchronously.
     await vi.waitFor(() => {
-      expect(mockTelemetryClient.track).toHaveBeenCalledTimes(1);
+      expect(mockTelemetryClient.track.mock.calls.filter(([event]) => event === "agent.task_run")).toHaveLength(1);
     });
     expect(mockTelemetryClient.track).toHaveBeenCalledWith(
       "agent.task_run",
@@ -647,7 +647,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // The terminal write never awaits the telemetry emission, so wait for
     // it here instead of asserting it fired synchronously.
     await vi.waitFor(() => {
-      expect(mockTelemetryClient.track).toHaveBeenCalledTimes(1);
+      expect(mockTelemetryClient.track.mock.calls.filter(([event]) => event === "agent.task_run")).toHaveLength(1);
     });
     expect(mockTelemetryClient.track).toHaveBeenCalledWith(
       "agent.task_run",
@@ -969,5 +969,134 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runningRunId));
     expect(events).toEqual([]);
+  });
+
+  describe("agent status reconciliation after orphaned-run terminalization", () => {
+    async function seedOrphanedRunWithIssue(agentStatus: string) {
+      const seeded = await seed();
+      await db.update(agents).set({ status: agentStatus }).where(eq(agents.id, seeded.agentId));
+      await db
+        .update(heartbeatRuns)
+        .set({ processPid: 2_000_000_000 })
+        .where(eq(heartbeatRuns.id, seeded.runningRunId));
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: seeded.companyId,
+        title: "Orphaned running run - reconcile agent status",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: seeded.agentId,
+        checkoutRunId: seeded.runningRunId,
+        executionRunId: seeded.runningRunId,
+        executionLockedAt: new Date(),
+      });
+      return { ...seeded, issueId };
+    }
+
+    async function readAgentStatus(agentId: string) {
+      return db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0]?.status);
+    }
+
+    it("returns a running agent to idle when its only running run is terminalized", async () => {
+      const { agentId, runningRunId } = await seedOrphanedRunWithIssue("running");
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.status, "failed"));
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.terminalizedRunIds).toEqual([runningRunId]);
+      expect(await readAgentStatus(agentId)).toBe("idle");
+    });
+
+    it("keeps the agent running when another run of the agent is still live", async () => {
+      const { companyId, agentId, runningRunId } = await seedOrphanedRunWithIssue("running");
+      const liveRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date(),
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.terminalizedRunIds).toEqual([runningRunId]);
+      expect(
+        await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, liveRunId)),
+      ).toEqual([{ status: "running" }]);
+      expect(await readAgentStatus(agentId)).toBe("running");
+    });
+
+    it("leaves a paused agent paused", async () => {
+      const { agentId, runningRunId } = await seedOrphanedRunWithIssue("paused");
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.terminalizedRunIds).toEqual([runningRunId]);
+      expect(await readAgentStatus(agentId)).toBe("paused");
+    });
+
+    it("reconciles the agent with the terminal status when the issue is done", async () => {
+      const { agentId, issueId, runningRunId } = await seedOrphanedRunWithIssue("running");
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      await db
+        .update(heartbeatRuns)
+        .set({ processPid: null })
+        .where(eq(heartbeatRuns.id, runningRunId));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.status, "failed"));
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.terminalizedRunIds).toEqual([runningRunId]);
+      expect(
+        await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runningRunId)),
+      ).toEqual([{ status: "succeeded" }]);
+      expect(await readAgentStatus(agentId)).toBe("idle");
+    });
+
+    it("passes the terminal run status to the agent status finalizer", async () => {
+      const { agentId } = await seedOrphanedRunWithIssue("running");
+      const finalizeAgentStatus = vi.fn(async () => {});
+
+      await recoveryService(db, { enqueueWakeup: vi.fn(), finalizeAgentStatus }).sweepStaleIssueLocks();
+
+      expect(finalizeAgentStatus).toHaveBeenCalledTimes(1);
+      expect(finalizeAgentStatus).toHaveBeenCalledWith(agentId, "interrupted");
+    });
+
+    it("still clears the lock when the agent status finalizer throws", async () => {
+      const { agentId, issueId, runningRunId } = await seedOrphanedRunWithIssue("running");
+      const finalizeAgentStatus = vi.fn(async () => {
+        throw new Error("simulated agent status finalizer failure");
+      });
+
+      const result = await recoveryService(db, {
+        enqueueWakeup: vi.fn(),
+        finalizeAgentStatus,
+      }).sweepStaleIssueLocks();
+
+      expect(finalizeAgentStatus).toHaveBeenCalledTimes(1);
+      expect(result.terminalizedRunIds).toEqual([runningRunId]);
+      expect(result.cleared).toBe(1);
+      expect(
+        await db
+          .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(eq(issues.id, issueId)),
+      ).toEqual([{ checkoutRunId: null, executionRunId: null }]);
+      expect(await readAgentStatus(agentId)).toBe("running");
+    });
   });
 });

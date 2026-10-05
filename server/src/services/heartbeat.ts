@@ -9536,6 +9536,8 @@ export function heartbeatService(
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
+    finalizeAgentStatus: (agentId, outcome) =>
+      finalizeAgentStatus(agentId, outcome),
     scheduleRecoveryRetry: async (runId) => {
       const [run] = await db
         .select()

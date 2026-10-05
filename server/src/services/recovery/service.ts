@@ -922,6 +922,10 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    finalizeAgentStatus?: (
+      agentId: string,
+      outcome: "succeeded" | "interrupted" | "cancelled",
+    ) => Promise<void>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -6049,6 +6053,17 @@ export function recoveryService(
       },
       "terminalized orphaned running heartbeat run in stale-lock sweep",
     );
+    // The reaper path reconciles the agent status after it terminalizes a run;
+    // do the same here so an agent does not stay "running" with no live run.
+    // Best-effort: a failure must not abort the sweep or the lock clear.
+    try {
+      await deps.finalizeAgentStatus?.(run.agentId, terminalStatus);
+    } catch (error) {
+      logger.error(
+        { err: error, runId: run.id, agentId: run.agentId, terminalStatus },
+        "failed to reconcile agent status after terminalizing orphaned run; run stays terminal and the sweep clears the lock",
+      );
+    }
     return { terminalized: true, status: updated.status };
   }
 
