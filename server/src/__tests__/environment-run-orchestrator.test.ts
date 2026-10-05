@@ -431,6 +431,99 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(result.persistedExecutionWorkspace).toEqual(updatedEw);
   });
 
+  it("persists the realized cwd as remoteCwd when realization returns no workspaceRealization payload", async () => {
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: "/workspace",
+        metadata: { provider: "kubernetes", remoteCwd: "/workspace" },
+      }),
+    } as Partial<EnvironmentRuntimeService>);
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "local", environmentId: "env-1", leaseId: "lease-1" });
+
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await orchestrator.realizeForRun(
+      makeRealizeInput({ environment: makeEnvironment("sandbox") }),
+    );
+
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
+      "lease-1",
+      expect.objectContaining({ remoteCwd: "/workspace" }),
+    );
+    expect(mockUpdateExecutionWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("persists the realized cwd as remoteCwd alongside workspaceRealization, and hands the updated lease to target resolution", async () => {
+    const persistedExecutionWorkspace = makePersistedExecutionWorkspace();
+    mockUpdateLeaseMetadata.mockImplementation(async (_id: string, metadata: Record<string, unknown>) =>
+      makeLease({ metadata }),
+    );
+    mockUpdateExecutionWorkspace.mockResolvedValue(persistedExecutionWorkspace);
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "local", environmentId: "env-1", leaseId: "lease-1" });
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: "/workspace",
+        metadata: {
+          provider: "kubernetes",
+          remoteCwd: "/workspace",
+          workspaceRealization: {
+            version: 1,
+            mode: "copy",
+            authoritativeRoot: "/workspace",
+            pathAliases: [],
+            outboundRestorePaths: [],
+            driver: "sandbox",
+            cwd: "/workspace",
+          },
+        },
+      }),
+    } as Partial<EnvironmentRuntimeService>);
+
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+    const result = await orchestrator.realizeForRun(
+      makeRealizeInput({ environment: makeEnvironment("sandbox"), persistedExecutionWorkspace }),
+    );
+
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledOnce();
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
+      "lease-1",
+      expect.objectContaining({
+        remoteCwd: "/workspace",
+        workspaceRealization: expect.any(Object),
+      }),
+    );
+    expect(result.lease.metadata).toEqual(expect.objectContaining({ remoteCwd: "/workspace" }));
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leaseMetadata: expect.objectContaining({ remoteCwd: "/workspace" }),
+        lease: expect.objectContaining({
+          metadata: expect.objectContaining({ remoteCwd: "/workspace" }),
+        }),
+      }),
+    );
+  });
+
+  it("does not rewrite lease metadata when the realized cwd already matches the lease", async () => {
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: "/workspace",
+        metadata: { provider: "kubernetes", remoteCwd: "/workspace" },
+      }),
+    } as Partial<EnvironmentRuntimeService>);
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "local", environmentId: "env-1", leaseId: "lease-1" });
+
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await orchestrator.realizeForRun(
+      makeRealizeInput({
+        environment: makeEnvironment("sandbox"),
+        lease: makeLease({ metadata: { remoteCwd: "/workspace" } }),
+      }),
+    );
+
+    expect(mockUpdateLeaseMetadata).not.toHaveBeenCalled();
+  });
+
   it("runs a remote provision command after workspace realization when configured", async () => {
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,

@@ -140,6 +140,8 @@ Every agent pod is:
 
 Plus per-namespace `pod-security.kubernetes.io/enforce: restricted` and a deny-all NetworkPolicy baseline with explicit egress allow-list (DNS, paperclip-server, configured FQDNs/CIDRs).
 
+A lease starts with `remoteCwd: /workspace` (the mounted emptyDir) as its native file-sync confinement root, because the server syncs managed assets before it realizes the workspace. The server persists the realized cwd on the lease as `remoteCwd`, and a resumed lease keeps any recorded value.
+
 The per-run Secret carrying the bootstrap token and adapter API keys has `ownerReferences` pointing at the owning Job, so a single `kubectl delete job …` cascades cleanly to the Pod and Secret.
 
 ## Optional Kata-FC microVM isolation
