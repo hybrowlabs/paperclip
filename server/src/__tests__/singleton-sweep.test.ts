@@ -5,7 +5,7 @@ import {
   startEmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { createSingletonSweepGuard } from "../services/singleton-sweep.js";
+import { createSingletonSweepGuard, singletonSweepsAllowed } from "../services/singleton-sweep.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeEmbedded = support.supported ? describe : describe.skip;
@@ -90,5 +90,21 @@ describeEmbedded("singleton sweep guard (HEARTBEAT_SCHEDULER_ENABLED=false, revi
     release();
     await first;
     expect(skips).toEqual(["env_cleanup"]);
+  });
+});
+
+describe("singletonSweepsAllowed (review M3 policy)", () => {
+  it("a scheduler candidate always runs its sweeps", () => {
+    expect(singletonSweepsAllowed({ schedulerEnabled: true, env: {} })).toBe(true);
+    expect(singletonSweepsAllowed({ schedulerEnabled: true, env: { PAPERCLIP_MULTI_REPLICA: "true" } })).toBe(true);
+  });
+
+  it("with the scheduler off, a lone replica keeps its previous behaviour", () => {
+    expect(singletonSweepsAllowed({ schedulerEnabled: false, env: {} })).toBe(true);
+    expect(singletonSweepsAllowed({ schedulerEnabled: false, env: { PAPERCLIP_MULTI_REPLICA: "false" } })).toBe(true);
+  });
+
+  it("with the scheduler off in a multi-replica deployment, the replica serves traffic only", () => {
+    expect(singletonSweepsAllowed({ schedulerEnabled: false, env: { PAPERCLIP_MULTI_REPLICA: "true" } })).toBe(false);
   });
 });

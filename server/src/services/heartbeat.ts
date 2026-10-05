@@ -276,6 +276,10 @@ import {
   resolvePaperclipRunnerNativeProviderInput,
 } from "./native-runtime/provider-profile.js";
 import {
+  isMultiReplicaDeployment,
+  isNativeRunHeldByOtherReplica,
+} from "./native-runtime/native-restart-recovery.js";
+import {
   buildNativeHeartbeatPreparationSpans,
   buildNativeWakeIngressSpan,
   recordFailedSkillPreparation,
@@ -15242,6 +15246,21 @@ export function heartbeatService(
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
           run.controllerBootId !== legacyControllerBootId) continue;
       if (isNativeRunnerOwnershipHeld(run)) continue;
+      if (isMultiReplicaDeployment() && run.runtimeMode === "native") {
+        // Shutdown owns only this boot's native executions, like the legacy
+        // filter above. A run another replica controls is not ours to
+        // suspend or interrupt.
+        const [owner] = await db
+          .select({ controllerBootId: nativeRunFinalizations.controllerBootId })
+          .from(nativeRunFinalizations)
+          .where(eq(nativeRunFinalizations.runId, run.id));
+        if (
+          owner?.controllerBootId &&
+          owner.controllerBootId !== (await currentNativeControllerIdentity()).bootId
+        ) {
+          continue;
+        }
+      }
       if (
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
@@ -19392,6 +19411,17 @@ export function heartbeatService(
       if (resumedRunIds.has(run.id)) continue;
       if (locallyTracked) continue;
       if (await hasLiveLegacyController(db, run)) continue;
+      if (
+        nativeRun &&
+        isNativeRunHeldByOtherReplica({
+          controllerBootId: nativeControllerBootId,
+          leaseExpiresAt: nativeControllerLeaseExpiresAt,
+          currentBootId: currentNativeController.bootId,
+          now,
+        })
+      ) {
+        continue;
+      }
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {

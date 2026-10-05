@@ -139,6 +139,7 @@ import {
   type SupervisedEmbeddedPostgres,
 } from "./embedded-postgres-supervisor.js";
 import { trySessionAdvisoryLock, withAdvisoryXactLock } from "./services/advisory-locks.js";
+import { createSingletonSweepGuard, singletonSweepsAllowed as resolveSingletonSweepsAllowed } from "./services/singleton-sweep.js";
 import {
   createSchedulerLeadership,
   registerSchedulerLeadershipForHealth,
@@ -1218,6 +1219,18 @@ async function startServerWithDatabaseTeardown(
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+  // Background sweeps below are singletons: two replicas running the same one
+  // at once would double-deliver or race. Every one goes through a cluster-wide
+  // single-flight lock, so a second replica skips a sweep another replica is
+  // running instead of repeating it. With several replicas
+  // (PAPERCLIP_MULTI_REPLICA=true) a replica started with
+  // HEARTBEAT_SCHEDULER_ENABLED=false serves traffic only and runs none of
+  // them; the elected leader owns them. A single replica with the flag off
+  // keeps running them as before.
+  const runSingletonSweep = createSingletonSweepGuard(db as any, {
+    onSkipped: (name) => logger.debug({ sweep: name }, "singleton sweep already running on another replica; skipped"),
+  });
+  const singletonSweepsAllowed = resolveSingletonSweepsAllowed({ schedulerEnabled: config.heartbeatSchedulerEnabled });
   const executionControlSweepsInFlight = new Set<string>();
   const executionControlSweeps = [
     ["finalization", () => reconcileAbandonedExecutionControl(db)],
@@ -1235,14 +1248,14 @@ async function startServerWithDatabaseTeardown(
     for (const [queue, work] of executionControlSweeps) {
       if (executionControlSweepsInFlight.has(queue)) continue;
       executionControlSweepsInFlight.add(queue);
-      trackHeartbeatSchedulerWork(Promise.resolve().then(async () => { await work(); })
+      trackHeartbeatSchedulerWork(Promise.resolve().then(async () => { await runSingletonSweep(`execution-control:${queue}`, async () => { await work(); }); })
         .catch(err => logger.error({ err, queue }, "execution control reconciliation failed"))
         .finally(() => { executionControlSweepsInFlight.delete(queue); }));
     }
   };
   let executionControlInterval: ReturnType<typeof setInterval> | null = null;
   const startExecutionControl = () => {
-    if (executionControlInterval) return;
+    if (executionControlInterval || !singletonSweepsAllowed) return;
     executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
     executionControlInterval.unref?.();
     sweepExecutionControl();
@@ -1254,7 +1267,8 @@ async function startServerWithDatabaseTeardown(
   };
   // With the scheduler enabled these reconcilers belong to the elected leader
   // (started and stopped with leadership, see below). A replica that opted out
-  // (HEARTBEAT_SCHEDULER_ENABLED=false) keeps its previous behaviour.
+  // (HEARTBEAT_SCHEDULER_ENABLED=false) keeps its previous behaviour when it is
+  // the only replica; in a multi-replica deployment it runs none of them.
   if (!heartbeat) startExecutionControl();
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
@@ -1265,14 +1279,14 @@ async function startServerWithDatabaseTeardown(
     enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
   });
   const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
-    if (heartbeatSchedulerStopped) return;
-    trackHeartbeatSchedulerWork(externalObjects
+    if (heartbeatSchedulerStopped || !singletonSweepsAllowed) return;
+    trackHeartbeatSchedulerWork(runSingletonSweep("external-object-refresh", () => externalObjects
       .refreshDueObjectsForActiveCompanies(50, now)
       .then((result) => {
         if (result.checked > 0 || result.refreshed > 0) {
           logger.info({ ...result }, "external-object scheduler tick refreshed due objects");
         }
-      })
+      }))
       .catch((err) => {
         logger.error({ err }, "external-object scheduler tick failed");
       }));
@@ -1318,13 +1332,13 @@ async function startServerWithDatabaseTeardown(
     resolveNativeQuestion: (interaction) => deliverNativeQuestionResponse(db as any, interaction),
   });
   const runEnvironmentLeaseCleanupSweep = (backoffMs: number) =>
-    environmentLeaseCleanupHeartbeat
+    (singletonSweepsAllowed ? runSingletonSweep("environment-lease-cleanup", () => environmentLeaseCleanupHeartbeat
       .sweepPendingCleanupLeases({ backoffMs })
       .then((result) => {
         if (result.destroyed > 0 || result.capped > 0) {
           logger.info(result, "environment lease cleanup sweep retried orphan sandbox teardowns");
         }
-      })
+      })) : Promise.resolve())
       .catch((err) => {
         logger.error({ err }, "environment lease cleanup sweep failed");
       });
@@ -1343,25 +1357,25 @@ async function startServerWithDatabaseTeardown(
       ?? null,
   });
   const scheduleGitHubConnectionEventPoll = () => {
-    if (heartbeatSchedulerStopped) return;
-    trackHeartbeatSchedulerWork(githubConnectionEvents.pollOnce()
+    if (heartbeatSchedulerStopped || !singletonSweepsAllowed) return;
+    trackHeartbeatSchedulerWork(runSingletonSweep("github-connection-event-poll", () => githubConnectionEvents.pollOnce()
       .then((result) => {
         if (result.leased > 0 || result.failed > 0) {
           logger.info(result, "GitHub connection event poll completed");
         }
-      })
+      }))
       .catch((err) => {
         logger.error({ err }, "GitHub connection event poll failed");
       }));
   };
   const scheduleGitHubConnectionContinuitySweep = () => {
-    if (heartbeatSchedulerStopped) return;
-    trackHeartbeatSchedulerWork(tools.sweepGitHubConnectionContinuity()
+    if (heartbeatSchedulerStopped || !singletonSweepsAllowed) return;
+    trackHeartbeatSchedulerWork(runSingletonSweep("github-connection-continuity", () => tools.sweepGitHubConnectionContinuity()
       .then((result) => {
         if (result.due > 0 || result.failed > 0) {
           logger.info(result, "GitHub connection continuity sweep completed");
         }
-      })
+      }))
       .catch((err) => {
         logger.error({ err }, "GitHub connection continuity sweep failed");
       }));
@@ -1944,13 +1958,21 @@ async function startServerWithDatabaseTeardown(
     // is still required. A failed acquire can leak a paid provider sandbox, so
     // this path retries the teardown at startup and on the interval, exactly as
     // the enabled path does.
-    await runEnvironmentLeaseCleanupSweep(0);
-    startHeartbeatSchedulerInterval(() => {
-      scheduleExternalObjectRefreshSweep(new Date());
-      scheduleEnvironmentLeaseCleanupSweep();
-      scheduleGitHubConnectionEventPoll();
-      scheduleGitHubConnectionContinuitySweep();
-    });
+    //
+    // In a multi-replica deployment (PAPERCLIP_MULTI_REPLICA=true) this
+    // replica serves traffic only: the elected leader owns these sweeps, so
+    // nothing is started here. Single replica: unchanged.
+    if (singletonSweepsAllowed) {
+      await runEnvironmentLeaseCleanupSweep(0);
+      startHeartbeatSchedulerInterval(() => {
+        scheduleExternalObjectRefreshSweep(new Date());
+        scheduleEnvironmentLeaseCleanupSweep();
+        scheduleGitHubConnectionEventPoll();
+        scheduleGitHubConnectionContinuitySweep();
+      });
+    } else {
+      logger.info("traffic-only replica (HEARTBEAT_SCHEDULER_ENABLED=false, PAPERCLIP_MULTI_REPLICA=true): background sweeps are owned by the scheduler leader");
+    }
   }
   
   if (config.databaseBackupEnabled) {
@@ -2051,6 +2073,9 @@ async function startServerWithDatabaseTeardown(
     await teardownLiveEventsTransport();
     // Resign first so a standby takes over within one retry interval rather
     // than waiting out the lease, while this replica drains its own runs.
+    // Keep this order on rebase: resign before the run drain below. The live
+    // events transport above only stops the cross-replica fan-out and is
+    // independent of leadership.
     if (schedulerLeadership) {
       await schedulerLeadership.stop().catch((err: unknown) => {
         logger.warn({ err, signal }, "failed to resign scheduler leadership during shutdown");

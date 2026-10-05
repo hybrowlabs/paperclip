@@ -174,6 +174,28 @@ describeCluster("multi-replica cluster (real processes, one Postgres)", () => {
     }, 300_000);
   });
 
+  describe("(a2) traffic-only replicas run no singleton sweeps (review M3)", () => {
+    it("with PAPERCLIP_MULTI_REPLICA=true a HEARTBEAT_SCHEDULER_ENABLED=false replica leaves the sweeps to the leader", async () => {
+      const databaseUrl = await freshDatabase("traffic_only_sweeps");
+      const multi = { PAPERCLIP_MULTI_REPLICA: "true" };
+      const trafficOnly = await boot(databaseUrl, "traffic", { ...multi, HEARTBEAT_SCHEDULER_ENABLED: "false" });
+      await waitForReady(trafficOnly);
+      const candidate = await boot(databaseUrl, "candidate", multi);
+      await waitForReady(candidate);
+      await waitUntil("the candidate to become leader", async () => (await leaders([candidate])).length === 1, {
+        timeoutMs: 30_000,
+      });
+
+      // Execution-control sweeps tick every 15 s; wait past two ticks.
+      await new Promise((resolve) => setTimeout(resolve, 35_000));
+
+      expect(trafficOnly.logs()).toMatch(/background sweeps are owned by the scheduler leader/);
+      expect(trafficOnly.logs()).not.toMatch(/execution control reconciliation failed/);
+      expect(trafficOnly.logs()).not.toMatch(/environment lease cleanup sweep/);
+      expect(await leaders([trafficOnly])).toHaveLength(0);
+    }, 300_000);
+  });
+
   describe("(b) live events across replicas", () => {
     it("delivers an event published on replica A to a WebSocket client on replica B", async () => {
       const databaseUrl = await freshDatabase("live_events");

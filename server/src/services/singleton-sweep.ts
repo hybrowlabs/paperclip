@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { tryAdvisoryXactLock } from "./advisory-locks.js";
+import { isMultiReplicaDeployment } from "./native-runtime/native-restart-recovery.js";
 
 export type SingletonSweepResult = { ran: boolean };
 
@@ -32,4 +33,18 @@ export function createSingletonSweepGuard(db: Db, options: SingletonSweepGuardOp
     }
     return { ran: true };
   };
+}
+
+/**
+ * Whether this replica may run singleton background sweeps at all. Scheduler
+ * candidates always may (the lock still keeps two copies from overlapping). A
+ * replica with HEARTBEAT_SCHEDULER_ENABLED=false serves traffic only when the
+ * deployment is multi-replica (PAPERCLIP_MULTI_REPLICA=true); a lone replica
+ * with the flag off keeps running them, as before this series.
+ */
+export function singletonSweepsAllowed(input: {
+  schedulerEnabled: boolean;
+  env?: NodeJS.ProcessEnv;
+}): boolean {
+  return input.schedulerEnabled || !isMultiReplicaDeployment(input.env ?? process.env);
 }
