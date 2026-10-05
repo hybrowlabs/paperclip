@@ -18,6 +18,30 @@ vi.mock("../../secrets/provider-registry.js", () => ({
 vi.mock("../../sentry.js", () => ({
   captureRunFailure: mockCaptureRunFailure,
 }));
+// Fake in-memory databases in this file have no `transaction`, so the real
+// run content gate would (correctly) fail closed and block every report. Route
+// only those DB-less fakes to a pass-through gate; real databases keep the real
+// gate. Fail-closed behaviour is covered by run-content-egress.test.ts.
+vi.mock("../run-content-gate.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../run-content-gate.js")>();
+  const passthroughLease = {
+    id: "passthrough",
+    grantId: null,
+    decision: "ordinary" as const,
+    runIds: [] as string[],
+    signal: new AbortController().signal,
+    checkpoint: async () => undefined,
+    emit: <T,>(write: () => T) => write(),
+    release: async () => undefined,
+  };
+  return {
+    ...actual,
+    getRunContentGate: (candidate: unknown) =>
+      typeof (candidate as { transaction?: unknown }).transaction === "function"
+        ? actual.getRunContentGate(candidate as never)
+        : { authorizeEgress: async () => ({ allowed: true as const, lease: passthroughLease }) },
+  };
+});
 // Wrap the real function instead of a fake, so tests can assert the actual
 // redacted output while still spying on the call. A fake output would hide
 // whether the composed redaction in run-failure-report.ts is correct.
@@ -27,7 +51,7 @@ vi.mock("../../log-redaction.js", async (importOriginal) => {
   return { ...actual, redactCurrentUserText: mockRedactCurrentUserText };
 });
 
-import { reportRunFailure, waitForPendingRunFailureReports } from "../run-failure-report.js";
+import { reportRunFailure as reportRunFailureUnseeded, waitForPendingRunFailureReports } from "../run-failure-report.js";
 import { REDACTED_EVENT_VALUE } from "../../redaction.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -108,6 +132,22 @@ describeEmbeddedPostgres("reportRunFailure", () => {
       contextSnapshot: null,
       ...overrides,
     } as unknown as typeof heartbeatRuns.$inferSelect;
+  }
+
+  // The run content gate fails closed for a run id with no `heartbeat_runs`
+  // row, so every fixture run is persisted before it is reported.
+  async function reportRunFailure(
+    reportDb: typeof db,
+    run: typeof heartbeatRuns.$inferSelect,
+    options?: Parameters<typeof reportRunFailureUnseeded>[2],
+  ) {
+    if (typeof (reportDb as { insert?: unknown }).insert === "function" && typeof (reportDb as { transaction?: unknown }).transaction === "function") {
+      await reportDb
+        .insert(heartbeatRuns)
+        .values({ id: run.id, companyId: run.companyId, agentId, status: run.status })
+        .onConflictDoNothing();
+    }
+    return reportRunFailureUnseeded(reportDb, run, options);
   }
 
   it("captures once for the status failed", async () => {

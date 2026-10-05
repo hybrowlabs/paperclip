@@ -84,6 +84,7 @@ import { connectionIntentService } from "../services/connection-intents.js";
 import { redactRemoteUrlCredential } from "../services/remote-url-credentials.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
 import type { heartbeatService } from "../services/heartbeat.js";
+import { serveRunContent } from "./run-content-guard.js";
 
 const COMPANY_INSTALL_DENIAL_REASON =
   "Only someone who can configure this connection can choose this.";
@@ -2456,7 +2457,15 @@ function connectorEnrollmentPrincipal(req: Request): string {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    res.json(await svc.getRunDecisionLookup(companyId, req.params.runId as string));
+    await serveRunContent({
+      db,
+      req,
+      res,
+      companyId,
+      runId: req.params.runId as string,
+      purpose: "tool_decisions",
+      produce: () => svc.getRunDecisionLookup(companyId, req.params.runId as string),
+    });
   });
 
   router.get("/companies/:companyId/tools/trust-rules", async (req, res) => {

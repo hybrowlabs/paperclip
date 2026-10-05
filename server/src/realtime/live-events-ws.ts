@@ -9,6 +9,7 @@ import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { getRunContentGate } from "../services/run-content-gate.js";
 
 interface WsSocket {
   readyState: number;
@@ -260,12 +261,36 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    const gate = getRunContentGate(db);
+    let watcher: Awaited<ReturnType<typeof gate.watchCompany>> | null = null;
+    let closed = false;
+    const watcherReady = gate
+      .watchCompany({ companyId: context.companyId, kind: "live_socket" })
+      .then((w) => {
+        if (closed) void w.close();
+        else watcher = w;
+      })
+      .catch((err) => {
+        logger.warn({ err, companyId: context.companyId }, "live socket run-content watcher failed; closing socket fail-closed");
+        socket.close(1011, "run content gate unavailable");
+      });
+
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
       if (socket.readyState !== WebSocket.OPEN) return;
+      // Fail closed: until the watcher holds a lease, and whenever its lease
+      // lapses, run-bearing payloads are not forwarded.
+      const runId = typeof event.payload?.runId === "string" ? event.payload.runId : null;
+      if (runId || event.type.startsWith("heartbeat.run")) {
+        if (!watcher || !runId || watcher.isRestricted(runId)) return;
+      }
       socket.send(JSON.stringify(event));
     });
 
-    cleanupByClient.set(socket, unsubscribe);
+    cleanupByClient.set(socket, () => {
+      closed = true;
+      unsubscribe();
+      void watcherReady.then(() => watcher?.close());
+    });
     aliveByClient.set(socket, true);
 
     socket.on("pong", () => {

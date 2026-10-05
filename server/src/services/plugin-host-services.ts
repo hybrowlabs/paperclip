@@ -43,6 +43,7 @@ import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
 import { getStorageService } from "../storage/index.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
+import { getRunContentGate } from "./run-content-gate.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 import { pluginRegistryService } from "./plugin-registry.js";
@@ -3327,11 +3328,30 @@ export function buildHostServices(
             unsubscribe();
             clearTimeout(timeoutTimer);
             activeSubscriptions.delete(entry);
+            void (pluginStreamLease as { release(reason?: string): Promise<void> } | null)?.release("complete").catch(() => {});
           };
+
+          const pluginStreamGate = getRunContentGate(db);
+          let pluginStreamLease: Awaited<ReturnType<typeof pluginStreamGate.acquireLease>> | null = null;
+          void pluginStreamGate
+            .acquireLease({ companyId, runId: run.id, actorId: null, routePurpose: "plugin_stream", kind: "stream" })
+            .then((lease) => {
+              pluginStreamLease = lease;
+              lease.signal.addEventListener("abort", () => cleanup(), { once: true });
+            })
+            .catch(() => cleanup());
 
           const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
             const payload = event.payload as Record<string, unknown> | undefined;
             if (!payload || payload.runId !== run.id) return;
+            const lease = pluginStreamLease;
+            if (!lease || lease.signal.aborted) return;
+            try {
+              lease.emit(() => undefined);
+            } catch {
+              cleanup();
+              return;
+            }
 
             if (event.type === "heartbeat.run.log" || event.type === "heartbeat.run.event") {
               notifyWorker("agents.sessions.event", {

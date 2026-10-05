@@ -47,6 +47,7 @@ import {
   sha256Digest,
 } from "./feedback-redaction.js";
 import { getRunLogStore } from "./run-log-store.js";
+import { getRunContentGate } from "./run-content-gate.js";
 import { getOperatorSettingDefaults } from "./setting-defaults.js";
 
 const FEEDBACK_SCHEMA_VERSION = "paperclip-feedback-envelope-v2";
@@ -1465,6 +1466,19 @@ async function buildFeedbackTraceBundleFromRow(
   db: Db,
   row: FeedbackTraceRow,
 ): Promise<FeedbackTraceBundle> {
+  const heldLeases: Array<{ release(reason?: string): Promise<void> }> = [];
+  try {
+    return await buildFeedbackTraceBundleFromRowGated(db, row, heldLeases);
+  } finally {
+    await Promise.all(heldLeases.map((lease) => lease.release("complete").catch(() => {})));
+  }
+}
+
+async function buildFeedbackTraceBundleFromRowGated(
+  db: Db,
+  row: FeedbackTraceRow,
+  heldLeases: Array<{ release(reason?: string): Promise<void> }>,
+): Promise<FeedbackTraceBundle> {
   const trace = mapTraceRow(row, true);
   const payloadSnapshot = asRecord(trace.payloadSnapshot);
   const notes: string[] = [];
@@ -1477,8 +1491,16 @@ async function buildFeedbackTraceBundleFromRow(
   let normalizedAdapterTrace: Record<string, unknown> | null = null;
   let adapterType: string | null = null;
 
+  const feedbackLease = sourceRunId
+    ? await getRunContentGate(db)
+        .acquireLease({ companyId: row.companyId, runId: sourceRunId, actorId: null, routePurpose: "feedback_export", kind: "internal_read" })
+        .catch(() => null)
+    : null;
+  if (feedbackLease) heldLeases.push(feedbackLease);
   if (!sourceRunId) {
     appendNote(notes, "source_run_missing");
+  } else if (!feedbackLease) {
+    appendNote(notes, "source_run_content_withheld");
   } else {
     const run = await db
       .select({

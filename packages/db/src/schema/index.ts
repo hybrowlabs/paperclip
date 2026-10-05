@@ -214,3 +214,10 @@ export { announcementDismissals, announcementPublications } from "./announcement
 export { chatTaskHandoffs, chatCompletionDeliveries } from "./chat_completion_deliveries.js";
 
 export { agentInstructionRevisions, agentInstructionHeads, agentInstructionWorkingCopies } from "./agent_instruction_revisions.js";
+export {
+  runContentRestrictions,
+  runContentLeases,
+  runContentForensicGrants,
+  runContentCapabilities,
+  runContentAuditEvents,
+} from "./run_content_restrictions.js";

@@ -125,6 +125,7 @@ import {
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import { getRunContentGate } from "./services/run-content-gate.js";
 import {
   createEmbeddedPostgresSupervisor,
   type EmbeddedPostgresSupervisor,
@@ -1926,11 +1927,20 @@ async function startServerWithDatabaseTeardown(
     );
   }
   
+  const runContentGateBoot = await getRunContentGate(db as any)
+    .start()
+    .catch((err) => {
+      logger.error({ err }, "run content gate failed to start; content reads will fail closed until it can acquire leases");
+      return { reapedLeases: 0 };
+    });
+  logger.info({ reapedLeases: runContentGateBoot.reapedLeases }, "run content gate started");
+
   const shutdown = async (
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+    await getRunContentGate(db as any).stop().catch(() => {});
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();
     clearInterval(executionControlInterval);

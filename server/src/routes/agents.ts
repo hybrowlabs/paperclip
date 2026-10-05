@@ -6798,8 +6798,20 @@ export function agentRoutes(
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const runs = await heartbeat.list(companyId, agentId, limit, { summary });
-    res.json(await runRedactions.redactForRuns(companyId, runs));
+    await serveRunList({
+      db,
+      req,
+      res,
+      companyId,
+      purpose: "list_runs",
+      listMeta: () => heartbeat.listRunIdsMeta(companyId, { agentId, limit }),
+      fetchContent: (runIds) => heartbeat.list(companyId, agentId, undefined, { summary, runIds }),
+      shape: async (rows) => {
+        const admitted = rows.filter((row) => !("contentWithheld" in row)) as Array<{ id: string }>;
+        const redacted = new Map((await runRedactions.redactForRuns(companyId, admitted)).map((row) => [row.id, row]));
+        return rows.map((row) => redacted.get(row.id) ?? row);
+      },
+    });
   });
 
   router.get("/companies/:companyId/provider-traces", async (req, res) => {
@@ -6811,7 +6823,10 @@ export function agentRoutes(
       .map((value) => value.trim())
       .filter(Boolean)
       .slice(0, 100);
-    const traces = await providerTraces.listMetadataForRuns(companyId, runIds);
+    const restrictedIds = await getRunContentGate(db).restrictedRunIds(companyId);
+    const traces = (await providerTraces.listMetadataForRuns(companyId, runIds))
+      .filter((trace) => !restrictedIds.has(trace.runId))
+      .map((trace) => ({ ...trace }));
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
@@ -6874,57 +6889,43 @@ export function agentRoutes(
       issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
     };
 
-    const liveRunsQuery = db
-      .select(columns)
-      .from(heartbeatRuns)
-      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          inArray(heartbeatRuns.status, ["queued", "running"]),
-        ),
-      )
-      .orderBy(desc(heartbeatRuns.createdAt));
-
-    const liveRuns = await liveRunsQuery.limit(limit);
+    const liveRunsMeta = await heartbeat.listRunIdsMeta(companyId, { limit, liveOnly: true });
     const targetRunCount = Math.min(minCount, limit);
-
-    if (targetRunCount > 0 && liveRuns.length < targetRunCount) {
-      const activeIds = liveRuns.map((r) => r.id);
-      const recentRuns = await db
-        .select(columns)
-        .from(heartbeatRuns)
-        .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, companyId),
-            not(inArray(heartbeatRuns.status, ["queued", "running"])),
-            ...(activeIds.length > 0 ? [not(inArray(heartbeatRuns.id, activeIds))] : []),
-          ),
-        )
-        .orderBy(desc(heartbeatRuns.createdAt))
-        .limit(targetRunCount - liveRuns.length);
-
-      const rows = [...liveRuns, ...recentRuns];
-      const projections = await executionProjectionsForRuns(db, companyId, rows.map(run => run.id));
-      res.json(await runRedactions.redactForRuns(companyId, await Promise.all(rows.map(async (run) => ({
-        ...heartbeat.decorateActiveRunStatus(run),
-        agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
-        avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
-        execution: projections.get(run.id) ?? null,
-        outputSilence: await heartbeat.buildRunOutputSilence(run),
-      })))));
-      return;
-    }
-
-    const projections = await executionProjectionsForRuns(db, companyId, liveRuns.map(run => run.id));
-    res.json(await runRedactions.redactForRuns(companyId, await Promise.all(liveRuns.map(async (run) => ({
-      ...heartbeat.decorateActiveRunStatus(run),
-        agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
-        avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
-        execution: projections.get(run.id) ?? null,
-      outputSilence: await heartbeat.buildRunOutputSilence(run),
-    })))));
+    const padMeta = targetRunCount > 0 && liveRunsMeta.length < targetRunCount
+      ? (await heartbeat.listRunIdsMeta(companyId, { limit: targetRunCount + liveRunsMeta.length + 50 }))
+          .filter((run) => !liveRunsMeta.some((live) => live.id === run.id) && run.status !== "queued" && run.status !== "running")
+          .slice(0, targetRunCount - liveRunsMeta.length)
+      : [];
+    const metas = [...liveRunsMeta, ...padMeta];
+    await serveRunList({
+      db,
+      req,
+      res,
+      companyId,
+      purpose: "live_runs",
+      listMeta: async () => metas,
+      fetchContent: async (runIds) => {
+        const rows = await db
+          .select(columns)
+          .from(heartbeatRuns)
+          .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+          .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds)))
+          .orderBy(desc(heartbeatRuns.createdAt));
+        const projections = await executionProjectionsForRuns(db, companyId, rows.map((run) => run.id));
+        return Promise.all(rows.map(async (run) => ({
+          ...heartbeat.decorateActiveRunStatus(run),
+          agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
+          avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
+          execution: projections.get(run.id) ?? null,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+        })));
+      },
+      shape: async (rows) => {
+        const admitted = rows.filter((row) => !("contentWithheld" in row)) as Array<{ id: string }>;
+        const redacted = new Map((await runRedactions.redactForRuns(companyId, admitted)).map((row) => [row.id, row]));
+        return rows.map((row) => redacted.get(row.id) ?? row);
+      },
+    });
   });
 
   function readHeartbeatRunId(req: Request): string {
@@ -6938,19 +6939,31 @@ export function agentRoutes(
 
   router.get("/heartbeat-runs/:runId", async (req, res) => {
     const runId = readHeartbeatRunId(req);
-    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
-    if (!run) return;
-    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
-    const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
-    const decoratedRun = heartbeat.decorateActiveRunStatus(run);
-    res.json(await runRedactions.redactForRun(
-      run.companyId,
-      run.id,
-      redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
-        await getCurrentUserRedactionOptions(),
-      ),
-    ));
+    const meta = await getAccessibleResource(req, res, heartbeat.getRunMeta(runId), "Heartbeat run not found");
+    if (!meta) return;
+    if (!(await assertRunTelemetryReadAllowed(req, res, meta.companyId))) return;
+    await serveRunContent({
+      db,
+      req,
+      res,
+      companyId: meta.companyId,
+      runId,
+      purpose: "read_run",
+      produce: async () => {
+        const run = await heartbeat.getRun(runId);
+        if (!run) throw notFound("Heartbeat run not found");
+        const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
+        const decoratedRun = heartbeat.decorateActiveRunStatus(run);
+        return runRedactions.redactForRun(
+          run.companyId,
+          run.id,
+          redactCurrentUserValue(
+            { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+            await getCurrentUserRedactionOptions(),
+          ),
+        );
+      },
+    });
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
@@ -7229,25 +7242,40 @@ export function agentRoutes(
     const run = await getAccessibleResource(
       req,
       res,
-      heartbeat.getRun(runId),
+      heartbeat.getRunMeta(runId),
       "Heartbeat run not found",
     );
     if (!run) return;
-    const inspection = await providerTraces.inspect(run.id, run.companyId);
-    await logActivity(db, {
+    await serveRunContent({
+      db,
+      req,
+      res,
       companyId: run.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "local-admin",
-      action: "provider_trace.redacted_viewed",
-      entityType: "heartbeat_run",
-      entityId: run.id,
-      details: {
-        traceId: inspection.trace?.id ?? null,
-        rawPayloadRevealed: false,
+      runId: run.id,
+      purpose: "inspect_provider_trace",
+      kind: "download",
+      produce: async (lease) => {
+        const inspection = await providerTraces.inspect(run.id, run.companyId);
+        await lease.checkpoint();
+        await logActivity(db, {
+          companyId: run.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "local-admin",
+          action: "provider_trace.redacted_viewed",
+          entityType: "heartbeat_run",
+          entityId: run.id,
+          details: {
+            traceId: inspection.trace?.id ?? null,
+            rawPayloadRevealed: false,
+          },
+        });
+        return inspection;
+      },
+      send: (response, payload) => {
+        response.set("Cache-Control", "no-cache, no-store");
+        response.json(payload);
       },
     });
-    res.set("Cache-Control", "no-cache, no-store");
-    res.json(inspection);
   });
 
   router.post(
@@ -7262,6 +7290,7 @@ export function agentRoutes(
         "Heartbeat run not found",
       );
       if (!run) return;
+      if (await denyRestrictedMutation({ db, req, res, companyId: run.companyId, runId: run.id, purpose: "reproject_provider_trace" })) return;
 
       const trace = await providerTraces.getByRun(run.id, run.companyId);
       let unavailable: WorkspaceDiffReprojectionSkipReason | null = null;
@@ -7321,31 +7350,46 @@ export function agentRoutes(
       const run = await getAccessibleResource(
         req,
         res,
-        heartbeat.getRun(runId),
+        heartbeat.getRunMeta(runId),
         "Heartbeat run not found",
       );
       if (!run) return;
-      const frame = await providerTraces.revealFrame(
-        run.id,
-        run.companyId,
-        frameId,
-      );
-      if (!frame) throw notFound("Provider trace frame not found");
-      await logActivity(db, {
+      await serveRunContent({
+        db,
+        req,
+        res,
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "local-admin",
-        action: "provider_trace.frame_revealed",
-        entityType: "heartbeat_run",
-        entityId: run.id,
-        details: {
-          frameId,
-          digest: frame.digest,
-          byteLength: frame.byteLength,
+        runId: run.id,
+        purpose: "reveal_provider_trace_frame",
+        kind: "download",
+        produce: async (lease) => {
+          const frame = await providerTraces.revealFrame(
+            run.id,
+            run.companyId,
+            frameId,
+          );
+          if (!frame) throw notFound("Provider trace frame not found");
+          await lease.checkpoint();
+          await logActivity(db, {
+            companyId: run.companyId,
+            actorType: "user",
+            actorId: req.actor.userId ?? "local-admin",
+            action: "provider_trace.frame_revealed",
+            entityType: "heartbeat_run",
+            entityId: run.id,
+            details: {
+              frameId,
+              digest: frame.digest,
+              byteLength: frame.byteLength,
+            },
+          });
+          return frame;
+        },
+        send: (response, payload) => {
+          response.set("Cache-Control", "no-cache, no-store");
+          response.json(payload);
         },
       });
-      res.set("Cache-Control", "no-cache, no-store");
-      res.json(frame);
     },
   );
 
@@ -7357,32 +7401,57 @@ export function agentRoutes(
       const run = await getAccessibleResource(
         req,
         res,
-        heartbeat.getRun(runId),
+        heartbeat.getRunMeta(runId),
         "Heartbeat run not found",
       );
       if (!run) return;
-      const download = await providerTraces.download(run.id, run.companyId);
-      if (!download) throw notFound("Provider trace not found");
-      await logActivity(db, {
+      await serveRunContent({
+        db,
+        req,
+        res,
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "local-admin",
-        action: "provider_trace.downloaded",
-        entityType: "heartbeat_run",
-        entityId: run.id,
-        details: {
-          traceId: download.row.id,
-          byteCount: download.bytes.byteLength,
-          digest: download.row.digest,
+        runId: run.id,
+        purpose: "download_provider_trace",
+        kind: "download",
+        produce: async (lease) => {
+          const download = await providerTraces.download(run.id, run.companyId);
+          if (!download) throw notFound("Provider trace not found");
+          await lease.checkpoint();
+          await logActivity(db, {
+            companyId: run.companyId,
+            actorType: "user",
+            actorId: req.actor.userId ?? "local-admin",
+            action: "provider_trace.downloaded",
+            entityType: "heartbeat_run",
+            entityId: run.id,
+            details: {
+              traceId: download.row.id,
+              byteCount: download.bytes.byteLength,
+              digest: download.row.digest,
+            },
+          });
+          return download;
+        },
+        send: (response, download) => {
+          response.set("Cache-Control", "no-cache, no-store");
+          response.set("Content-Type", "application/x-ndjson");
+          response.set(
+            "Content-Disposition",
+            `attachment; filename=provider-trace-${run.id}.ndjson`,
+          );
+          response.send(download.bytes);
+        },
+        onForensicRead: async ({ grantId, payload }) => {
+          await getRunContentGate(db).recordForensicRead({
+            companyId: run.companyId,
+            runId: run.id,
+            actorId: runContentActorId(req),
+            grantId,
+            operation: "download_provider_trace",
+            bytes: payload.bytes,
+          });
         },
       });
-      res.set("Cache-Control", "no-cache, no-store");
-      res.set("Content-Type", "application/x-ndjson");
-      res.set(
-        "Content-Disposition",
-        `attachment; filename=provider-trace-${run.id}.ndjson`,
-      );
-      res.send(download.bytes);
     },
   );
 
@@ -7396,6 +7465,7 @@ export function agentRoutes(
       "Heartbeat run not found",
     );
     if (!run) return;
+    if (await denyRestrictedMutation({ db, req, res, companyId: run.companyId, runId: run.id, purpose: "delete_provider_trace" })) return;
     const removed = await providerTraces.remove(run.id, run.companyId);
     if (!removed) throw notFound("Provider trace not found");
     await logActivity(db, {
@@ -7412,21 +7482,31 @@ export function agentRoutes(
 
   router.get("/heartbeat-runs/:runId/events", async (req, res) => {
     const runId = readHeartbeatRunId(req);
-    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    const run = await getAccessibleResource(req, res, heartbeat.getRunMeta(runId), "Heartbeat run not found");
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
 
     const afterSeq = Number(req.query.afterSeq ?? 0);
     const limit = Number(req.query.limit ?? 200);
-    const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
-    const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const redactedEvents = events.map((event) =>
-      redactCurrentUserValue({
-        ...event,
-        payload: redactEventPayload(event.payload),
-      }, currentUserRedactionOptions),
-    );
-    res.json(await runRedactions.redactForRun(run.companyId, run.id, redactedEvents));
+    await serveRunContent({
+      db,
+      req,
+      res,
+      companyId: run.companyId,
+      runId: run.id,
+      purpose: "read_events",
+      produce: async () => {
+        const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
+        const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+        const redactedEvents = events.map((event) =>
+          redactCurrentUserValue({
+            ...event,
+            payload: redactEventPayload(event.payload),
+          }, currentUserRedactionOptions),
+        );
+        return runRedactions.redactForRun(run.companyId, run.id, redactedEvents);
+      },
+    });
   });
 
   router.get("/heartbeat-runs/:runId/log", async (req, res) => {
@@ -7437,42 +7517,89 @@ export function agentRoutes(
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
-    const result = await heartbeat.readLog(run, {
-      offset: Number.isFinite(offset) ? offset : 0,
-      limitBytes,
+    await serveRunContent({
+      db,
+      req,
+      res,
+      companyId: run.companyId,
+      runId: run.id,
+      purpose: "read_log",
+      produce: async (lease) => {
+        const result = await heartbeat.readLog(run, {
+          offset: Number.isFinite(offset) ? offset : 0,
+          limitBytes,
+        });
+        await lease.checkpoint();
+        return runRedactions.redactForRun(run.companyId, run.id, result);
+      },
+      send: (response, payload) => {
+        response.set("Cache-Control", "no-cache, no-store");
+        response.json(payload);
+      },
     });
-
-    res.set("Cache-Control", "no-cache, no-store");
-    res.json(await runRedactions.redactForRun(run.companyId, run.id, result));
   });
 
   router.get("/heartbeat-runs/:runId/workspace-operations", async (req, res) => {
     const runId = readHeartbeatRunId(req);
-    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    const run = await getAccessibleResource(req, res, heartbeat.getRunMeta(runId), "Heartbeat run not found");
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
 
-    const context = asRecord(run.contextSnapshot);
-    const executionWorkspaceId = asNonEmptyString(context?.executionWorkspaceId);
-    const operations = await workspaceOperations.listForRun(runId, executionWorkspaceId);
-    res.json(redactCurrentUserValue(operations, await getCurrentUserRedactionOptions()));
+    await serveRunContent({
+      db,
+      req,
+      res,
+      companyId: run.companyId,
+      runId: run.id,
+      purpose: "list_workspace_operations",
+      produce: async () => {
+        const full = await heartbeat.getRun(runId);
+        const context = asRecord(full?.contextSnapshot);
+        const executionWorkspaceId = asNonEmptyString(context?.executionWorkspaceId);
+        const metas = await workspaceOperations.listMetaForRun(runId, executionWorkspaceId);
+        const gateForOps = getRunContentGate(db);
+        const nullWs = [...new Set(metas.filter((m) => !m.heartbeatRunId && m.executionWorkspaceId).map((m) => m.executionWorkspaceId!))];
+        const assoc = await gateForOps.workspaceRunAssociation(run.companyId, nullWs);
+        const restrictedIds = await gateForOps.restrictedRunIds(run.companyId);
+        const allowedIds = metas
+          .filter((m) => m.heartbeatRunId || ![...(assoc.get(m.executionWorkspaceId ?? "") ?? [])].some((id) => restrictedIds.has(id)))
+          .map((m) => m.id);
+        const operations = (await workspaceOperations.getByIds(allowedIds)).sort(
+          (a, b) => allowedIds.indexOf(a.id) - allowedIds.indexOf(b.id),
+        );
+        return redactCurrentUserValue(operations, await getCurrentUserRedactionOptions());
+      },
+    });
   });
 
   router.get("/workspace-operations/:operationId/log", async (req, res) => {
     const operationId = req.params.operationId as string;
-    const operation = await getAccessibleResource(req, res, workspaceOperations.getById(operationId), "Workspace operation not found");
+    const operation = await getAccessibleResource(req, res, workspaceOperations.getMetaById(operationId), "Workspace operation not found");
     if (!operation) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, operation.companyId))) return;
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
-    const result = await workspaceOperations.readLog(operationId, {
-      offset: Number.isFinite(offset) ? offset : 0,
-      limitBytes,
+    await serveWorkspaceOperation({
+      db,
+      req,
+      res,
+      companyId: operation.companyId,
+      purpose: "read_workspace_operation_log",
+      getMeta: async () => operation,
+      produce: async (lease) => {
+        const result = await workspaceOperations.readLog(operationId, {
+          offset: Number.isFinite(offset) ? offset : 0,
+          limitBytes,
+        });
+        await lease?.checkpoint();
+        return result;
+      },
+      send: (response, payload) => {
+        response.set("Cache-Control", "no-cache, no-store");
+        response.json(payload);
+      },
     });
-
-    res.set("Cache-Control", "no-cache, no-store");
-    res.json(result);
   });
 
   router.get("/issues/:issueId/live-runs", async (req, res) => {
@@ -7487,53 +7614,67 @@ export function agentRoutes(
     );
     if (!issue) return;
 
-    const liveRuns = await db
-      .select({
-        id: heartbeatRuns.id,
-        runtimeMode: heartbeatRuns.runtimeMode,
-        status: heartbeatRuns.status,
-        invocationSource: heartbeatRuns.invocationSource,
-        triggerDetail: heartbeatRuns.triggerDetail,
-        contextCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'commentId'`.as("contextCommentId"),
-        contextWakeCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`.as("contextWakeCommentId"),
-        startedAt: heartbeatRuns.startedAt,
-        finishedAt: heartbeatRuns.finishedAt,
-        createdAt: heartbeatRuns.createdAt,
-        agentId: heartbeatRuns.agentId,
-        agentName: agentsTable.name,
-        agentAppearance: agentsTable.appearance,
-        adapterType: agentsTable.adapterType,
-        logBytes: heartbeatRuns.logBytes,
-        livenessState: heartbeatRuns.livenessState,
-        livenessReason: heartbeatRuns.livenessReason,
-        continuationAttempt: heartbeatRuns.continuationAttempt,
-        lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
-        nextAction: heartbeatRuns.nextAction,
-        lastOutputAt: heartbeatRuns.lastOutputAt,
-        lastOutputSeq: heartbeatRuns.lastOutputSeq,
-        lastOutputStream: heartbeatRuns.lastOutputStream,
-        lastOutputBytes: heartbeatRuns.lastOutputBytes,
-        processStartedAt: heartbeatRuns.processStartedAt,
-      })
-      .from(heartbeatRuns)
-      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, issue.companyId),
-          inArray(heartbeatRuns.status, ["queued", "running"]),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
-        ),
-      )
-      .orderBy(desc(heartbeatRuns.createdAt));
+    const issueLiveWhere = and(
+      eq(heartbeatRuns.companyId, issue.companyId),
+      inArray(heartbeatRuns.status, ["queued", "running"]),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+    );
+    await serveRunList({
+      db,
+      req,
+      res,
+      companyId: issue.companyId,
+      purpose: "live_runs",
+      listMeta: () =>
+        db
+          .select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
+          .from(heartbeatRuns)
+          .where(issueLiveWhere)
+          .orderBy(desc(heartbeatRuns.createdAt)),
+      fetchContent: async (runIds) => {
+        const liveRuns = await db
+          .select({
+            id: heartbeatRuns.id,
+            runtimeMode: heartbeatRuns.runtimeMode,
+            status: heartbeatRuns.status,
+            invocationSource: heartbeatRuns.invocationSource,
+            triggerDetail: heartbeatRuns.triggerDetail,
+            contextCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'commentId'`.as("contextCommentId"),
+            contextWakeCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`.as("contextWakeCommentId"),
+            startedAt: heartbeatRuns.startedAt,
+            finishedAt: heartbeatRuns.finishedAt,
+            createdAt: heartbeatRuns.createdAt,
+            agentId: heartbeatRuns.agentId,
+            agentName: agentsTable.name,
+            agentAppearance: agentsTable.appearance,
+            adapterType: agentsTable.adapterType,
+            logBytes: heartbeatRuns.logBytes,
+            livenessState: heartbeatRuns.livenessState,
+            livenessReason: heartbeatRuns.livenessReason,
+            continuationAttempt: heartbeatRuns.continuationAttempt,
+            lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+            nextAction: heartbeatRuns.nextAction,
+            lastOutputAt: heartbeatRuns.lastOutputAt,
+            lastOutputSeq: heartbeatRuns.lastOutputSeq,
+            lastOutputStream: heartbeatRuns.lastOutputStream,
+            lastOutputBytes: heartbeatRuns.lastOutputBytes,
+            processStartedAt: heartbeatRuns.processStartedAt,
+          })
+          .from(heartbeatRuns)
+          .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+          .where(and(issueLiveWhere, inArray(heartbeatRuns.id, runIds)))
+          .orderBy(desc(heartbeatRuns.createdAt));
 
-    const projections = await executionProjectionsForRuns(db, issue.companyId, liveRuns.map(run => run.id));
-    res.json(await Promise.all(liveRuns.map(async (run) => ({
-      ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
-      agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
-      avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
-      execution: projections.get(run.id) ?? null,
-      outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
-    }))));
+        const projections = await executionProjectionsForRuns(db, issue.companyId, liveRuns.map(run => run.id));
+        return Promise.all(liveRuns.map(async (run) => ({
+          ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
+          agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
+          avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
+          execution: projections.get(run.id) ?? null,
+          outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
+        })));
+      },
+    });
   });
 
   router.get("/issues/:issueId/execution", async (req, res) => {
@@ -7543,6 +7684,14 @@ export function agentRoutes(
       eq(heartbeatRuns.companyId, issue.companyId),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
     )).orderBy(sql`case when ${heartbeatRuns.id} = ${issue.executionRunId} then 0 when ${heartbeatRuns.status} = 'running' then 1 else 2 end`, desc(heartbeatRuns.createdAt)).limit(1);
+    if (run) {
+      const decision = await getRunContentGate(db).authorizeRunContent({ companyId: issue.companyId, runId: run.id, actorId: runContentActorId(req), routePurpose: "issue_runs" });
+      if (decision.decision === "deny") {
+        res.set("Cache-Control", "no-store");
+        res.json({ runId: run.id, agentId: null, contentWithheld: true, state: "restricted", recoveryAction: null, execution: null });
+        return;
+      }
+    }
     res.json(run ? { runId: run.id, agentId: run.agentId, recoveryAction: await issueRecoveryActionService(db).getActiveForIssue(issue.companyId, issue.id), execution: await executionProjectionForRun(db, issue.companyId, run.id) } : null);
   });
 
@@ -7580,6 +7729,14 @@ export function agentRoutes(
       res.json(null);
       return;
     }
+    {
+      const decision = await getRunContentGate(db).authorizeRunContent({ companyId: issue.companyId, runId: run.id, actorId: runContentActorId(req), routePurpose: "issue_runs" });
+      if (decision.decision === "deny") {
+        res.set("Cache-Control", "no-store");
+        res.json({ id: run.id, companyId: issue.companyId, state: "restricted", contentWithheld: true });
+        return;
+      }
+    }
 
     const agent = await svc.getById(run.agentId);
     if (!agent) {
@@ -7603,3 +7760,5 @@ export function agentRoutes(
   return router;
 }
 import { listRunIdentityContexts } from "../services/run-identity.js";
+import { getRunContentGate } from "../services/run-content-gate.js";
+import { denyRestrictedMutation, runContentActorId, serveRunContent, serveRunList, serveWorkspaceOperation } from "./run-content-guard.js";

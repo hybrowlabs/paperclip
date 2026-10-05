@@ -10,6 +10,7 @@ import {
   type RunFailureReportOptions,
 } from "./run-failure-diagnostics.js";
 import { logger } from "../middleware/logger.js";
+import { getRunContentGate } from "./run-content-gate.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 
@@ -65,7 +66,21 @@ async function captureTerminalRunFailure(
   runStatus: RunFailureStatus,
   options: RunFailureReportOptions,
 ): Promise<void> {
+  let egress: Awaited<ReturnType<ReturnType<typeof getRunContentGate>["authorizeEgress"]>> | null = null;
   try {
+    // Fail closed: the egress lease is held until the Sentry call is made, and
+    // the decision is taken against the current restriction epoch at send time,
+    // not when the report was queued.
+    egress = await getRunContentGate(db).authorizeEgress({
+      companyId: run.companyId,
+      runId: run.id,
+      jobKind: "sentry_failed_run_report",
+      destinationClass: "sentry",
+    });
+    if (!egress.allowed) {
+      logger.info({ runId: run.id, reason: egress.reason }, "run failure report withheld by run content gate");
+      return;
+    }
     const snapshot = redactRunFailureSecretValues({
       errorMessage: run.error ?? "",
       errorCode: run.errorCode ?? null,
@@ -93,7 +108,8 @@ async function captureTerminalRunFailure(
       const { createRunSecretRedactionRegistry } = await import("./run-secret-redaction.js");
       redacted = await createRunSecretRedactionRegistry(db).redactForRun(run.companyId, run.id, snapshot);
     }
-    captureRunFailure({
+    await egress.lease?.checkpoint();
+    egress.lease?.emit(() => captureRunFailure({
       taskId,
       runId: run.id,
       errorMessage: sanitizeRunFailureText(redacted.errorMessage, MAX_ERROR_MESSAGE_LENGTH),
@@ -106,9 +122,11 @@ async function captureTerminalRunFailure(
       exitCode: run.exitCode,
       signal: run.signal,
       diagnostics: sanitizeRunFailureDiagnostics(redacted.diagnostics),
-    });
+    }));
   } catch (err) {
     logger.warn({ err, runId: run.id }, "failed to report run failure to Sentry");
+  } finally {
+    if (egress?.allowed) await egress.lease?.release("complete").catch(() => {});
   }
 }
 

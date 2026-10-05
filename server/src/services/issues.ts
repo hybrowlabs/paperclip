@@ -148,6 +148,7 @@ import {
   resolveNextIssueGoalId,
 } from "./issue-goal-fallback.js";
 import { getRunLogStore } from "./run-log-store.js";
+import { getRunContentGate } from "./run-content-gate.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import {
@@ -6546,11 +6547,27 @@ async function countBlockedInboxIssues(
 
 export async function readIssueCommentRunLogText(run: {
   runId?: string | null;
+  companyId?: string | null;
   logStore: string | null;
   logRef: string | null;
   logBytes: number | null;
-}) {
+}, gateDb?: Db): Promise<string> {
   if (run.logStore !== "local_file" || !run.logRef) return "";
+  if (gateDb && run.runId && run.companyId) {
+    const lease = await getRunContentGate(gateDb)
+      .acquireLease({ companyId: run.companyId, runId: run.runId, actorId: null, routePurpose: "derive_issue_comment", kind: "internal_read" })
+      .catch(() => null);
+    if (!lease) return "";
+    try {
+      const text: string = await readIssueCommentRunLogText({ ...run, companyId: null });
+      await lease.checkpoint();
+      return text;
+    } catch {
+      return "";
+    } finally {
+      await lease.release("complete");
+    }
+  }
   // A timed-out finalization leaves size unknown even when earlier entries
   // exist. Read those logs within the same byte budget as a known-size log.
   if (run.logBytes !== null && (!Number.isFinite(run.logBytes) || run.logBytes <= 0)) return "";
@@ -7051,7 +7068,7 @@ export function issueService(db: Db) {
           );
           await Promise.all(
             batch.map(async (run) => {
-              logByRunId.set(run.runId, await readIssueCommentRunLogText(run));
+              logByRunId.set(run.runId, await readIssueCommentRunLogText({ ...run, companyId }, db));
             }),
           );
         }

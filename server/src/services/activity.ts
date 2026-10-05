@@ -388,7 +388,30 @@ export function activityService(db: Db) {
         )
         .orderBy(desc(activityLog.createdAt)),
 
-    runsForIssue: async (companyId: string, issueId: string) => {
+    runsMetaForIssue: async (companyId: string, issueId: string) =>
+      db
+        .select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            or(
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              sql`exists (
+                select 1
+                from ${activityLog}
+                where ${activityLog.companyId} = ${companyId}
+                  and ${activityLog.entityType} = 'issue'
+                  and ${activityLog.entityId} = ${issueId}
+                  and ${activityLog.runId} = ${heartbeatRuns.id}
+              )`,
+            ),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt)),
+
+    runsForIssue: async (companyId: string, issueId: string, options: { runIds?: string[] } = {}) => {
+      if (options.runIds && options.runIds.length === 0) return [];
       scheduleRunLivenessBackfill(companyId, issueId);
       const runs = await db
         .select({
@@ -431,6 +454,7 @@ export function activityService(db: Db) {
         .where(
           and(
             eq(heartbeatRuns.companyId, companyId),
+            ...(options.runIds ? [inArray(heartbeatRuns.id, options.runIds)] : []),
             or(
               sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
               sql`exists (

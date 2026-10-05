@@ -10,6 +10,7 @@ import type {
 } from "@paperclipai/shared";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logActivity } from "./activity-log.js";
+import { isRunRetentionHeld } from "./run-content-gate.js";
 
 export const PROVIDER_TRACE_MAX_BYTES = 64 * 1024 * 1024;
 export const PROVIDER_TRACE_RETENTION_MS = 24 * 60 * 60 * 1_000;
@@ -278,6 +279,7 @@ export function providerTraceStore(db: Db) {
   }
 
   async function expireRow(row: TraceRow, now: Date) {
+    if (await isRunRetentionHeld(db, row.companyId, row.runId)) return null;
     let expired = row;
     let newlyExpired = false;
     if (!row.deletedAt) {
@@ -578,6 +580,9 @@ export function providerTraceStore(db: Db) {
   async function remove(runId: string, companyId: string) {
     const row = await getByRun(runId, companyId);
     if (!row || row.deletedAt) return null;
+    if (await isRunRetentionHeld(db, row.companyId, row.runId)) {
+      throw new Error("provider_trace_retention_hold");
+    }
     // Manual deletion is filesystem-first and strict: a reported success must
     // never leave raw sidecars orphaned behind an inaccessible database row.
     await removeTraceFiles(row.traceRef);

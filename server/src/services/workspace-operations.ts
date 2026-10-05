@@ -238,6 +238,14 @@ function combineMetadata(
   };
 }
 
+const workspaceOperationMetaColumns = {
+  id: workspaceOperations.id,
+  companyId: workspaceOperations.companyId,
+  heartbeatRunId: workspaceOperations.heartbeatRunId,
+  executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+  startedAt: workspaceOperations.startedAt,
+} as const;
+
 export interface WorkspaceOperationRecorder {
   attachExecutionWorkspaceId(executionWorkspaceId: string | null): Promise<void>;
   recordOperation(input: {
@@ -695,6 +703,43 @@ export function workspaceOperationService(db: Db) {
           }
         },
       };
+    },
+
+    listMetaForRun: async (runId: string, executionWorkspaceId?: string | null) => {
+      const conditions = [eq(workspaceOperations.heartbeatRunId, runId)];
+      if (executionWorkspaceId) {
+        conditions.push(
+          and(
+            eq(workspaceOperations.executionWorkspaceId, executionWorkspaceId)!,
+            isNull(workspaceOperations.heartbeatRunId),
+          )!,
+        );
+      }
+      return db
+        .select(workspaceOperationMetaColumns)
+        .from(workspaceOperations)
+        .where(conditions.length === 1 ? conditions[0]! : or(...conditions)!)
+        .orderBy(asc(workspaceOperations.startedAt), asc(workspaceOperations.createdAt), asc(workspaceOperations.id));
+    },
+
+    listMetaForExecutionWorkspace: async (executionWorkspaceId: string) =>
+      db
+        .select(workspaceOperationMetaColumns)
+        .from(workspaceOperations)
+        .where(eq(workspaceOperations.executionWorkspaceId, executionWorkspaceId))
+        .orderBy(desc(workspaceOperations.startedAt), desc(workspaceOperations.createdAt)),
+
+    getMetaById: async (id: string) =>
+      db
+        .select(workspaceOperationMetaColumns)
+        .from(workspaceOperations)
+        .where(eq(workspaceOperations.id, id))
+        .then((rows) => rows[0] ?? null),
+
+    getByIds: async (ids: string[]) => {
+      if (ids.length === 0) return [];
+      const rows = await db.select().from(workspaceOperations).where(inArray(workspaceOperations.id, ids));
+      return rows.map(toWorkspaceOperation);
     },
 
     listForRun: async (runId: string, executionWorkspaceId?: string | null) => {

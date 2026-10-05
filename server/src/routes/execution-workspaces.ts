@@ -61,6 +61,7 @@ import {
   workspaceLoginHandoffFailureStatus,
 } from "../services/workspace-login-handoff-issuer.js";
 import { conflict, unprocessable } from "../errors.js";
+import { serveWorkspaceOperationList } from "./run-content-guard.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 
@@ -260,8 +261,18 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const workspace = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
     if (!workspace) return;
     if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
-    const operations = await workspaceOperationsSvc.listForExecutionWorkspace(id);
-    res.json(operations);
+    await serveWorkspaceOperationList({
+      db,
+      req,
+      res,
+      companyId: workspace.companyId,
+      purpose: "list_workspace_operations",
+      listMeta: () => workspaceOperationsSvc.listMetaForExecutionWorkspace(id),
+      fetchContent: async (ids) => {
+        const rows = await workspaceOperationsSvc.getByIds(ids);
+        return rows.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+      },
+    });
   });
 
   async function handleExecutionWorkspaceRuntimeCommand(req: Request, res: Response) {

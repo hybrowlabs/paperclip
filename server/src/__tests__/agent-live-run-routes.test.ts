@@ -8,7 +8,35 @@ const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
 
+const mockRunContentGate = vi.hoisted(() => {
+  const lease = () => ({
+    id: "passthrough",
+    grantId: null,
+    decision: "ordinary" as const,
+    runIds: [] as string[],
+    signal: new AbortController().signal,
+    checkpoint: async () => undefined,
+    emit: <T,>(write: () => T) => write(),
+    release: async () => undefined,
+  });
+  return {
+    authorizeRunContent: vi.fn(async () => ({ decision: "ordinary" as const, epoch: 0, policyVersion: 1 })),
+    authorizeRunMutation: vi.fn(async () => ({ allowed: true as const })),
+    acquireLease: vi.fn(async () => lease()),
+    acquireListLease: vi.fn(async (input: { runIds: string[] }) => ({
+      lease: lease(),
+      allowed: new Set(input.runIds),
+      restricted: new Map(),
+    })),
+    restrictedRunIds: vi.fn(async () => new Set<string>()),
+    workspaceRunAssociation: vi.fn(async () => new Map()),
+    recordForensicRead: vi.fn(async () => undefined),
+  };
+});
+
 const mockHeartbeatService = vi.hoisted(() => ({
+  getRunMeta: vi.fn(),
+  listRunIdsMeta: vi.fn(),
   buildRunOutputSilence: vi.fn(),
   decorateActiveRunStatus: vi.fn(),
   getRunIssueSummary: vi.fn(),
@@ -65,6 +93,9 @@ const mockAccessService = vi.hoisted(() => ({
 }));
 const mockWorkspaceOperationService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getMetaById: vi.fn(),
+  getByIds: vi.fn(),
+  listMetaForRun: vi.fn(),
   listForRun: vi.fn(),
   readLog: vi.fn(),
 }));
@@ -79,6 +110,11 @@ const mockChatRunRetries = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/run-content-gate.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/run-content-gate.js")>("../services/run-content-gate.js")),
+    getRunContentGate: () => mockRunContentGate,
+  }));
+
   vi.doMock("../services/execution-projection.js", () => mockExecutionProjection);
   vi.doMock("../routes/authz.js", async () =>
     vi.importActual("../routes/authz.js"),
@@ -182,10 +218,16 @@ async function createApp(
 
 function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
   const limit = vi.fn(async (value: number) => rows.slice(0, value));
+  // The route lists ids first (heartbeat.listRunIdsMeta), then selects content
+  // only for the admitted ids. The stub honours that id set exactly as the
+  // real `inArray(heartbeatRuns.id, ids)` predicate does, so the limit and
+  // padding assertions keep exercising the real route.
+  let admittedIds: Set<string> | null = null;
+  const contentRows = () => (admittedIds ? rows.filter((row) => admittedIds!.has(String(row.id))) : rows);
   const orderedQuery = {
     limit,
     then: (resolve: (value: Array<Record<string, unknown>>) => unknown) =>
-      Promise.resolve(rows).then(resolve),
+      Promise.resolve(contentRows()).then(resolve),
   };
   const query = {
     from: vi.fn().mockReturnThis(),
@@ -193,6 +235,17 @@ function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
     where: vi.fn().mockReturnThis(),
     orderBy: vi.fn().mockReturnValue(orderedQuery),
   };
+  mockHeartbeatService.listRunIdsMeta.mockImplementation(
+    async (_companyId: string, options: { limit?: number; liveOnly?: boolean } = {}) => {
+      const filtered = rows.filter((row) =>
+        options.liveOnly ? row.status === "queued" || row.status === "running" : true,
+      );
+      const sliced = options.limit ? filtered.slice(0, options.limit) : filtered;
+      await limit(options.limit ?? filtered.length);
+      admittedIds = new Set(sliced.map((row) => String(row.id)));
+      return sliced.map((row) => ({ id: row.id, createdAt: row.createdAt, status: row.status }));
+    },
+  );
 
   return {
     db: {
@@ -285,6 +338,11 @@ describe("agent live run routes", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockHeartbeatService.getRunMeta.mockImplementation(async (runId: string) => {
+      const run = await mockHeartbeatService.getRun(runId);
+      return run ? { id: run.id ?? runId, companyId: run.companyId, createdAt: run.createdAt ?? null } : null;
+    });
+    mockHeartbeatService.listRunIdsMeta.mockResolvedValue([]);
     mockChatRunRetries.prepareFailedChatRunRetry.mockReset();
     mockChatRunRetries.processFailedChatRunRetry.mockReset();
     mockAccessService.canUser.mockResolvedValue(true);
@@ -376,6 +434,12 @@ describe("agent live run routes", () => {
       id: "operation-1",
       companyId: "company-1",
       runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    });
+    mockWorkspaceOperationService.getMetaById.mockResolvedValue({
+      id: "operation-1",
+      companyId: "company-1",
+      heartbeatRunId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      executionWorkspaceId: null,
     });
     mockQueueRuntimeRequestResolution.mockReturnValue({
       commandId: "command-resolution-1",
@@ -771,27 +835,7 @@ describe("agent live run routes", () => {
       issueId: "issue-1",
     }));
 
-    const selectCalls: Array<ReturnType<typeof vi.fn>> = [];
-    const db = {
-      select: vi.fn().mockImplementation(() => {
-        const limitFn = vi.fn(async (value: number) =>
-          liveRows.slice(0, value),
-        );
-        const orderedQuery = {
-          limit: limitFn,
-          then: (resolve: (value: typeof liveRows) => unknown) =>
-            Promise.resolve(liveRows).then(resolve),
-        };
-        const query = {
-          from: vi.fn().mockReturnThis(),
-          innerJoin: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          orderBy: vi.fn().mockReturnValue(orderedQuery),
-        };
-        selectCalls.push(limitFn);
-        return query;
-      }),
-    };
+    const { db } = createLiveRunsDbStub(liveRows);
 
     const res = await requestApp(await createApp(db), (baseUrl) =>
       request(baseUrl).get("/api/companies/company-1/live-runs"),
@@ -858,25 +902,7 @@ describe("agent live run routes", () => {
       issueId: "issue-1",
     }));
 
-    let selectCallCount = 0;
-    const db = {
-      select: vi.fn().mockImplementation(() => {
-        selectCallCount += 1;
-        const rows = selectCallCount === 1 ? liveRows : recentRows;
-        const limitFn = vi.fn(async (value: number) => rows.slice(0, value));
-        const orderedQuery = {
-          limit: limitFn,
-          then: (resolve: (value: typeof rows) => unknown) =>
-            Promise.resolve(rows).then(resolve),
-        };
-        return {
-          from: vi.fn().mockReturnThis(),
-          innerJoin: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          orderBy: vi.fn().mockReturnValue(orderedQuery),
-        };
-      }),
-    };
+    const { db } = createLiveRunsDbStub([...liveRows, ...recentRows]);
 
     const res = await requestApp(await createApp(db), (baseUrl) =>
       request(baseUrl).get("/api/companies/company-1/live-runs?minCount=4"),
@@ -884,7 +910,9 @@ describe("agent live run routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toHaveLength(4);
-    expect(db.select).toHaveBeenCalledTimes(2);
+    expect(res.body.filter((run: { status: string }) => run.status === "running")).toHaveLength(2);
+    expect(res.body.filter((run: { status: string }) => run.status === "succeeded")).toHaveLength(2);
+    expect(mockHeartbeatService.listRunIdsMeta).toHaveBeenCalledTimes(2);
   });
 
   it("passes scoped wake fields through the legacy heartbeat invoke route", async () => {

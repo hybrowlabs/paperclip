@@ -10,6 +10,7 @@ import { sanitizeRecord } from "../redaction.js";
 import { badRequest, forbidden } from "../errors.js";
 import { agentActionAuditService } from "../services/agent-action-audit.js";
 import { logActivity } from "../services/activity-log.js";
+import { runContentActorId, serveRunContent, serveRunList } from "./run-content-guard.js";
 
 /** Max rows a single CSV export will stream (guards against runaway exports). */
 const AUDIT_CSV_EXPORT_MAX_ROWS = 10_000;
@@ -352,14 +353,28 @@ export function activityRoutes(db: Db) {
     const issue = await getAccessibleResource(req, res, resolveIssueByRef(rawId), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const result = await svc.runsForIssue(issue.companyId, issue.id);
-    res.json(result);
+    await serveRunList({
+      db,
+      req,
+      res,
+      companyId: issue.companyId,
+      purpose: "issue_runs",
+      listMeta: () => svc.runsMetaForIssue(issue.companyId, issue.id),
+      fetchContent: async (runIds) =>
+        (await svc.runsForIssue(issue.companyId, issue.id, { runIds })).map((run) => ({ ...run, id: run.runId })),
+      shape: (rows) =>
+        rows.map((row) => {
+          if ("contentWithheld" in row) return { runId: row.id, ...row };
+          const { id: _id, ...rest } = row as { id: string } & Record<string, unknown>;
+          return rest;
+        }),
+    });
   });
 
   router.get("/heartbeat-runs/:runId/issues", async (req, res) => {
     assertAuthenticated(req);
     const runId = req.params.runId as string;
-    const run = await heartbeat.getRun(runId);
+    const run = await heartbeat.getRunMeta(runId);
     if (!run || !hasCompanyAccess(req, run.companyId)) {
       // Return `200 []` for both "doesn't exist" and "cross-tenant" — preserves the
       // legacy API contract while keeping the cross-tenant existence oracle closed
@@ -369,8 +384,15 @@ export function activityRoutes(db: Db) {
     }
     assertCompanyAccess(req, run.companyId);
     if (!(await assertCompanyScopeReadAllowed(req, res, run.companyId))) return;
-    const result = await svc.issuesForRun(runId);
-    res.json(result);
+    await serveRunContent({
+      db,
+      req,
+      res,
+      companyId: run.companyId,
+      runId,
+      purpose: "issue_runs",
+      produce: () => svc.issuesForRun(runId),
+    });
   });
 
   return router;

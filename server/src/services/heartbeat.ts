@@ -10658,6 +10658,36 @@ export function heartbeatService(
     return recordHeartbeatRunRuntimeProgress(currentRun, update, issueId);
   }
 
+  async function getRunMeta(runId: string) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function listRunIdsMeta(
+    companyId: string,
+    options: { agentId?: string; limit?: number; liveOnly?: boolean } = {},
+  ) {
+    const query = db
+      .select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
+          ...(options.liveOnly ? [inArray(heartbeatRuns.status, ["queued", "running"])] : []),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt));
+    return options.limit ? query.limit(options.limit) : query;
+  }
+
   async function getRunLogAccess(runId: string) {
     return db
       .select(heartbeatRunLogAccessColumns)
@@ -29589,10 +29619,11 @@ export function heartbeatService(
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: { summary?: boolean; runIds?: string[] } = {},
     ) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
+      if (options.runIds && options.runIds.length === 0) return [];
       const query = db
         .select(
           summary
@@ -29614,12 +29645,11 @@ export function heartbeatService(
         )
         .from(heartbeatRuns)
         .where(
-          agentId
-            ? and(
-                eq(heartbeatRuns.companyId, companyId),
-                eq(heartbeatRuns.agentId, agentId),
-              )
-            : eq(heartbeatRuns.companyId, companyId),
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            ...(agentId ? [eq(heartbeatRuns.agentId, agentId)] : []),
+            ...(options.runIds ? [inArray(heartbeatRuns.id, options.runIds)] : []),
+          ),
         )
         .orderBy(desc(heartbeatRuns.createdAt));
 
@@ -29775,6 +29805,9 @@ export function heartbeatService(
         clearedTaskSessions,
       };
     },
+
+    getRunMeta,
+    listRunIdsMeta,
 
     listEvents: (runId: string, afterSeq = 0, limit = 200) =>
       db
