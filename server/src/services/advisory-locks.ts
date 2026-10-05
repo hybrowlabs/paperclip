@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { PAPERCLIP_LOCK_NAMESPACE, postgres } from "@paperclipai/db";
+import { PAPERCLIP_LOCK_NAMESPACE, getAdvisoryLockDb, postgres } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 
 /**
@@ -25,11 +25,12 @@ import type { Db } from "@paperclipai/db";
  * this safe under transaction-pooling poolers (PgBouncer) and leak-proof:
  * the lock releases on commit OR rollback, with no manual unlock to lose.
  *
- * The transaction (and therefore one pooled connection) stays open for the
- * duration of `fn` — long-running callbacks hold that pooled connection for
- * their entire duration, so keep critical sections bounded; at call sites
- * where the protected work is heavier (e.g. skill refresh), state the bound
- * in a comment. Truly long-running work (backups, migrations) belongs on
+ * The transaction stays open for the duration of `fn` on a connection from a
+ * separate lock pool (`getAdvisoryLockDb`, `DATABASE_ADVISORY_LOCK_POOL_MAX`,
+ * default 16), never the pool `fn` itself uses, so any number of concurrent
+ * lock holders cannot starve their own work of connections. Do not nest lock
+ * calls, which could wait on the lock pool while holding it. Keep critical
+ * sections bounded. Truly long-running work (backups, migrations) belongs on
  * `trySessionAdvisoryLock` instead.
  *
  * `fn` deliberately receives nothing: the lock's transaction is a mutex
@@ -37,7 +38,7 @@ import type { Db } from "@paperclipai/db";
  * outer pool (its own connections), not inside the lock's transaction.
  */
 export async function withAdvisoryXactLock<T>(db: Db, name: string, fn: () => Promise<T>): Promise<T> {
-  return await db.transaction(async (tx) => {
+  return await getAdvisoryLockDb(db).transaction(async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(${PAPERCLIP_LOCK_NAMESPACE}, hashtext(${name}))`);
     return await fn();
   });
@@ -54,7 +55,7 @@ export async function tryAdvisoryXactLock<T>(
   name: string,
   fn: () => Promise<T>,
 ): Promise<{ acquired: false } | { acquired: true; result: T }> {
-  return await db.transaction(async (tx) => {
+  return await getAdvisoryLockDb(db).transaction(async (tx) => {
     const rows = await tx.execute(
       sql`SELECT pg_try_advisory_xact_lock(${PAPERCLIP_LOCK_NAMESPACE}, hashtext(${name})) AS acquired`,
     );

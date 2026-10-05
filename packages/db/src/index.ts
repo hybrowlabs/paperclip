@@ -5,6 +5,8 @@ export {
   PAPERCLIP_LOCK_NAMESPACE,
   createDb,
   withDedicatedDbConnection,
+  getAdvisoryLockDb,
+  closeAdvisoryLockDb,
   closeRegisteredClients,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
