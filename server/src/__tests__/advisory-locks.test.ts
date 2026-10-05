@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
 import { createDb, type Db } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -100,5 +101,52 @@ describeEmbedded("advisory locks", () => {
     const after = await trySessionAdvisoryLock(connectionString, "test-session");
     expect(after.acquired).toBe(true);
     if (after.acquired) await after.release();
+  });
+
+  it("does not deadlock a small pool when more locks are held than the pool has connections", async () => {
+    const smallPool = createDb(connectionString, { maxConnections: 2 });
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      let entered = 0;
+      let allEntered!: () => void;
+      const everyoneInside = new Promise<void>((resolve) => (allEntered = resolve));
+      const holders = ["pool-a", "pool-b", "pool-c", "pool-d"].map((name) =>
+        tryAdvisoryXactLock(smallPool, `test-${name}`, async () => {
+          entered += 1;
+          if (entered === 4) allEntered();
+          await gate;
+          const rows = await smallPool.execute(sql`select 1 as one`);
+          return rows.length;
+        }),
+      );
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("locks starved the shared pool: deadlock")), 10_000),
+      );
+      await Promise.race([everyoneInside, timeout]);
+      release();
+      const results = await Promise.race([Promise.all(holders), timeout]);
+      expect(results.every((result) => result.acquired)).toBe(true);
+      const blocking = await Promise.race([
+        Promise.all(
+          ["pool-e", "pool-f", "pool-g"].map((name) =>
+            withAdvisoryXactLock(smallPool, `test-${name}`, async () => {
+              const rows = await smallPool.execute(sql`select 1 as one`);
+              return rows.length;
+            }),
+          ),
+        ),
+        timeout,
+      ]);
+      expect(blocking).toEqual([1, 1, 1]);
+    } finally {
+      await smallPool.$client.end({ timeout: 5 });
+    }
+  }, 30_000);
+
+  it("keeps working for a Db that was not built by createDb", async () => {
+    const wrapped = { transaction: dbA.transaction.bind(dbA) } as unknown as Db;
+    const result = await tryAdvisoryXactLock(wrapped, "test-wrapped", async () => "ran");
+    expect(result).toEqual({ acquired: true, result: "ran" });
   });
 });
