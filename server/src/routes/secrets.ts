@@ -28,7 +28,10 @@ import { issueService } from "../services/issues.js";
 import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
-import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
+import {
+  assertCanResolveProposal,
+  hasSecretDefinitionAdminAccess as sharedHasSecretDefinitionAdminAccess,
+} from "../services/secret-proposal-authorization.js";
 
 type SecretRoutesDeps = {
   heartbeat?: IssueAssignmentWakeupDeps;
@@ -68,9 +71,7 @@ function setProposalPaginationHeaders(
 function hasSecretDefinitionAdminAccess(req: Parameters<typeof assertBoard>[0], companyId: string) {
   assertBoard(req);
   assertCompanyAccess(req, companyId);
-  if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return true;
-  const membership = req.actor.memberships?.find((item) => item.companyId === companyId);
-  return membership?.status === "active" && ["owner", "admin"].includes(String(membership.membershipRole));
+  return sharedHasSecretDefinitionAdminAccess(req.actor, companyId);
 }
 
 function assertSecretDefinitionAdmin(req: Parameters<typeof assertBoard>[0], companyId: string) {
