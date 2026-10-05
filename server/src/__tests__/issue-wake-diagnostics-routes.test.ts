@@ -631,6 +631,7 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(res.body.diagnosis).toContain("truncated to 50 wake requests");
     expect(res.body.caps).toEqual({ maxWakeRequests: 50, maxActivityRecords: 50, lookbackDays: 14 });
   });
+
   it("reads only the wait cause from the wake payload, not the whole payload", async () => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);

@@ -10516,6 +10516,8 @@ export function heartbeatService(
     const issueIdSql = sql<string>`${agentWakeupRequests.payload}->>'issueId'`;
     const candidates = await db.select({ companyId: agentWakeupRequests.companyId, issueId: issueIdSql })
       .from(agentWakeupRequests)
+      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${issueIdSql}`))
       .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
       .where(and(
         parkedStageWait,
@@ -10558,8 +10560,10 @@ export function heartbeatService(
       if (live.length === 0) continue;
       if (await getExecutionBlocker(db, candidate.companyId, candidate.issueId)) {
         await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
-          inArray(agentWakeupRequests.id, live.map(({ wake }) => wake.id)),
-          eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          parkedStageWait,
+          eq(agentWakeupRequests.companyId, candidate.companyId),
+          sql`${issueIdSql} = ${candidate.issueId}`,
+        ));
         continue;
       }
       for (const { wake, issue } of live) {

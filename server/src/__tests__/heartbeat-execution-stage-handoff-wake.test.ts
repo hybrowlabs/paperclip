@@ -221,6 +221,7 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, checkerAgentId));
     expect(runs).toHaveLength(0);
   });
+
   async function releaseLease(leaseId: string) {
     await db.update(environmentLeases)
       .set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
@@ -378,4 +379,98 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
     expect(checkerRuns).toHaveLength(1);
     expect(after!.runId).toBe(checkerRuns[0]!.id);
   }, 30_000);
+
+  it("does not let parked wakes whose issue is gone starve a newer resumable one", async () => {
+    const ready = await seed();
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    const orphanWake = stageWake(randomUUID(), ready.stoppedRunId);
+    await db.insert(agentWakeupRequests).values(Array.from({ length: 60 }, (_, index) => ({
+      companyId: ready.companyId,
+      agentId: ready.checkerAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      status: "deferred_issue_execution",
+      idempotencyKey: `orphan-${index}-${randomUUID()}`,
+      payload: index < 55
+        ? {
+          ...orphanWake.payload,
+          issueId: randomUUID(),
+          executionWait: { recoveryActionId: null, cause: "execution_owner_active" },
+        }
+        : { executionWait: { recoveryActionId: null, cause: "execution_owner_active" } },
+      requestedAt: new Date(old.getTime() + index),
+      updatedAt: new Date(old.getTime() + index),
+    })));
+    await heartbeat.wakeup(ready.checkerAgentId, stageWake(ready.issueId, ready.stoppedRunId, ready.stageId));
+    await releaseLease(ready.leaseId);
+
+    expect((await heartbeat.resumeExecutionStageWaits()).resumed).toBe(1);
+    const readyRuns = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, ready.companyId), eq(heartbeatRuns.agentId, ready.checkerAgentId)));
+    expect(readyRuns).toHaveLength(1);
+  });
+
+  it("rotates a held issue with more than 50 parked wakes behind a newer resumable one", async () => {
+    const blocked = await seed();
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    const wake = stageWake(blocked.issueId, blocked.stoppedRunId, blocked.stageId);
+    await db.insert(agentWakeupRequests).values(Array.from({ length: 120 }, (_, index) => ({
+      companyId: blocked.companyId,
+      agentId: blocked.checkerAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      status: "deferred_issue_execution",
+      idempotencyKey: `held-${index}-${randomUUID()}`,
+      payload: {
+        ...wake.payload,
+        executionWait: { recoveryActionId: null, cause: "execution_owner_active" },
+        _paperclipWakeContext: wake.contextSnapshot,
+      },
+      requestedAt: new Date(old.getTime() + index),
+      updatedAt: new Date(old.getTime() + index),
+    })));
+
+    // First sweep: the held issue is checked and rotated.
+    expect((await heartbeat.resumeExecutionStageWaits()).resumed).toBe(0);
+    const parked = (await wakeRows(blocked.companyId, blocked.checkerAgentId))
+      .filter((row) => row.status === "deferred_issue_execution");
+    expect(parked).toHaveLength(120);
+    expect(parked.every((row) => row.updatedAt.getTime() > old.getTime() + 1_000)).toBe(true);
+  });
+
+  it("still resumes a changes_requested wake whose stage id matches the current stage", async () => {
+    const { companyId, checkerAgentId, issueId, stageId, stoppedRunId, leaseId } = await seed();
+    await db.update(issues).set({
+      status: "in_progress",
+      executionState: {
+        status: "changes_requested",
+        currentStageId: stageId,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: randomUUID() },
+        returnAssignee: { type: "agent", agentId: checkerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: "changes_requested",
+      },
+    }).where(eq(issues.id, issueId));
+    const base = stageWake(issueId, stoppedRunId, stageId);
+    const executionStage = { ...base.payload.executionStage, wakeRole: "executor", allowedActions: [] };
+    const first = await heartbeat.wakeup(checkerAgentId, {
+      ...base,
+      reason: "execution_changes_requested",
+      payload: { ...base.payload, executionStage },
+      contextSnapshot: { ...base.contextSnapshot, wakeReason: "execution_changes_requested", executionStage },
+    });
+    expect(first).toBeNull();
+    const parked = await wakeRows(companyId, checkerAgentId);
+    expect(parked.map((row) => row.status)).toEqual(["deferred_issue_execution"]);
+
+    await releaseLease(leaseId);
+    expect((await heartbeat.resumeExecutionStageWaits({ companyId, issueId })).resumed).toBe(1);
+    const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parked[0]!.id));
+    expect(after!.status).toBe("coalesced");
+  });
 });
