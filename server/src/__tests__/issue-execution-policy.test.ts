@@ -932,8 +932,23 @@ describe("issue execution policy transitions", () => {
     });
   });
 
-  describe("reopening from done/cancelled clears state", () => {
-    it("reopening a done issue clears execution state", () => {
+  describe("reopening from done/cancelled", () => {
+    function completedState(policy: ReturnType<typeof twoStagePolicy>) {
+      return {
+        status: "completed" as const,
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: { type: "agent" as const, agentId: coderAgentId },
+        reviewRequest: null,
+        completedStageIds: [policy.stages[0].id, policy.stages[1].id],
+        lastDecisionId: null,
+        lastDecisionOutcome: "approved" as const,
+      };
+    }
+
+    it.each(["todo", "in_progress", "blocked"])("reopening a done issue to %s keeps a completed workflow (HYBA-1358)", (requestedStatus) => {
       const policy = twoStagePolicy();
       const result = applyIssueExecutionPolicyTransition({
         issue: {
@@ -941,17 +956,26 @@ describe("issue execution policy transitions", () => {
           assigneeAgentId: coderAgentId,
           assigneeUserId: null,
           executionPolicy: policy,
-          executionState: {
-            status: "completed",
-            currentStageId: null,
-            currentStageIndex: null,
-            currentStageType: null,
-            currentParticipant: null,
-            returnAssignee: { type: "agent", agentId: coderAgentId },
-            completedStageIds: [policy.stages[0].id, policy.stages[1].id],
-            lastDecisionId: null,
-            lastDecisionOutcome: "approved",
-          },
+          executionState: completedState(policy),
+        },
+        policy,
+        requestedStatus,
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+      });
+
+      expect(result.patch.executionState).toBeUndefined();
+    });
+
+    it("reopening a done issue clears a workflow that is not completed", () => {
+      const policy = twoStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "done",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: { ...completedState(policy), status: "pending", currentStageId: policy.stages[0].id },
         },
         policy,
         requestedStatus: "todo",
@@ -960,6 +984,56 @@ describe("issue execution policy transitions", () => {
       });
 
       expect(result.patch.executionState).toBeNull();
+    });
+
+    it("setting a reopened issue back to done without a new submission does not restart the workflow (HYBA-1358)", () => {
+      const policy = twoStagePolicy();
+      const state = completedState(policy);
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "todo",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: state,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+      });
+
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.patch.status).toBeUndefined();
+      expect(result.workflowControlledAssignment).toBeUndefined();
+    });
+
+    it("a real resubmission after reopening starts a fresh workflow at the first stage (HYBA-1358)", () => {
+      const policy = twoStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: completedState(policy),
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        executionState: {
+          status: "pending",
+          currentStageId: policy.stages[0].id,
+          currentStageType: "review",
+          completedStageIds: [],
+        },
+      });
     });
   });
 

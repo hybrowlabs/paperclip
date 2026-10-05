@@ -736,7 +736,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     requestedStatus !== "done" &&
     requestedStatus !== "cancelled"
   ) {
-    patch.executionState = null;
+    // A finished workflow's approvals are evidence of completed work. A
+    // reopen alone must not erase them; a real resubmission (in_review) starts
+    // a fresh workflow below.
+    if (existingState?.status !== COMPLETED_STATUS) {
+      patch.executionState = null;
+    }
     return { patch };
   }
 
@@ -1026,18 +1031,26 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     return { patch };
   }
 
+  // A resubmission after a completed workflow is a new submission: the
+  // earlier approvals do not carry over, so the chain starts at the first
+  // stage again. The monitor survives the restart.
+  const workflowState: IssueExecutionState | null =
+    requestedStatus === "in_review" && existingState?.status === COMPLETED_STATUS
+      ? { ...existingState, completedStageIds: [], returnAssignee: null, lastDecisionOutcome: null }
+      : existingState;
+
   let pendingStage =
-    existingState?.status === CHANGES_REQUESTED_STATUS && currentStage
+    workflowState?.status === CHANGES_REQUESTED_STATUS && currentStage
       ? currentStage
-      : nextPendingStage(input.policy, existingState);
+      : nextPendingStage(input.policy, workflowState);
   if (!pendingStage) return { patch };
 
-  const returnAssignee = existingState?.returnAssignee ?? currentAssignee;
-  const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
+  const returnAssignee = workflowState?.returnAssignee ?? currentAssignee;
+  const skippedStageIds = [...(workflowState?.completedStageIds ?? [])];
   let participant = selectStageParticipant(pendingStage, {
     preferred:
-      existingState?.status === CHANGES_REQUESTED_STATUS
-        ? explicitAssignee ?? existingState.currentParticipant ?? null
+      workflowState?.status === CHANGES_REQUESTED_STATUS
+        ? explicitAssignee ?? workflowState.currentParticipant ?? null
         : explicitAssignee,
     exclude: returnAssignee,
   });
@@ -1046,14 +1059,14 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     pendingStage = nextPendingStage(
       input.policy,
       buildStateWithCompletedStages({
-        previous: existingState,
+        previous: workflowState,
         completedStageIds: skippedStageIds,
         returnAssignee,
       }),
     );
     if (!pendingStage) {
       patch.executionState = buildSkippedStageCompletedState({
-        previous: existingState,
+        previous: workflowState,
         completedStageIds: skippedStageIds,
         returnAssignee,
       });
@@ -1061,8 +1074,8 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
     participant = selectStageParticipant(pendingStage, {
       preferred:
-        existingState?.status === CHANGES_REQUESTED_STATUS
-          ? explicitAssignee ?? existingState.currentParticipant ?? null
+        workflowState?.status === CHANGES_REQUESTED_STATUS
+          ? explicitAssignee ?? workflowState.currentParticipant ?? null
           : explicitAssignee,
       exclude: returnAssignee,
     });
@@ -1080,10 +1093,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   buildPendingStagePatch({
     patch,
     previous:
-      skippedStageIds.length === (existingState?.completedStageIds ?? []).length
-        ? existingState
+      skippedStageIds.length === (workflowState?.completedStageIds ?? []).length
+        ? workflowState
         : buildStateWithCompletedStages({
-            previous: existingState,
+            previous: workflowState,
             completedStageIds: skippedStageIds,
             returnAssignee,
           }),
