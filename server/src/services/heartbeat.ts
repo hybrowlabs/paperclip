@@ -572,6 +572,7 @@ import {
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+import { tryAdvisoryXactLock } from "./advisory-locks.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -20072,6 +20073,12 @@ export function heartbeatService(
     const rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }> = [];
 
     return withAgentStartLock(agentId, async () => {
+      // Cross-replica: if another replica is concurrently starting runs for
+      // this agent, skip. Its pass starts what fits and the next tick (or API
+      // retry) covers anything left queued. Skipping beats blocking: this
+      // section claims runs and counts slots, and two replicas doing that at
+      // once would overrun per-agent concurrency.
+      const outcome = await tryAdvisoryXactLock(db, `agent-start:${agentId}`, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -20219,6 +20226,12 @@ export function heartbeatService(
         });
       }
       return claimedRuns;
+      });
+      if (!outcome.acquired) {
+        logger.debug({ agentId }, "agent start skipped; another replica holds the start lock");
+        return [];
+      }
+      return outcome.result;
     }).finally(() => cancelRejectedQueuedRuns(rejectedClaims));
   }
 

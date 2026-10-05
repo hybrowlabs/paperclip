@@ -131,6 +131,7 @@ import {
   type EmbeddedPostgresSupervisor,
   type SupervisedEmbeddedPostgres,
 } from "./embedded-postgres-supervisor.js";
+import { trySessionAdvisoryLock, withAdvisoryXactLock } from "./services/advisory-locks.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -355,13 +356,21 @@ async function startServerWithDatabaseTeardown(
   const LOCAL_BOARD_USER_NAME = "Board";
   
   async function ensureLocalTrustedBoardPrincipal(db: any): Promise<void> {
+    // N replicas boot concurrently in local_trusted mode; the check-then-insert
+    // sequences below race without cross-replica mutual exclusion.
+    await withAdvisoryXactLock(db, "local-board-bootstrap", async () => {
+      await ensureLocalTrustedBoardPrincipalLocked(db);
+    });
+  }
+
+  async function ensureLocalTrustedBoardPrincipalLocked(db: any): Promise<void> {
     const now = new Date();
     const existingUser = await db
       .select({ id: authUsers.id })
       .from(authUsers)
       .where(eq(authUsers.id, LOCAL_BOARD_USER_ID))
       .then((rows: Array<{ id: string }>) => rows[0] ?? null);
-  
+
     if (!existingUser) {
       await db.insert(authUsers).values({
         id: LOCAL_BOARD_USER_ID,
@@ -373,7 +382,7 @@ async function startServerWithDatabaseTeardown(
         updatedAt: now,
       });
     }
-  
+
     const role = await db
       .select({ id: instanceUserRoles.id })
       .from(instanceUserRoles)
@@ -385,7 +394,7 @@ async function startServerWithDatabaseTeardown(
         role: "instance_admin",
       });
     }
-  
+
     const companyRows = await db.select({ id: companies.id }).from(companies);
     for (const company of companyRows) {
       const membership = await db
@@ -828,6 +837,26 @@ async function startServerWithDatabaseTeardown(
     }
 
     databaseBackupInFlight = true;
+    // Acquire the cross-replica lock under an explicit catch: the main
+    // try/finally (which resets the flag) only starts below, so a throwing
+    // acquisition (e.g. connection failure) must reset the flag here or it
+    // would leak `true` and block all future backups on this replica.
+    let lock: Awaited<ReturnType<typeof trySessionAdvisoryLock>>;
+    try {
+      lock = await trySessionAdvisoryLock(activeDatabaseConnectionString, "database-backup");
+    } catch (err) {
+      databaseBackupInFlight = false;
+      throw err;
+    }
+    if (!lock.acquired) {
+      databaseBackupInFlight = false;
+      const message = "Database backup already in progress on another replica";
+      if (trigger === "scheduled") {
+        logger.warn("Skipping scheduled database backup because another replica is backing up");
+        return null;
+      }
+      throw conflict(message);
+    }
     const startedAt = new Date();
     const startedAtMs = Date.now();
     const label = trigger === "scheduled" ? "Automatic" : "Manual";
@@ -870,6 +899,7 @@ async function startServerWithDatabaseTeardown(
       logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
       throw err;
     } finally {
+      await lock.release().catch(() => {});
       databaseBackupInFlight = false;
     }
   };
