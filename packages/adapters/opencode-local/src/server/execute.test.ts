@@ -174,6 +174,58 @@ describe("OpenCode local skill injection", () => {
     }
   });
 
+  it("mounts runtime MCP servers as remote OpenCode MCP entries without logging tokens", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-mcp-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    const token = "mcp-bearer-secret-value";
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runProcessMock.mockReset();
+    let seenConfig: { mcp?: Record<string, Record<string, unknown>> } | null = null;
+    runProcessMock.mockImplementationOnce((async (_runId: string, _target: unknown, _cmd: string, _args: string[], opts: { env: Record<string, string> }) => {
+      seenConfig = JSON.parse(await fs.readFile(path.join(opts.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"));
+      return probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "s-mcp", part: { text: "done" } }) });
+    }) as never);
+    const logs: string[] = [];
+    const metadata: unknown[] = [];
+    try {
+      const result = await execute({
+        runId: "run-mcp",
+        agent: { id: "agent-mcp", companyId: "company-1", name: "Atlas", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath, cwd: workspace, model: "openai/gpt-5",
+          env: { OPENCODE_ALLOW_ALL_MODELS: "1" }, promptTemplate: "Run the task.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        runtimeMcp: {
+          getServers: () => [
+            { name: "Cloudflare", url: "https://mcp.example.test/cf", token, connectionId: "1160a715-aaaa" },
+            { name: "Cloudflare", url: "https://mcp.example.test/cf2", token: "other-secret", connectionId: "9999ffff-bbbb" },
+          ],
+        },
+        onLog: async (_s, chunk) => { logs.push(chunk); },
+        onMeta: async (m) => { metadata.push(m); },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(seenConfig).not.toBeNull();
+      const mcp = (seenConfig as unknown as { mcp: Record<string, Record<string, unknown>> }).mcp;
+      expect(mcp.Cloudflare).toEqual({
+        type: "remote", url: "https://mcp.example.test/cf",
+        headers: { Authorization: `Bearer ${token}` }, enabled: true,
+      });
+      expect(Object.keys(mcp)).toHaveLength(2);
+      const everything = JSON.stringify({ logs, metadata, result });
+      expect(everything).not.toContain(token);
+      expect(everything).not.toContain("other-secret");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("passes an OpenRouter key and complete model to OpenCode without logging the key", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-openrouter-"));
     const workspace = path.join(root, "workspace");
