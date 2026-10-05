@@ -1,0 +1,21 @@
+# Forge region provenance diagnostic (HYBA-713)
+
+This is a **draft operator diagnostic, not authorization or an executed live comparison**. It is scoped to PW-HR Forge and returns only a single binding's presence, type and equality to the expected region, plus counts and revision metadata. It never prints a complete config, any binding value or any secret reference.
+
+## Source path and known limits
+
+- Board Secrets editor save flushes its draft; the route restores unchanged redacted plain bindings, normalizes the complete adapter config and passes it to `agentService.update`. That service records a revision only when the before/after config snapshot differs. The existing UI and route synthetic tests cover the changed plain region while retaining another binding, a secret ref and model; they cannot establish either historical browser payload.
+- `server/src/services/heartbeat.ts:21356` builds workspace config then shallow-merges issue assignee adapter overrides; `:21402` resolves bindings. `:1807` gives the agent config precedence over selected environment, `:1836` lets project override it, `:1865` lets routine override project, and `:1874` lets trusted projection override those. The local Claude adapter overlays resolved env onto the host environment (`packages/adapters/claude-local/src/server/execute.ts:217-314`). A run-level issue override can replace `env` as a whole before resolution, not just one key.
+- The diagnostic reads the current agent, project and issue override, the environment ID pinned in the run snapshot, and the pinned routine revision when version 1. It refuses to compare an arbitrary environment if the run snapshot lacks that ID; such a run is inconclusive. The issue override replaces the **whole** agent env map and current assignee is not proof of who owned it at dispatch; ownership changes force an inconclusive effective source. A repeatable-read, read-only transaction pins one consistent current-state snapshot. Current config is not automatically a historical run snapshot: if any source changed after the failed run, that history needs a separate authorized audit comparison. Trusted projection and host-process fallback remain `inconclusive`; the script does not access a provider credential. The historical browser payload also remains unknown.
+
+## Controlled execution
+
+An already-authorized board/platform server operator must review this script, acquire an appropriate read-only DB session or endpoint and invoke `server/src/forge-region-provenance.ts` with exact company, agent, environment and run UUID arguments. Do not deliver the DB connection string in an issue, transcript or command log. The script starts a read-only transaction and emits JSON containing only source booleans/types/counts, selected environment identity, run issue identity and revision metadata. The caller should verify the output shape and transfer only those fields to the existing operator task. The script does not save or roll out config and must not run under Nova's agent JWT. An empty or failed comparison is **INCONCLUSIVE**, not success.
+
+The output is insufficient to claim the source of Forge's historical effective region if trusted projection, run-scoped overrides, later configuration edits, or remote execution environment remain unknown. The operator must additionally return a sanitized historical-run projection/override presence/equality check through a sanctioned internal comparator where available, then trigger a new Forge-origin boolean check after the confirmed repair. Do not repeat a blind UI save.
+
+## Rollback and concurrency
+
+This diagnostic changes no state. Before any later repair, re-read revision and binding counts, lock or use compare-and-swap for the full config update, and reject a changed revision rather than overwriting another operator's edits. Preserve nine env names, four AWS/GitLab secret refs, provider/model and all harness controls. If a deployed code repair fails, roll back the exact code revision and verify deployment and a fresh Forge process; a historical config revision is not a safe substitute without validating the full config and concurrent edits.
+
+Synthetic test: `cd server && node_modules/.bin/vitest run src/forge-region-provenance.test.ts --config vitest.config.ts`.
