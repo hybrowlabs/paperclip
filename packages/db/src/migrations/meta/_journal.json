@@ -2059,6 +2059,20 @@
       "when": 1791114488817,
       "tag": "0295_clever_the_professor",
       "breakpoints": true
+    },
+    {
+      "idx": 296,
+      "version": "7",
+      "when": 1791114489817,
+      "tag": "0296_plugin_webhook_delivery_dedup",
+      "breakpoints": true
+    },
+    {
+      "idx": 297,
+      "version": "7",
+      "when": 1791114490817,
+      "tag": "0297_scheduler_leader",
+      "breakpoints": true
     }
   ]
 }

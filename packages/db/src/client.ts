@@ -267,6 +267,32 @@ export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: D
   finally { await dedicated.$client.end({ timeout: 1 }); }
 }
 
+// Transaction-scoped advisory locks hold one connection for the whole critical
+// section while the work inside runs on the normal pool. If the locks drew from
+// that same pool, enough concurrent lock holders would take every connection
+// and the work inside could never get one (deadlock). They get their own small
+// pool instead; holders only ever wait on this pool, never on the main one.
+export const DEFAULT_ADVISORY_LOCK_POOL_MAX = 16;
+const advisoryLockDbFactories = new WeakMap<object, () => Db>();
+const advisoryLockDbs = new WeakMap<object, Db>();
+
+export function getAdvisoryLockDb(db: Db): Db {
+  const existing = advisoryLockDbs.get(db);
+  if (existing) return existing;
+  const factory = advisoryLockDbFactories.get(db);
+  if (!factory) return db;
+  const lockDb = factory();
+  advisoryLockDbs.set(db, lockDb);
+  return lockDb;
+}
+
+export async function closeAdvisoryLockDb(db: Db): Promise<void> {
+  const lockDb = advisoryLockDbs.get(db);
+  if (!lockDb) return;
+  advisoryLockDbs.delete(db);
+  await lockDb.$client.end({ timeout: 5 });
+}
+
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = resolveDatabaseClientOptions(options ?? databaseClientOptionsFromEnv());
   const sql = postgres(url, postgresJsOptions(resolved));
@@ -279,6 +305,11 @@ export function createDb(url: string, options?: DatabaseClientOptions) {
   const db = drizzlePg(sql, { schema });
   dedicatedDbFactories.set(db, () => createDb(url, {
     ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock",
+  }));
+  advisoryLockDbFactories.set(db, () => createDb(url, {
+    ...resolved,
+    maxConnections: envPositiveInteger(process.env, "DATABASE_ADVISORY_LOCK_POOL_MAX") ?? DEFAULT_ADVISORY_LOCK_POOL_MAX,
+    applicationName: "paperclip-advisory-locks",
   }));
   return db;
 }
@@ -1028,7 +1059,9 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
   }
 }
 
-export async function applyPendingMigrations(url: string): Promise<void> {
+export const PAPERCLIP_LOCK_NAMESPACE = 0x70_63_6c_70; // "pclp" — namespaces Paperclip's advisory locks away from other tools' keys
+
+async function applyPendingMigrationsLocked(url: string): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
@@ -1085,6 +1118,20 @@ export async function applyPendingMigrations(url: string): Promise<void> {
     throw new Error(
       `Failed to apply pending migrations: ${finalState.pendingMigrations.join(", ")}`,
     );
+  }
+}
+
+export async function applyPendingMigrations(url: string): Promise<void> {
+  // Serialize concurrent migration attempts (N replicas booting after an
+  // upgrade). Session-scoped advisory lock on a dedicated connection: held
+  // across all migration transactions, released on sql.end() or if this
+  // process dies. Waiters block, then re-inspect and no-op.
+  const lockSql = createUtilitySql(url);
+  try {
+    await lockSql`SELECT pg_advisory_lock(${PAPERCLIP_LOCK_NAMESPACE}, hashtext('db-migrate'))`;
+    await applyPendingMigrationsLocked(url);
+  } finally {
+    await lockSql.end({ timeout: 5 });
   }
 }
 

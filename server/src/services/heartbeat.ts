@@ -276,6 +276,10 @@ import {
   resolvePaperclipRunnerNativeProviderInput,
 } from "./native-runtime/provider-profile.js";
 import {
+  isMultiReplicaDeployment,
+  isNativeRunHeldByOtherReplica,
+} from "./native-runtime/native-restart-recovery.js";
+import {
   buildNativeHeartbeatPreparationSpans,
   buildNativeWakeIngressSpan,
   recordFailedSkillPreparation,
@@ -572,6 +576,7 @@ import {
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+import { tryAdvisoryXactLock } from "./advisory-locks.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -15241,6 +15246,21 @@ export function heartbeatService(
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
           run.controllerBootId !== legacyControllerBootId) continue;
       if (isNativeRunnerOwnershipHeld(run)) continue;
+      if (isMultiReplicaDeployment() && run.runtimeMode === "native") {
+        // Shutdown owns only this boot's native executions, like the legacy
+        // filter above. A run another replica controls is not ours to
+        // suspend or interrupt.
+        const [owner] = await db
+          .select({ controllerBootId: nativeRunFinalizations.controllerBootId })
+          .from(nativeRunFinalizations)
+          .where(eq(nativeRunFinalizations.runId, run.id));
+        if (
+          owner?.controllerBootId &&
+          owner.controllerBootId !== (await currentNativeControllerIdentity()).bootId
+        ) {
+          continue;
+        }
+      }
       if (
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
@@ -19391,6 +19411,17 @@ export function heartbeatService(
       if (resumedRunIds.has(run.id)) continue;
       if (locallyTracked) continue;
       if (await hasLiveLegacyController(db, run)) continue;
+      if (
+        nativeRun &&
+        isNativeRunHeldByOtherReplica({
+          controllerBootId: nativeControllerBootId,
+          leaseExpiresAt: nativeControllerLeaseExpiresAt,
+          currentBootId: currentNativeController.bootId,
+          now,
+        })
+      ) {
+        continue;
+      }
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -20072,6 +20103,12 @@ export function heartbeatService(
     const rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }> = [];
 
     return withAgentStartLock(agentId, async () => {
+      // Cross-replica: if another replica is concurrently starting runs for
+      // this agent, skip. Its pass starts what fits and the next tick (or API
+      // retry) covers anything left queued. Skipping beats blocking: this
+      // section claims runs and counts slots, and two replicas doing that at
+      // once would overrun per-agent concurrency.
+      const outcome = await tryAdvisoryXactLock(db, `agent-start:${agentId}`, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -20219,6 +20256,12 @@ export function heartbeatService(
         });
       }
       return claimedRuns;
+      });
+      if (!outcome.acquired) {
+        logger.debug({ agentId }, "agent start skipped; another replica holds the start lock");
+        return [];
+      }
+      return outcome.result;
     }).finally(() => cancelRejectedQueuedRuns(rejectedClaims));
   }
 

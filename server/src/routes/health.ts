@@ -27,6 +27,8 @@ import {
   type InspectDatabaseBackupHealthOptions,
 } from "../services/database-backup-health.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { getLiveEventsTransportHealth } from "../services/live-events.js";
+import { getLocalSchedulerHealth, getSchedulerHealth } from "../services/scheduler-leadership.js";
 import { isManagedWorkspaceInstance, resolveWorkspaceReadiness } from "../services/workspace-readiness.js";
 import {
   resolveWorkspaceReadinessLocalToken,
@@ -116,6 +118,8 @@ function getCloudHealthStatus(env: CloudInstanceEnv) {
     } : {}),
   };
 }
+
+let lastNotificationQueueWarnAtMs = 0;
 
 export function healthRoutes(
   db?: Db,
@@ -316,6 +320,25 @@ export function healthRoutes(
       return;
     }
 
+    let liveEvents: Awaited<ReturnType<typeof getLiveEventsTransportHealth>> = { mode: "in-process" };
+    if (exposeFullDetails) {
+      // Full-details view only: the unauthenticated probe stays free of the
+      // extra notification-queue query.
+      liveEvents = await getLiveEventsTransportHealth();
+      if (liveEvents.mode === "transport" && (liveEvents.notificationQueueUsage ?? 0) > 0.5) {
+        // Probes fire every few seconds; during a queue incident one warning
+        // per minute is signal, one per probe is noise.
+        const nowMs = Date.now();
+        if (nowMs - lastNotificationQueueWarnAtMs > 60_000) {
+          lastNotificationQueueWarnAtMs = nowMs;
+          logger.warn(
+            { notificationQueueUsage: liveEvents.notificationQueueUsage },
+            "Postgres notification queue is filling — a lagging LISTEN session is holding back cleanup",
+          );
+        }
+      }
+    }
+
     let bootstrapStatus: "ready" | "bootstrap_pending" = "ready";
     let bootstrapInviteActive = false;
     // Cloud-managed instances have no first-admin concept: the control
@@ -399,6 +422,10 @@ export function healthRoutes(
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
+        // Booleans from process memory: the unauthenticated probe never costs a
+        // DB query, and operators can still identify the leader pod. The lease
+        // row (ids, hostnames) stays in the full-details view.
+        scheduler: getLocalSchedulerHealth(),
         // Token-authorized probe on an otherwise redacted response: the control
         // plane needs readiness without a board session, and nothing else about
         // this instance becomes visible.
@@ -429,6 +456,13 @@ export function healthRoutes(
       ...(databaseBackup ? { databaseBackup } : {}),
       ...(warnings ? { warnings } : {}),
       ...(devServer ? { devServer } : {}),
+      liveEvents,
+      scheduler: db
+        ? await getSchedulerHealth(db).catch((error) => {
+            logger.warn({ err: error }, "scheduler leadership health lookup failed");
+            return getLocalSchedulerHealth();
+          })
+        : getLocalSchedulerHealth(),
       ...(workspaceReadiness ? { workspace: workspaceReadiness } : {}),
       ...(cloud ? { cloud } : {}),
       ...(hiddenSettings.length ? { hiddenSettings } : {}),
