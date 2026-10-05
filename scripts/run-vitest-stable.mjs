@@ -67,6 +67,7 @@ const additionalSerializedServerTests = new Set([
   "server/src/__tests__/project-routes-env.test.ts",
   "server/src/__tests__/redaction.test.ts",
   "server/src/__tests__/routines-e2e.test.ts",
+  "server/src/__tests__/live-events-cross-replica.test.ts",
   "server/src/__tests__/scheduler-leadership.test.ts",
   "server/src/__tests__/agent-start-lock-cross-replica.test.ts",
   "server/src/__tests__/multi-replica-cluster.test.ts",

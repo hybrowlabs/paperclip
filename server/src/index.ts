@@ -1,6 +1,11 @@
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
+import {
+  configureLiveEventsTransport,
+  resolveLiveEventsTransportMode,
+  subscribeAllCompanyLiveEvents,
+  teardownLiveEventsTransport,
+} from "./services/live-events.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
 /// <reference path="./types/express.d.ts" />
 // Kicks off the OTel bootstrap as early as possible (no-op unless
@@ -1000,6 +1005,22 @@ async function startServerWithDatabaseTeardown(
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,
   });
+  // Cross-replica live events over Postgres LISTEN/NOTIFY. LISTEN needs a
+  // session-capable connection, so it must not go through a transaction-mode
+  // pooler: PAPERCLIP_LIVE_EVENTS_DATABASE_URL overrides, then the direct
+  // migration URL, then the main connection string. A single replica is
+  // unaffected: in-process delivery stays the whole story if this fails.
+  const liveEventsTransportMode = resolveLiveEventsTransportMode();
+  await configureLiveEventsTransport({
+    mode: liveEventsTransportMode,
+    databaseUrl:
+      process.env.PAPERCLIP_LIVE_EVENTS_DATABASE_URL?.trim() ||
+      config.databaseMigrationUrl ||
+      activeDatabaseConnectionString,
+  }).catch((err) => {
+    logger.warn({ err }, "live-events: transport configuration failed; falling back to in-process");
+  });
+
   setupLiveEventsWebSocketServer(server, db as any, {
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,
@@ -2027,6 +2048,7 @@ async function startServerWithDatabaseTeardown(
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();
     stopExecutionControl();
+    await teardownLiveEventsTransport();
     // Resign first so a standby takes over within one retry interval rather
     // than waiting out the lease, while this replica drains its own runs.
     if (schedulerLeadership) {
