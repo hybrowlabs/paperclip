@@ -69,6 +69,21 @@ export interface KubernetesEnvironmentConfigInput {
   egressAllowFqdns?: string[];
   egressAllowCidrs?: string[];
   namespacePrefix?: string;
+  tenantResourceQuota?: {
+    pods: string;
+    requestsCpu: string;
+    requestsMemory: string;
+    limitsCpu: string;
+    limitsMemory: string;
+  };
+  tenantLimitRange?: {
+    defaultCpu: string;
+    defaultMemory: string;
+    defaultRequestCpu: string;
+    defaultRequestMemory: string;
+    maxCpu: string;
+    maxMemory: string;
+  };
   imageRegistry?: string;
   adapterType?: string;
   /**

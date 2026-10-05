@@ -76,6 +76,35 @@ const manifest: PaperclipPluginManifestV1 = {
             enum: ["standard", "cilium"],
             description: "Network policy mode. `cilium` enables FQDN-based egress filtering via CiliumNetworkPolicy.",
           },
+          tenantResourceQuota: {
+            type: "object",
+            description:
+              "Hard limits for the per-tenant ResourceQuota. All five fields are required. Absent = built-in defaults (pods 20, requests 10 CPU / 20Gi, limits 20 CPU / 40Gi).",
+            properties: {
+              pods: { type: "string" },
+              requestsCpu: { type: "string" },
+              requestsMemory: { type: "string" },
+              limitsCpu: { type: "string" },
+              limitsMemory: { type: "string" },
+            },
+            required: ["pods", "requestsCpu", "requestsMemory", "limitsCpu", "limitsMemory"],
+            additionalProperties: false,
+          },
+          tenantLimitRange: {
+            type: "object",
+            description:
+              "Per-container default, defaultRequest and max for the per-tenant LimitRange. All six fields are required. Absent = built-in defaults (default 1 CPU / 2Gi, max 4 CPU / 8Gi).",
+            properties: {
+              defaultCpu: { type: "string" },
+              defaultMemory: { type: "string" },
+              defaultRequestCpu: { type: "string" },
+              defaultRequestMemory: { type: "string" },
+              maxCpu: { type: "string" },
+              maxMemory: { type: "string" },
+            },
+            required: ["defaultCpu", "defaultMemory", "defaultRequestCpu", "defaultRequestMemory", "maxCpu", "maxMemory"],
+            additionalProperties: false,
+          },
           runtimeClassName: {
             type: "string",
             description:

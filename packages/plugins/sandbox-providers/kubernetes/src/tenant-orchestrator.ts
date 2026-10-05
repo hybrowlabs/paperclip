@@ -1,6 +1,50 @@
 import type { KubeClients } from "./kube-client.js";
 import { buildNetworkPolicyManifests } from "./network-policy.js";
 import { buildCiliumNetworkPolicyManifest } from "./cilium-network-policy.js";
+import type { KubernetesProviderConfig } from "./types.js";
+
+export interface TenantResourceQuotaValues {
+  pods: string;
+  requestsCpu: string;
+  requestsMemory: string;
+  limitsCpu: string;
+  limitsMemory: string;
+}
+
+export interface TenantLimitRangeValues {
+  defaultCpu: string;
+  defaultMemory: string;
+  defaultRequestCpu: string;
+  defaultRequestMemory: string;
+  maxCpu: string;
+  maxMemory: string;
+}
+
+export const DEFAULT_RESOURCE_QUOTA: TenantResourceQuotaValues = {
+  pods: "20",
+  requestsCpu: "10",
+  requestsMemory: "20Gi",
+  limitsCpu: "20",
+  limitsMemory: "40Gi",
+};
+
+export const DEFAULT_LIMIT_RANGE: TenantLimitRangeValues = {
+  defaultCpu: "1",
+  defaultMemory: "2Gi",
+  defaultRequestCpu: "250m",
+  defaultRequestMemory: "512Mi",
+  maxCpu: "4",
+  maxMemory: "8Gi",
+};
+
+export function resolveTenantLimits(
+  config: Pick<KubernetesProviderConfig, "tenantResourceQuota" | "tenantLimitRange">,
+): { resourceQuota: TenantResourceQuotaValues; limitRange: TenantLimitRangeValues } {
+  return {
+    resourceQuota: config.tenantResourceQuota ?? DEFAULT_RESOURCE_QUOTA,
+    limitRange: config.tenantLimitRange ?? DEFAULT_LIMIT_RANGE,
+  };
+}
 
 export interface EnsureTenantInput {
   namespace: string;
@@ -10,13 +54,8 @@ export interface EnsureTenantInput {
   egressMode: "standard" | "cilium";
   egressAllowFqdns: string[];
   egressAllowCidrs: string[];
-  resourceQuota: {
-    pods: string;
-    requestsCpu: string;
-    requestsMemory: string;
-    limitsCpu: string;
-    limitsMemory: string;
-  };
+  resourceQuota: TenantResourceQuotaValues;
+  limitRange?: TenantLimitRangeValues;
 }
 
 const SERVICE_ACCOUNT_NAME = "paperclip-tenant-sa";
@@ -174,6 +213,7 @@ async function ensureResourceQuota(clients: KubeClients, input: EnsureTenantInpu
 }
 
 async function ensureLimitRange(clients: KubeClients, input: EnsureTenantInput): Promise<void> {
+  const limitRange = input.limitRange ?? DEFAULT_LIMIT_RANGE;
   try {
     await clients.core.readNamespacedLimitRange({ name: LIMIT_RANGE_NAME, namespace: input.namespace });
     return;
@@ -191,13 +231,13 @@ async function ensureLimitRange(clients: KubeClients, input: EnsureTenantInput):
             limits: [
               {
                 type: "Container",
-                max: { cpu: "4", memory: "8Gi" },
+                max: { cpu: limitRange.maxCpu, memory: limitRange.maxMemory },
                 min: { cpu: "100m", memory: "128Mi" },
                 // The k8s client-node type names this `_default` but the actual
                 // Kubernetes API field is `default`. We produce a JSON-shape
                 // manifest so the cast is safe.
-                default: { cpu: "1", memory: "2Gi" },
-                defaultRequest: { cpu: "250m", memory: "512Mi" },
+                default: { cpu: limitRange.defaultCpu, memory: limitRange.defaultMemory },
+                defaultRequest: { cpu: limitRange.defaultRequestCpu, memory: limitRange.defaultRequestMemory },
               },
             ],
           },
