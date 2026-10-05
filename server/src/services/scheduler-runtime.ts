@@ -45,6 +45,7 @@ export interface LeaderSchedulerOptions {
   intervalMs: number;
   recover: () => Promise<void>;
   tick: () => Promise<void>;
+  onTickSkipped?: () => void;
   onTickError?: (err: unknown) => void;
 }
 
@@ -61,6 +62,14 @@ export function createLeaderScheduler(opts: LeaderSchedulerOptions): LeaderSched
   let starting = false;
   let tickInFlight: Promise<void> | null = null;
 
+  const onTickSkipped =
+    opts.onTickSkipped ??
+    (() => {
+      logger.warn(
+        { intervalMs: opts.intervalMs },
+        "heartbeat scheduler tick skipped: previous tick still running; sweeps are slower than the tick interval",
+      );
+    });
   const onTickError =
     opts.onTickError ??
     ((err: unknown) => {
@@ -68,6 +77,10 @@ export function createLeaderScheduler(opts: LeaderSchedulerOptions): LeaderSched
     });
 
   function fire() {
+    if (tickInFlight) {
+      onTickSkipped();
+      return;
+    }
     const current = Promise.resolve()
       .then(() => opts.tick())
       .catch(onTickError)
