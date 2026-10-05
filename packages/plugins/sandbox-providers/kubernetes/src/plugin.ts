@@ -28,7 +28,7 @@ import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./ad
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
 import { buildSandboxCrManifest } from "./sandbox-cr-builder.js";
-import { ensureTenant } from "./tenant-orchestrator.js";
+import { ensureTenant, resolveTenantLimits } from "./tenant-orchestrator.js";
 import { createPerRunSecret } from "./secret-manager.js";
 import { FastUploadInterceptor } from "./upload-interceptor.js";
 import { jobOrchestrator, JobTimeoutError } from "./job-orchestrator.js";
@@ -63,16 +63,6 @@ const DEFAULT_WORKSPACE_REMOTE_CWD = "/workspace";
 
 // Name of the ServiceAccount created inside each tenant namespace by ensureTenant.
 const TENANT_SERVICE_ACCOUNT = "paperclip-tenant-sa";
-
-// Resource quota defaults applied to every tenant namespace (tunable via
-// config in a future iteration).
-const DEFAULT_RESOURCE_QUOTA = {
-  pods: "20",
-  requestsCpu: "10",
-  requestsMemory: "20Gi",
-  limitsCpu: "20",
-  limitsMemory: "40Gi",
-};
 
 function deriveTenantNamespace(config: KubernetesProviderConfig, companyId: string): string {
   // TODO: future versions could thread companyName through AcquireLeaseParams
@@ -348,7 +338,7 @@ const plugin = definePlugin({
       egressMode: config.egressMode,
       egressAllowFqdns: [...adapterDefaults.allowFqdns, ...config.egressAllowFqdns],
       egressAllowCidrs: config.egressAllowCidrs,
-      resourceQuota: DEFAULT_RESOURCE_QUOTA,
+      ...resolveTenantLimits(config),
     });
 
     const jobName = `pc-${newRunUlidDns()}`;

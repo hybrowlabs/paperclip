@@ -52,6 +52,45 @@ function parsePositiveIntMs(value: string | undefined): number | undefined {
   return parsed;
 }
 
+const K8S_QUANTITY_RE = /^(\d+(\.\d+)?|\.\d+)(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/;
+
+/**
+ * Read an all-or-nothing group of env vars into a typed object. Returns
+ * undefined when every var is unset/blank; throws naming the variable on a
+ * missing member or an invalid value so a typo never silently falls back to
+ * the plugin's looser built-in defaults.
+ */
+function parseEnvGroup<K extends string>(
+  env: ExecutionPolicyBootstrapEnv,
+  mapping: Record<K, string>,
+  validate: (key: K, envName: string, value: string) => void,
+): Record<K, string> | undefined {
+  const entries = (Object.entries(mapping) as Array<[K, string]>).map(
+    ([key, envName]) => [key, envName, env[envName]?.trim() ?? ""] as const,
+  );
+  if (entries.every(([, , value]) => value === "")) return undefined;
+  const missing = entries.filter(([, , value]) => value === "").map(([, envName]) => envName);
+  if (missing.length > 0) {
+    throw new Error(
+      `Incomplete per-tenant limit configuration: ${missing.join(", ")} must be set together with the other variables in the same group.`,
+    );
+  }
+  const out = {} as Record<K, string>;
+  for (const [key, envName, value] of entries) {
+    validate(key, envName, value);
+    out[key] = value;
+  }
+  return out;
+}
+
+function validateQuantity(envName: string, value: string): void {
+  if (!K8S_QUANTITY_RE.test(value)) {
+    throw new Error(
+      `${envName} must be a Kubernetes quantity such as "4", "500m" or "8Gi" (got "${value}").`,
+    );
+  }
+}
+
 function parseList(value: string | undefined): string[] | undefined {
   if (value === undefined) return undefined;
   const items = value
@@ -109,6 +148,41 @@ export function parseExecutionPolicyBootstrapEnv(
 
   const namespacePrefix = env.PAPERCLIP_K8S_NAMESPACE_PREFIX?.trim();
   if (namespacePrefix) kubernetesConfig.namespacePrefix = namespacePrefix;
+
+  const tenantResourceQuota = parseEnvGroup(
+    env,
+    {
+      pods: "PAPERCLIP_K8S_QUOTA_PODS",
+      requestsCpu: "PAPERCLIP_K8S_QUOTA_REQUESTS_CPU",
+      requestsMemory: "PAPERCLIP_K8S_QUOTA_REQUESTS_MEMORY",
+      limitsCpu: "PAPERCLIP_K8S_QUOTA_LIMITS_CPU",
+      limitsMemory: "PAPERCLIP_K8S_QUOTA_LIMITS_MEMORY",
+    },
+    (key, envName, value) => {
+      if (key === "pods") {
+        if (!/^[1-9]\d*$/.test(value)) {
+          throw new Error(`${envName} must be a positive integer (got "${value}").`);
+        }
+        return;
+      }
+      validateQuantity(envName, value);
+    },
+  );
+  if (tenantResourceQuota) kubernetesConfig.tenantResourceQuota = tenantResourceQuota;
+
+  const tenantLimitRange = parseEnvGroup(
+    env,
+    {
+      defaultCpu: "PAPERCLIP_K8S_LIMITRANGE_DEFAULT_CPU",
+      defaultMemory: "PAPERCLIP_K8S_LIMITRANGE_DEFAULT_MEMORY",
+      defaultRequestCpu: "PAPERCLIP_K8S_LIMITRANGE_DEFAULT_REQUEST_CPU",
+      defaultRequestMemory: "PAPERCLIP_K8S_LIMITRANGE_DEFAULT_REQUEST_MEMORY",
+      maxCpu: "PAPERCLIP_K8S_LIMITRANGE_MAX_CPU",
+      maxMemory: "PAPERCLIP_K8S_LIMITRANGE_MAX_MEMORY",
+    },
+    (_key, envName, value) => validateQuantity(envName, value),
+  );
+  if (tenantLimitRange) kubernetesConfig.tenantLimitRange = tenantLimitRange;
 
   const imageRegistry = env.PAPERCLIP_K8S_IMAGE_REGISTRY?.trim();
   if (imageRegistry) kubernetesConfig.imageRegistry = imageRegistry;
