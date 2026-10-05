@@ -363,6 +363,7 @@ describe("GET /health", () => {
       commit: testServerInfo.git.fullSha,
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
+      scheduler: { candidate: false, isLeader: false },
       databaseBackup: {
         enabled: true,
         status: "warning",
@@ -421,6 +422,7 @@ describe("GET /health", () => {
       commit: testServerInfo.git.fullSha,
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
+      scheduler: { candidate: false, isLeader: false },
     });
     expect(res.body.serverInfo).toBeUndefined();
   });
@@ -460,6 +462,7 @@ describe("GET /health", () => {
       commit: testServerInfo.git.fullSha,
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
+      scheduler: { candidate: false, isLeader: false },
     });
     expect(res.body.serverInfo).toBeUndefined();
   });
@@ -504,6 +507,7 @@ describe("GET /health", () => {
       authReady: true,
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
+      scheduler: { candidate: false, isLeader: false },
       features: {
         companyDeletionEnabled: false,
       },
@@ -544,6 +548,7 @@ describe("GET /health", () => {
       status: "ok",
       bootstrapStatus: "bootstrap_pending",
       bootstrapInviteActive: false,
+      scheduler: { candidate: false, isLeader: false },
     });
   });
 
@@ -581,6 +586,7 @@ describe("GET /health", () => {
       status: "ok",
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
+      scheduler: { candidate: false, isLeader: false },
     });
   });
 });

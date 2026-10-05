@@ -110,6 +110,7 @@ describe("GET /health dev-server supervisor access", () => {
         commit: null,
         bootstrapStatus: "ready",
         bootstrapInviteActive: false,
+        scheduler: { candidate: false, isLeader: false },
         devServer: {
           enabled: true,
           restartRequired: true,

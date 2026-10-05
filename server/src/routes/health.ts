@@ -27,6 +27,7 @@ import {
   type InspectDatabaseBackupHealthOptions,
 } from "../services/database-backup-health.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { getLocalSchedulerHealth, getSchedulerHealth } from "../services/scheduler-leadership.js";
 import { isManagedWorkspaceInstance, resolveWorkspaceReadiness } from "../services/workspace-readiness.js";
 import {
   resolveWorkspaceReadinessLocalToken,
@@ -399,6 +400,10 @@ export function healthRoutes(
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
+        // Booleans from process memory: the unauthenticated probe never costs a
+        // DB query, and operators can still identify the leader pod. The lease
+        // row (ids, hostnames) stays in the full-details view.
+        scheduler: getLocalSchedulerHealth(),
         // Token-authorized probe on an otherwise redacted response: the control
         // plane needs readiness without a board session, and nothing else about
         // this instance becomes visible.
@@ -429,6 +434,12 @@ export function healthRoutes(
       ...(databaseBackup ? { databaseBackup } : {}),
       ...(warnings ? { warnings } : {}),
       ...(devServer ? { devServer } : {}),
+      scheduler: db
+        ? await getSchedulerHealth(db).catch((error) => {
+            logger.warn({ err: error }, "scheduler leadership health lookup failed");
+            return getLocalSchedulerHealth();
+          })
+        : getLocalSchedulerHealth(),
       ...(workspaceReadiness ? { workspace: workspaceReadiness } : {}),
       ...(cloud ? { cloud } : {}),
       ...(hiddenSettings.length ? { hiddenSettings } : {}),
