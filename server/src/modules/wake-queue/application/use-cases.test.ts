@@ -115,6 +115,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
       releasePolicy: null,
     })),
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
+    getLatestCommentCreatedAt: vi.fn(async () => null),
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
@@ -570,6 +571,94 @@ describe("releaseIssueExecution", () => {
     expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
     expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(1);
     expect(result.outcome.kind).toBe("promoted");
+  });
+
+  describe("deferred comment timing against the terminal timestamp (HYBA-1358)", () => {
+    const COMPLETED_AT = new Date("2026-10-05T15:25:07.000Z");
+    const BEFORE = new Date("2026-10-05T15:23:50.000Z");
+    const AFTER = new Date("2026-10-05T15:25:55.000Z");
+
+    function releaseWith(input: {
+      status: "done" | "cancelled";
+      commentAt: Date | null;
+      agentId: string;
+      wakeReason?: string;
+      executionState?: Record<string, unknown> | null;
+    }) {
+      const queue = [wakeCandidate({
+        agentId: input.agentId,
+        ...(input.wakeReason ? { reason: input.wakeReason, wakeReason: input.wakeReason } : {}),
+        requestedByActorType: "user",
+        deferredCommentIds: ["board-comment"],
+        queuedCommentIds: ["board-comment"],
+      })];
+      const transaction = createFakeTransaction({
+        findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+        getQueuedCommentLiveness: vi.fn(async () => ({ liveNonSelfCommentIds: ["board-comment"], containedSelfAuthoredComment: false })),
+        getLatestCommentCreatedAt: vi.fn(async () => input.commentAt),
+        reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+      } as Partial<WakeQueueTransaction>);
+      const issue: IssueSnapshot = {
+        ...ISSUE,
+        status: input.status,
+        completedAt: input.status === "done" ? COMPLETED_AT : null,
+        cancelledAt: input.status === "cancelled" ? COMPLETED_AT : null,
+        executionState: input.executionState ?? null,
+      };
+      const release = createReleaseIssueExecution({
+        issueLock: createFakeIssueLock(createFakeHost(), transaction, issue),
+        recovery: createFakeRecovery(),
+      });
+      return { transaction, run: () => release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() }) };
+    }
+
+    it.each(["done", "cancelled"] as const)("does not reopen a %s issue for a comment posted before it was closed, and still delivers the wake to a non-assignee", async (status) => {
+      const { transaction, run } = releaseWith({ status, commentAt: BEFORE, agentId: "deferred-agent", wakeReason: "issue_comment_mentioned" });
+      const result = await run();
+      expect(transaction.reopenIssue).not.toHaveBeenCalled();
+      expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(1);
+      expect(result.outcome.kind).toBe("promoted");
+      expect(result.postCommitEffects.some((effect) => effect.kind === "issue_reopened")).toBe(false);
+    });
+
+    it("delivers a pre-completion board comment to the assignee without reopening or cancelling it", async () => {
+      const { transaction, run } = releaseWith({ status: "done", commentAt: BEFORE, agentId: ISSUE.assigneeAgentId! });
+      const result = await run();
+      expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+      expect(transaction.reopenIssue).not.toHaveBeenCalled();
+      expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(1);
+      expect(result.outcome.kind).toBe("promoted");
+    });
+
+    it.each(["done", "cancelled"] as const)("still reopens a %s issue for a comment posted after it was closed", async (status) => {
+      const { transaction, run } = releaseWith({ status, commentAt: AFTER, agentId: ISSUE.assigneeAgentId! });
+      const result = await run();
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+      expect(result.postCommitEffects).toContainEqual(expect.objectContaining({ kind: "issue_reopened", reopenedFrom: status }));
+    });
+
+    it("still reopens when the comment time is unknown (no regression for legacy rows)", async () => {
+      const { transaction, run } = releaseWith({ status: "done", commentAt: null, agentId: ISSUE.assigneeAgentId! });
+      await run();
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a completed execution workflow when a later comment reopens the issue", async () => {
+      const completed = { status: "completed", completedStageIds: ["s1", "s2"] };
+      const { transaction, run } = releaseWith({
+        status: "done", commentAt: AFTER, agentId: ISSUE.assigneeAgentId!, executionState: completed,
+      });
+      await run();
+      expect(transaction.reopenIssue).toHaveBeenCalledWith(expect.objectContaining({ keepExecutionState: true }));
+    });
+
+    it("still clears a non-completed execution state when reopening", async () => {
+      const { transaction, run } = releaseWith({
+        status: "done", commentAt: AFTER, agentId: ISSUE.assigneeAgentId!, executionState: { status: "pending" },
+      });
+      await run();
+      expect(transaction.reopenIssue).toHaveBeenCalledWith(expect.objectContaining({ keepExecutionState: false }));
+    });
   });
 
   it.each(["done_live", "cancelled_live", "done_missing", "done_self", "done_no_resume", "done_untracked_comment"])("handles explicit agent feedback after completion: %s", async (scenario) => {

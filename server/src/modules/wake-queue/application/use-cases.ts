@@ -329,6 +329,7 @@ async function promoteDeferredWake(
 ): Promise<ReleaseTransactionResult | null> {
   let currentIssue = issue;
   let shouldReopen = false;
+  let commentPredatesClose = false;
   if (
     !workingCandidate.authorizedFailedChatRetry &&
     workingCandidate.deferredCommentIds.length > 0 &&
@@ -340,7 +341,7 @@ async function promoteDeferredWake(
       finishingRunId: run.id,
       commentIds: workingCandidate.deferredCommentIds,
     });
-    shouldReopen =
+    const reopenCandidate =
       !selfAuthorship.allSelfAuthored &&
       (workingCandidate.requestedByActorType === "user" ||
         workingCandidate.wakeReason === "issue_reopened_via_comment" ||
@@ -349,6 +350,21 @@ async function promoteDeferredWake(
           workingCandidate.requestedByActorType === "agent" &&
           workingCandidate.deferredContextSeed.resumeIntent === true &&
           workingCandidate.queuedCommentIds.length > 0));
+    if (reopenCandidate) {
+      // A comment posted before the issue was closed was already part of the
+      // work that closed it. It is still delivered, but it cannot undo the
+      // completion. Unknown timestamps keep the pre-existing reopen.
+      const closedAt = currentIssue.status === "done" ? currentIssue.completedAt : currentIssue.cancelledAt;
+      const latestCommentAt = closedAt
+        ? await ports.transaction.getLatestCommentCreatedAt({
+            companyId: run.companyId,
+            issueId: currentIssue.id,
+            commentIds: workingCandidate.deferredCommentIds,
+          })
+        : null;
+      commentPredatesClose = Boolean(closedAt && latestCommentAt && latestCommentAt.getTime() <= closedAt.getTime());
+      shouldReopen = !commentPredatesClose;
+    }
   }
 
   // Agent continuations can outlive the work they addressed. Live,
@@ -362,6 +378,7 @@ async function promoteDeferredWake(
       contextSnapshot: workingCandidate.deferredContextSeed });
   if (
     !shouldReopen &&
+    !commentPredatesClose &&
     !onboardingResultReport &&
     (currentIssue.status === "done" || currentIssue.status === "cancelled") &&
     workingCandidate.agentId === currentIssue.assigneeAgentId
@@ -389,6 +406,7 @@ async function promoteDeferredWake(
       companyId: run.companyId,
       issueId: currentIssue.id,
       runId: run.id,
+      keepExecutionState: currentIssue.executionState?.status === "completed",
     });
     if (reopened) {
       postCommitEffects.push({

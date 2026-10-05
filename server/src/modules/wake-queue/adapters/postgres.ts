@@ -112,6 +112,8 @@ function toIssueSnapshot(row: IssueRow): IssueSnapshot {
     assigneeAgentId: row.assigneeAgentId,
     assigneeUserId: row.assigneeUserId,
     hiddenAt: row.hiddenAt,
+    completedAt: row.completedAt ?? null,
+    cancelledAt: row.cancelledAt ?? null,
     originKind: row.originKind,
     monitorNextCheckAt: row.monitorNextCheckAt,
     executionState: (row.executionState as Record<string, unknown> | null) ?? null,
@@ -418,8 +420,24 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return isCompletedOnboardingHandoffWake(tx, input);
     },
 
-    async reopenIssue({ companyId, issueId }) {
-      const updated = await issuesSvc.updateForCompany(issueId, companyId, { status: "todo", executionState: null }, tx);
+    async getLatestCommentCreatedAt({ companyId, issueId, commentIds }) {
+      if (commentIds.length === 0) return null;
+      const rows = await tx
+        .select({ createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
+      let latest: Date | null = null;
+      for (const row of rows) if (!latest || row.createdAt > latest) latest = row.createdAt;
+      return latest;
+    },
+
+    async reopenIssue({ companyId, issueId, keepExecutionState }) {
+      const updated = await issuesSvc.updateForCompany(
+        issueId,
+        companyId,
+        keepExecutionState ? { status: "todo" } : { status: "todo", executionState: null },
+        tx,
+      );
       return updated ? toIssueSnapshot(updated as unknown as IssueRow) : null;
     },
 

@@ -36,6 +36,10 @@ export type IssueSnapshot = {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
   hiddenAt: Date | null;
+  /** When the issue last reached `done`; null otherwise. */
+  completedAt?: Date | null;
+  /** When the issue last reached `cancelled`; null otherwise. */
+  cancelledAt?: Date | null;
   originKind: string | null;
   monitorNextCheckAt: Date | null;
   executionState: Record<string, unknown> | null;

@@ -158,6 +158,8 @@ export interface WakeQueueTransaction {
     finishingRunId: string;
     commentIds: string[];
   }): Promise<{ allSelfAuthored: boolean }>;
+  /** Latest creation time among the live comments with these ids, or null when none can be read. */
+  getLatestCommentCreatedAt(input: { companyId: string; issueId: string; commentIds: string[] }): Promise<Date | null>;
   /** Proves all candidate comments only report completed child work in the finishing parent's own run. */
   isCompletedDelegationMention(input: {
     companyId: string;
@@ -166,7 +168,7 @@ export interface WakeQueueTransaction {
     wakeAgentId: string;
     commentIds: string[];
   }): Promise<boolean>;
-  reopenIssue(input: { companyId: string; issueId: string; runId: string }): Promise<IssueSnapshot | null>;
+  reopenIssue(input: { companyId: string; issueId: string; runId: string; keepExecutionState?: boolean }): Promise<IssueSnapshot | null>;
   /** Verifies a Done onboarding parent's completion wake against its own completed children. */
   isCompletedOnboardingHandoffWake(input: { companyId: string; issueId: string; agentId: string;
     reason: string | null; contextSnapshot: Record<string, unknown> }): Promise<boolean>;
