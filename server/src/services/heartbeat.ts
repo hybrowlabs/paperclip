@@ -10505,65 +10505,97 @@ export function heartbeatService(
    */
   async function resumeExecutionStageWaits(scope?: { companyId: string; issueId: string }) {
     if ((await getSchedulingSuppression()).suppressed) return { resumed: 0 };
-    const waits = await db.select({ wake: agentWakeupRequests, issue: issues })
+    const parkedStageWait = and(
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      inArray(agentWakeupRequests.reason, [...EXECUTION_STAGE_WAKE_REASONS]),
+      sql`${agentWakeupRequests.payload}->'executionWait' is not null`,
+      sql`${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId' is null`,
+    );
+    // Pick issues, not wakes, so many parked wakes on one still-held issue
+    // cannot fill the batch. Held issues are rotated to the back below.
+    const issueIdSql = sql<string>`${agentWakeupRequests.payload}->>'issueId'`;
+    const candidates = await db.select({ companyId: agentWakeupRequests.companyId, issueId: issueIdSql })
       .from(agentWakeupRequests)
-      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`))
       .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
       .where(and(
-        eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        inArray(agentWakeupRequests.reason, [...EXECUTION_STAGE_WAKE_REASONS]),
-        sql`${agentWakeupRequests.payload}->'executionWait' is not null`,
-        sql`${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId' is null`,
+        parkedStageWait,
         scope ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
-        scope ? sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}` : undefined,
+        scope ? sql`${issueIdSql} = ${scope.issueId}` : undefined,
       ))
-      .orderBy(asc(agentWakeupRequests.requestedAt)).limit(50);
+      .groupBy(agentWakeupRequests.companyId, issueIdSql)
+      .orderBy(sql`min(${agentWakeupRequests.updatedAt}) asc`)
+      .limit(50);
     let resumed = 0;
-    for (const { wake, issue } of waits) {
-      const stillCurrent = issue.assigneeAgentId === wake.agentId && !issue.assigneeUserId &&
-        !["done", "cancelled"].includes(issue.status);
-      if (!stillCurrent) {
+    for (const candidate of candidates) {
+      const waits = await db.select({ wake: agentWakeupRequests, issue: issues })
+        .from(agentWakeupRequests)
+        .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = ${issueIdSql}`))
+        .where(and(
+          parkedStageWait,
+          eq(agentWakeupRequests.companyId, candidate.companyId),
+          sql`${issueIdSql} = ${candidate.issueId}`,
+        ))
+        .orderBy(asc(agentWakeupRequests.requestedAt)).limit(50);
+      const live: typeof waits = [];
+      for (const entry of waits) {
+        const { wake, issue } = entry;
+        const wakeStageId = readNonEmptyString(parseObject(parseObject(wake.payload).executionStage).stageId);
+        const issueStageId = readNonEmptyString(parseObject(issue.executionState).currentStageId);
+        const stillCurrent = issue.assigneeAgentId === wake.agentId && !issue.assigneeUserId &&
+          !["done", "cancelled"].includes(issue.status) &&
+          (!wakeStageId || wakeStageId === issueStageId);
+        if (stillCurrent) {
+          live.push(entry);
+          continue;
+        }
         await db.update(agentWakeupRequests).set({
           status: "cancelled", finishedAt: new Date(), updatedAt: new Date(),
           error: "Execution stage moved on before the parked wake could start",
         }).where(and(eq(agentWakeupRequests.id, wake.id),
           eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      }
+      if (live.length === 0) continue;
+      if (await getExecutionBlocker(db, candidate.companyId, candidate.issueId)) {
+        await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+          inArray(agentWakeupRequests.id, live.map(({ wake }) => wake.id)),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")));
         continue;
       }
-      if (await getExecutionBlocker(db, wake.companyId, issue.id)) continue;
-      const [claimed] = await db.update(agentWakeupRequests).set({
-        status: "coalesced", finishedAt: new Date(), updatedAt: new Date(),
-      }).where(and(eq(agentWakeupRequests.id, wake.id),
-        eq(agentWakeupRequests.status, "deferred_issue_execution")))
-        .returning({ id: agentWakeupRequests.id });
-      if (!claimed) continue;
-      const payload = { ...parseObject(wake.payload) };
-      const contextSnapshot = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
-      delete payload[DEFERRED_WAKE_CONTEXT_KEY];
-      delete payload.executionWait;
-      try {
-        const run = await enqueueWakeup(wake.agentId, {
-          source: (wake.source as WakeupOptions["source"]) ?? "assignment",
-          triggerDetail: (wake.triggerDetail as WakeupOptions["triggerDetail"]) ?? "system",
-          reason: wake.reason,
-          payload,
-          contextSnapshot,
-          requestedByActorType: (wake.requestedByActorType as WakeupOptions["requestedByActorType"]) ?? undefined,
-          requestedByActorId: wake.requestedByActorId,
-          idempotencyKey: wake.idempotencyKey,
-          issueStateGuard: { assigneeAgentId: wake.agentId, statuses: [issue.status] },
-        });
-        if (run) {
-          resumed += 1;
-          await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
-            .where(eq(agentWakeupRequests.id, wake.id));
+      for (const { wake, issue } of live) {
+        const [claimed] = await db.update(agentWakeupRequests).set({
+          status: "coalesced", finishedAt: new Date(), updatedAt: new Date(),
+        }).where(and(eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")))
+          .returning({ id: agentWakeupRequests.id });
+        if (!claimed) continue;
+        const payload = { ...parseObject(wake.payload) };
+        const contextSnapshot = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+        delete payload[DEFERRED_WAKE_CONTEXT_KEY];
+        delete payload.executionWait;
+        try {
+          const run = await enqueueWakeup(wake.agentId, {
+            source: (wake.source as WakeupOptions["source"]) ?? "assignment",
+            triggerDetail: (wake.triggerDetail as WakeupOptions["triggerDetail"]) ?? "system",
+            reason: wake.reason,
+            payload,
+            contextSnapshot,
+            requestedByActorType: (wake.requestedByActorType as WakeupOptions["requestedByActorType"]) ?? undefined,
+            requestedByActorId: wake.requestedByActorId,
+            idempotencyKey: wake.idempotencyKey,
+            issueStateGuard: { assigneeAgentId: wake.agentId, statuses: [issue.status] },
+          });
+          if (run) {
+            resumed += 1;
+            await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
+              .where(eq(agentWakeupRequests.id, wake.id));
+          }
+        } catch (err) {
+          await db.update(agentWakeupRequests).set({
+            status: "deferred_issue_execution", finishedAt: null, updatedAt: new Date(),
+          }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "coalesced")));
+          logger.warn({ err, wakeId: wake.id }, "failed to resume parked execution-stage wake");
         }
-      } catch (err) {
-        await db.update(agentWakeupRequests).set({
-          status: "deferred_issue_execution", finishedAt: null, updatedAt: new Date(),
-        }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "coalesced")));
-        logger.warn({ err, wakeId: wake.id }, "failed to resume parked execution-stage wake");
       }
     }
     return { resumed };

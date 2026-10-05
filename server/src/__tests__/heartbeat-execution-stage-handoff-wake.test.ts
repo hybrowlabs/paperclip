@@ -11,6 +11,7 @@ import {
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -53,6 +54,7 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
     await db.update(issues).set({ executionRunId: null, checkoutRunId: null });
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueRecoveryActions);
     await db.delete(issues);
     await db.delete(agentRuntimeState);
   });
@@ -61,8 +63,9 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
     await tempDb?.cleanup();
   });
 
-  async function seed() {
+  async function seed(opts: { makerAdapterConfig?: Record<string, unknown> } = {}) {
     const companyId = randomUUID();
+    const stageId = randomUUID();
     const makerAgentId = randomUUID();
     const checkerAgentId = randomUUID();
     const issueId = randomUUID();
@@ -80,7 +83,8 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
     await db.insert(agents).values([
       {
         id: makerAgentId, companyId, name: "Reviewer", role: "engineer", status: "idle",
-        adapterType: "process", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        adapterType: "process", adapterConfig: opts.makerAdapterConfig ?? {},
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, wakeOnDemand: true } }, permissions: {},
       },
       {
         id: checkerAgentId, companyId, name: "Checker", role: "engineer", status: "idle",
@@ -124,14 +128,25 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
       assigneeAgentId: checkerAgentId,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: checkerAgentId },
+        returnAssignee: { type: "agent", agentId: makerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
     });
-    return { companyId, checkerAgentId, issueId, stoppedRunId, leaseId };
+    return { companyId, makerAgentId, checkerAgentId, issueId, issuePrefix, stageId, stoppedRunId, leaseId };
   }
 
-  function stageWake(issueId: string, interruptedRunId: string) {
+  function stageWake(issueId: string, interruptedRunId: string, stageId: string = randomUUID()) {
     const executionStage = {
       wakeRole: "reviewer",
-      stageId: randomUUID(),
+      stageId,
       stageType: "review",
       allowedActions: ["approve", "request_changes"],
     };
@@ -154,9 +169,9 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
   }
 
   it("parks the next participant's wake instead of skipping it, then starts it once cleanup finishes", async () => {
-    const { companyId, checkerAgentId, issueId, stoppedRunId, leaseId } = await seed();
+    const { companyId, checkerAgentId, issueId, stageId, stoppedRunId, leaseId } = await seed();
 
-    const first = await heartbeat.wakeup(checkerAgentId, stageWake(issueId, stoppedRunId));
+    const first = await heartbeat.wakeup(checkerAgentId, stageWake(issueId, stoppedRunId, stageId));
     expect(first).toBeNull();
 
     const parked = await db.select().from(agentWakeupRequests)
@@ -192,8 +207,8 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
   });
 
   it("drops a parked stage wake when the stage has moved to someone else", async () => {
-    const { companyId, checkerAgentId, issueId, stoppedRunId, leaseId } = await seed();
-    await heartbeat.wakeup(checkerAgentId, stageWake(issueId, stoppedRunId));
+    const { companyId, checkerAgentId, issueId, stageId, stoppedRunId, leaseId } = await seed();
+    await heartbeat.wakeup(checkerAgentId, stageWake(issueId, stoppedRunId, stageId));
     await db.update(issues).set({ assigneeAgentId: null, status: "todo" }).where(eq(issues.id, issueId));
     await db.update(environmentLeases)
       .set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
@@ -206,4 +221,161 @@ describeEmbeddedPostgres("execution-stage handoff while the deciding run is stil
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, checkerAgentId));
     expect(runs).toHaveLength(0);
   });
+  async function releaseLease(leaseId: string) {
+    await db.update(environmentLeases)
+      .set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, leaseId));
+  }
+
+  async function wakeRows(companyId: string, agentId: string) {
+    return db.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+  }
+
+  it("drops a parked stage wake when the same assignee is now on a different stage", async () => {
+    const { companyId, checkerAgentId, issueId, stageId, stoppedRunId, leaseId } = await seed();
+    await heartbeat.wakeup(checkerAgentId, stageWake(issueId, stoppedRunId, stageId));
+    // The same agent still owns the issue, but the policy has advanced to a
+    // later stage. The parked wake belongs to the old stage and is stale.
+    await db.update(issues).set({
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 2,
+        currentStageType: "approval",
+        currentParticipant: { type: "agent", agentId: checkerAgentId },
+        returnAssignee: null,
+        completedStageIds: [stageId],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    await releaseLease(leaseId);
+
+    expect((await heartbeat.resumeExecutionStageWaits({ companyId, issueId })).resumed).toBe(0);
+    expect((await wakeRows(companyId, checkerAgentId)).map((row) => row.status)).toEqual(["cancelled"]);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, checkerAgentId));
+    expect(runs).toHaveLength(0);
+  });
+
+  it("keeps a parked wake whose recovery hold is real, even after the lease is released", async () => {
+    const { companyId, checkerAgentId, issueId, stageId, stoppedRunId, leaseId } = await seed();
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "execution_reconciliation",
+      cause: "uncertain_provider_action",
+      fingerprint: `fp-${randomUUID()}`,
+      nextAction: "Confirm whether the provider action happened.",
+      evidence: { runId: stoppedRunId },
+    }).returning();
+    const wake = stageWake(issueId, stoppedRunId, stageId);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: checkerAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      status: "deferred_issue_execution",
+      payload: {
+        ...wake.payload,
+        executionWait: { recoveryActionId: action!.id, cause: "uncertain_provider_action" },
+        _paperclipWakeContext: wake.contextSnapshot,
+      },
+    });
+    await releaseLease(leaseId);
+
+    expect((await heartbeat.resumeExecutionStageWaits({ companyId, issueId })).resumed).toBe(0);
+    expect((await heartbeat.resumeExecutionStageWaits()).resumed).toBe(0);
+    expect((await wakeRows(companyId, checkerAgentId)).map((row) => row.status))
+      .toEqual(["deferred_issue_execution"]);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, checkerAgentId));
+    expect(runs).toHaveLength(0);
+  });
+
+  it("does not let 50 older still-blocked parked wakes starve a newer resumable one", async () => {
+    const blocked = await seed();
+    const ready = await seed();
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    const wake = stageWake(blocked.issueId, blocked.stoppedRunId, blocked.stageId);
+    await db.insert(agentWakeupRequests).values(Array.from({ length: 55 }, (_, index) => ({
+      companyId: blocked.companyId,
+      agentId: blocked.checkerAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      status: "deferred_issue_execution",
+      idempotencyKey: `old-${index}-${randomUUID()}`,
+      payload: {
+        ...wake.payload,
+        executionWait: { recoveryActionId: null, cause: "execution_owner_active" },
+        _paperclipWakeContext: wake.contextSnapshot,
+      },
+      requestedAt: new Date(old.getTime() + index),
+      updatedAt: new Date(old.getTime() + index),
+    })));
+    await heartbeat.wakeup(ready.checkerAgentId, stageWake(ready.issueId, ready.stoppedRunId, ready.stageId));
+    await releaseLease(ready.leaseId);
+
+    // Unscoped periodic sweep: the blocked issue keeps its lease, so all of
+    // its wakes stay parked; the newer issue must still get its run.
+    expect((await heartbeat.resumeExecutionStageWaits()).resumed).toBe(1);
+    const readyRuns = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, ready.companyId), eq(heartbeatRuns.agentId, ready.checkerAgentId)));
+    expect(readyRuns).toHaveLength(1);
+    const stillParked = (await wakeRows(blocked.companyId, blocked.checkerAgentId))
+      .filter((row) => row.status === "deferred_issue_execution");
+    expect(stillParked).toHaveLength(55);
+  });
+
+  it("starts the parked next participant from the deciding run's own cleanup, without a sweep", async () => {
+    const { companyId, makerAgentId, checkerAgentId, issueId, stageId, leaseId } = await seed({
+      makerAdapterConfig: { command: process.execPath, args: ["-e", "setTimeout(() => process.exit(0), 1500)"] },
+    });
+    await releaseLease(leaseId);
+    // The maker is mid-run on the issue when a stage decision hands it on.
+    await db.update(issues).set({ assigneeAgentId: makerAgentId, status: "in_progress" }).where(eq(issues.id, issueId));
+    const makerRun = await heartbeat.wakeup(makerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "system",
+      requestedByActorId: "issue_assignment",
+    });
+    expect(makerRun).not.toBeNull();
+    for (let i = 0; i < 100; i += 1) {
+      const [row] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, makerRun!.id));
+      if (row?.status === "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await db.update(issues).set({ assigneeAgentId: checkerAgentId, status: "in_review" }).where(eq(issues.id, issueId));
+    const wake = stageWake(issueId, makerRun!.id, stageId);
+    const [parked] = await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: checkerAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      status: "deferred_issue_execution",
+      payload: {
+        ...wake.payload,
+        executionWait: { recoveryActionId: null, cause: "execution_owner_active" },
+        _paperclipWakeContext: wake.contextSnapshot,
+      },
+    }).returning();
+
+    // Only the maker run's own completion path runs here: no resumeQueuedRuns
+    // and no direct resumeExecutionStageWaits call.
+    await heartbeat.drainActiveRunExecutions();
+
+    const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parked!.id));
+    expect(after!.status).toBe("coalesced");
+    const checkerRuns = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, checkerAgentId)));
+    expect(checkerRuns).toHaveLength(1);
+    expect(after!.runId).toBe(checkerRuns[0]!.id);
+  }, 30_000);
 });

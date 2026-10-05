@@ -1433,11 +1433,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_WAIT_CAUSES = new Set([
   ...EXECUTION_RECONCILIATION_CAUSES,
 ]);
 
-function projectWakeDiagnosticWaitCause(payload: unknown) {
-  if (!payload || typeof payload !== "object") return null;
-  const wait = (payload as Record<string, unknown>).executionWait;
-  if (!wait || typeof wait !== "object") return null;
-  const cause = (wait as Record<string, unknown>).cause;
+function projectWakeDiagnosticWaitCause(cause: unknown) {
   if (typeof cause !== "string") return null;
   return ISSUE_WAKE_DIAGNOSTIC_KNOWN_WAIT_CAUSES.has(cause) ? cause : "other";
 }
@@ -1496,7 +1492,7 @@ function projectIssueWakeRequest(
     claimedAt: Date | string | null;
     finishedAt: Date | string | null;
     error: string | null;
-    payload?: unknown;
+    waitCause?: string | null;
   },
   options: { includeInternalIds: boolean },
 ): IssueWakeDiagnosticWakeRequest {
@@ -1513,7 +1509,7 @@ function projectIssueWakeRequest(
     claimedAt: dateToIso(row.claimedAt),
     finishedAt: dateToIso(row.finishedAt),
     failureClass: wakeFailureClass(status, row.error),
-    waitCause: projectWakeDiagnosticWaitCause(row.payload),
+    waitCause: projectWakeDiagnosticWaitCause(row.waitCause),
   };
 }
 
@@ -1719,7 +1715,7 @@ function buildIssueWakeDiagnosticsResponse(input: {
     claimedAt: Date | string | null;
     finishedAt: Date | string | null;
     error: string | null;
-    payload?: unknown;
+    waitCause?: string | null;
   }>;
   activityRecords: Array<{
     action: string;

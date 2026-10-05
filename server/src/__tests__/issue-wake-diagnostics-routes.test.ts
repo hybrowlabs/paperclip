@@ -21,6 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -629,5 +630,40 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(res.body.truncatedSections).toEqual({ wakeRequests: true, activityRecords: false });
     expect(res.body.diagnosis).toContain("truncated to 50 wake requests");
     expect(res.body.caps).toEqual({ maxWakeRequests: 50, maxActivityRecords: 50, lookbackDays: 14 });
+  });
+  it("reads only the wait cause from the wake payload, not the whole payload", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Large payload",
+      status: "in_review",
+      assigneeAgentId: agent.id,
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "assignment",
+      reason: "execution_review_requested",
+      status: "deferred_issue_execution",
+      payload: {
+        issueId: issue.id,
+        executionWait: { cause: "execution_owner_active", recoveryActionId: null },
+        _paperclipWakeContext: { issueId: issue.id, bulky: "x".repeat(10_000) },
+      },
+    });
+
+    const diagnostics = await issueService(db).getWakeDiagnostics(issue.id);
+    expect(diagnostics.wakeRequests).toHaveLength(1);
+    const row = diagnostics.wakeRequests[0] as Record<string, unknown>;
+    expect(row).not.toHaveProperty("payload");
+    expect(row.waitCause).toBe("execution_owner_active");
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events[0]).toMatchObject({ waitCause: "execution_owner_active" });
   });
 });
