@@ -140,6 +140,8 @@ export { smokeRuns, smokeRunSteps } from "./smoke_lab.js";
 export { costEvents } from "./cost_events.js";
 export { financeEvents } from "./finance_events.js";
 export { approvals } from "./approvals.js";
+export { wardenRecipientCheckGrants } from "./warden_recipient_check_grants.js";
+export { wardenRecipientCheckReceipts } from "./warden_recipient_check_receipts.js";
 export { approvalComments } from "./approval_comments.js";
 export { activityLog } from "./activity_log.js";
 export { companySecretProviderConfigs } from "./company_secret_provider_configs.js";
