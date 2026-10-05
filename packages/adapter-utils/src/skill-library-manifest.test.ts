@@ -19,7 +19,7 @@ describe("buildSkillLibraryManifestMarkdown", () => {
     expect(buildSkillLibraryManifestMarkdown({ entries: [], desiredSkillKeys: new Set() })).toBeNull();
   });
 
-  it("renders enabled, not-enabled, and broken states deterministically and key-sorted", () => {
+  it("renders only assigned and broken states deterministically and key-sorted", () => {
     const entries = [
       entry({ key: "acme/tools/wireframe" }),
       entry({ key: "paperclipai/paperclip/paperclip" }),
@@ -33,18 +33,16 @@ describe("buildSkillLibraryManifestMarkdown", () => {
 
     const manifest = buildSkillLibraryManifestMarkdown({ entries, desiredSkillKeys });
 
-    expect(manifest).toContain("## Company skill library");
-    expect(manifest).toContain("- acme/tools/wireframe — installed, not enabled for you");
+    expect(manifest).toContain("## Assigned company skills");
+    expect(manifest).not.toContain("acme/tools/wireframe");
     expect(manifest).toContain("- paperclipai/paperclip/paperclip — enabled");
     expect(manifest).toContain(
       "- acme/tools/broken — enabled but unavailable: Failed to materialize skill files: SKILL.md copy is missing.",
     );
     // Key-sorted body, regardless of input order.
     const brokenIndex = manifest!.indexOf("acme/tools/broken");
-    const wireframeIndex = manifest!.indexOf("acme/tools/wireframe");
     const coreIndex = manifest!.indexOf("paperclipai/paperclip/paperclip —");
-    expect(brokenIndex).toBeLessThan(wireframeIndex);
-    expect(wireframeIndex).toBeLessThan(coreIndex);
+    expect(brokenIndex).toBeLessThan(coreIndex);
 
     // Byte-identical for identical inputs (shuffled order): the claude-local
     // prompt-bundle cache key hashes this text, so determinism is load-bearing.
@@ -89,7 +87,8 @@ describe("buildSkillLibraryManifestMarkdown", () => {
       entries: [entry({ key: "acme/tools/wireframe" }), entry({ key: "acme/tools/extra" })],
       desiredSkillKeys: new Set(),
     });
-    expect(enabled).not.toBe(base);
-    expect(grown).not.toBe(base);
+    expect(base).toBeNull();
+    expect(enabled).toContain("acme/tools/wireframe — enabled");
+    expect(grown).toBeNull();
   });
 });
