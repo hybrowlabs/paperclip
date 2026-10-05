@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -115,6 +116,39 @@ suite("heartbeat dispatch checkpoint hooks", () => {
     expect(finished?.processPid).toBe(process.pid);
     expect(finished?.status).not.toBe("running");
   });
+
+  it("F3b: a stale fence at spawn terminates the real provider process group, not just the abort signal", async () => {
+    const s = await seed();
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    const childPid = child.pid!;
+    const isAlive = (pid: number) => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    };
+    let aliveAfterSpawnHook = true;
+    let aliveGroupAfterSpawnHook = true;
+    try {
+      execute.mockImplementation(async (ctx) => {
+        await db.update(executionDispatchCheckpoints).set({ recoveryState: "recovery_open" })
+          .where(eq(executionDispatchCheckpoints.runId, ctx.runId));
+        await ctx.onSpawn?.({ pid: childPid, processGroupId: childPid, startedAt: new Date().toISOString() });
+        const deadline = Date.now() + 8_000;
+        while (Date.now() < deadline && isAlive(childPid)) await new Promise((resolve) => setTimeout(resolve, 50));
+        aliveAfterSpawnHook = isAlive(childPid);
+        try { process.kill(-childPid, 0); aliveGroupAfterSpawnHook = true; } catch { aliveGroupAfterSpawnHook = false; }
+        const [row] = await db.select({ pid: heartbeatRuns.processPid, pgid: heartbeatRuns.processGroupId })
+          .from(heartbeatRuns).where(eq(heartbeatRuns.id, ctx.runId));
+        expect(row).toMatchObject({ pid: childPid, pgid: childPid });
+        return { ...okResult, exitCode: 1, errorMessage: "provider stopped" };
+      });
+      const queued = await heartbeat.invoke(s.agentId, "on_demand", { issueId: s.issueId }, "manual");
+      const finished = await waitForRun(heartbeat, queued!.id);
+      expect(aliveAfterSpawnHook).toBe(false);
+      expect(aliveGroupAfterSpawnHook).toBe(false);
+      expect(finished?.status).not.toBe("running");
+    } finally {
+      try { process.kill(-childPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  }, 30_000);
 
   it("F6: when the intent cannot be saved the run fails with its own error code and the provider is never called", async () => {
     const s = await seed();

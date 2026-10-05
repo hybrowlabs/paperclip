@@ -24679,7 +24679,10 @@ export function heartbeatService(
         // is never allowed to throw past the saved pid. A fenced run is stopped
         // through its execution control; any other write error leaves the
         // checkpoint at its conservative earlier stage for reconciliation.
-        const commitProviderStartedCheckpoint = async () => {
+        const commitProviderStartedCheckpoint = async (meta: {
+          pid: number | null | undefined;
+          processGroupId?: number | null;
+        }) => {
           if (dispatchFenceGeneration === null) return;
           try {
             await advanceDispatchCheckpoint(db, {
@@ -24695,6 +24698,20 @@ export function heartbeatService(
                 message: "Dispatch fence was superseded by recovery; stopping this run's provider process.",
               }).catch(() => undefined);
               executionControl.controller.abort(checkpointErr);
+              const stalePid = typeof meta.pid === "number" && meta.pid !== process.pid ? meta.pid : null;
+              const staleGroup =
+                typeof meta.processGroupId === "number" && meta.processGroupId !== process.pid
+                  ? meta.processGroupId
+                  : null;
+              if (stalePid !== null || staleGroup !== null) {
+                await terminateHeartbeatRunProcess({
+                  pid: stalePid,
+                  processGroupId: staleGroup,
+                  graceMs: 2_000,
+                }).catch((terminateErr) => {
+                  logger.warn({ err: terminateErr, runId: run.id }, "failed to terminate provider process after stale dispatch fence");
+                });
+              }
               return;
             }
             logger.warn({ err: checkpointErr, runId: run.id }, "dispatch checkpoint provider_started write deferred to reconciliation");
@@ -24710,7 +24727,13 @@ export function heartbeatService(
               providerRef,
             });
           } catch (checkpointErr) {
-            logger.warn({ err: checkpointErr, runId: run.id }, "dispatch checkpoint provider_returned write deferred to reconciliation");
+            if (checkpointErr instanceof StaleDispatchFenceError) {
+              await appendRunEvent(run, {
+                eventType: "lifecycle", stream: "system", level: "warn",
+                message: `Provider returned after the dispatch fence was superseded; the checkpoint was not advanced. Provider ref (not stored on the checkpoint): ${providerRef ?? "none"}.`,
+              }).catch(() => undefined);
+            }
+            logger.warn({ err: checkpointErr, runId: run.id, providerRef }, "dispatch checkpoint provider_returned write deferred to reconciliation");
           }
         };
 
@@ -25095,7 +25118,7 @@ export function heartbeatService(
                             : null,
                         startedAt: meta.startedAt,
                       });
-                      await commitProviderStartedCheckpoint();
+                      await commitProviderStartedCheckpoint(meta);
                     },
                     authToken: authToken ?? undefined,
                   }));
