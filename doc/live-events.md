@@ -41,6 +41,24 @@ and rely on UI polling.
 `LISTEN`/`NOTIFY` also do not run on hot-standby replicas — the transport
 connects to the primary.
 
+## Connection role and trust boundary
+
+The transport connects with `PAPERCLIP_LIVE_EVENTS_DATABASE_URL`, then
+`DATABASE_URL`. It never falls back to `DATABASE_MIGRATION_URL`: `LISTEN` and
+`NOTIFY` need only `CONNECT`, and the connection stays open for the life of the
+process, so use the application role (a direct URL behind a transaction-mode
+pooler), never a DDL-capable role.
+
+`NOTIFY` frames carry full event payloads, including `heartbeat.run.log`
+chunks. Any database role with `CONNECT` can `LISTEN` on a company channel
+(the channel is a hash of the company id, which is not a secret) and read them,
+or `NOTIFY` forged frames. Tenant isolation between browsers is the WebSocket
+gate; at the database level it is role trust. Run Paperclip in its own
+database and keep read-only, analytics and backup roles off it, or set
+`PAPERCLIP_LIVE_EVENTS_TRANSPORT=off`. Inbound frames are validated: known
+event type, plain-object payload, matching company; a malformed `id` or
+`createdAt` is replaced.
+
 ## Monitoring
 
 `GET /api/health` (full-details view) includes:

@@ -1,4 +1,4 @@
-import type { LiveEvent, LiveEventType } from "@paperclipai/shared";
+import { LIVE_EVENT_TYPES, type LiveEvent, type LiveEventType } from "@paperclipai/shared";
 
 /**
  * Cross-replica fan-out transport for live events.
@@ -99,6 +99,34 @@ export function packEnvelopes(
   return out;
 }
 
+const KNOWN_LIVE_EVENT_TYPES: ReadonlySet<string> = new Set(LIVE_EVENT_TYPES);
+
+/**
+ * Wire events are untrusted: any database role with CONNECT can NOTIFY on a
+ * company channel. Accept only a known event type with a plain-object payload
+ * for the receiving company. The id must be a finite number and createdAt a
+ * parseable date string; otherwise they are replaced (id 0 marks
+ * receiver-synthesized events; createdAt becomes the local receive time).
+ */
+function sanitizeWireEvent(companyId: string, candidate: unknown): LiveEvent | null {
+  if (typeof candidate !== "object" || candidate === null) return null;
+  const event = candidate as Partial<Record<keyof LiveEvent, unknown>>;
+  if (event.companyId !== companyId) return null;
+  if (typeof event.type !== "string" || !KNOWN_LIVE_EVENT_TYPES.has(event.type)) return null;
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  return {
+    id: typeof event.id === "number" && Number.isFinite(event.id) ? event.id : 0,
+    companyId,
+    type: event.type as LiveEventType,
+    createdAt:
+      typeof event.createdAt === "string" && !Number.isNaN(Date.parse(event.createdAt))
+        ? event.createdAt
+        : new Date().toISOString(),
+    payload: payload as LiveEvent["payload"],
+  };
+}
+
 /**
  * Decode an inbound envelope into the LiveEvents to deliver locally.
  *
@@ -120,13 +148,17 @@ export function envelopeToEvents(companyId: string, envelope: TransportEnvelope)
   const kind = raw.kind ?? (raw.event !== undefined ? "full" : undefined);
   switch (kind) {
     case "full": {
-      const event = raw.event as LiveEvent | null | undefined;
-      if (typeof event !== "object" || event === null) return [];
-      return event.companyId === companyId ? [event] : [];
+      const event = sanitizeWireEvent(companyId, raw.event);
+      return event ? [event] : [];
     }
     case "batch": {
       if (!Array.isArray(raw.events)) return [];
-      return (raw.events as LiveEvent[]).filter((e) => e?.companyId === companyId);
+      const out: LiveEvent[] = [];
+      for (const candidate of raw.events) {
+        const event = sanitizeWireEvent(companyId, candidate);
+        if (event) out.push(event);
+      }
+      return out;
     }
     case "resync": {
       if (raw.companyId !== companyId) return [];

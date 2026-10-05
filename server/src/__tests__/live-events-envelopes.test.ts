@@ -168,3 +168,42 @@ describe("envelopeToEvents", () => {
     expect(envelopeToEvents("company-a", numericType)).toEqual([]);
   });
 });
+
+describe("envelopeToEvents wire validation", () => {
+  it("drops full events whose type is not a known live event type", () => {
+    const event = makeEvent({ type: "evil.type" as never });
+    expect(envelopeToEvents("company-a", { kind: "full", origin: "o", event })).toEqual([]);
+  });
+
+  it("drops events whose payload is not a plain object", () => {
+    const event = makeEvent({ payload: "x" as never });
+    expect(envelopeToEvents("company-a", { kind: "full", origin: "o", event })).toEqual([]);
+    const arr = makeEvent({ payload: [1] as never });
+    expect(envelopeToEvents("company-a", { kind: "full", origin: "o", event: arr })).toEqual([]);
+  });
+
+  it("replaces a non-numeric id with 0 and an unparseable createdAt with the receive time", () => {
+    const event = makeEvent({ id: "boom" as never, createdAt: "not-a-date", payload: { a: 1 } });
+    const [out] = envelopeToEvents("company-a", { kind: "full", origin: "o", event });
+    expect(out.id).toBe(0);
+    expect(out.createdAt).not.toBe("not-a-date");
+    expect(Number.isNaN(Date.parse(out.createdAt))).toBe(false);
+    expect(out.payload).toEqual({ a: 1 });
+    expect(out.type).toBe("activity.logged");
+  });
+
+  it("keeps a valid id and createdAt", () => {
+    const event = makeEvent({ id: 7, createdAt: "2026-01-01T00:00:00.000Z" });
+    const [out] = envelopeToEvents("company-a", { kind: "full", origin: "o", event });
+    expect(out.id).toBe(7);
+    expect(out.createdAt).toBe("2026-01-01T00:00:00.000Z");
+  });
+
+  it("validates every event in a batch and keeps the valid ones", () => {
+    const good = makeEvent();
+    const bad = makeEvent({ type: "nope" as never });
+    const out = envelopeToEvents("company-a", { kind: "batch", origin: "o", events: [bad, good] });
+    expect(out).toHaveLength(1);
+    expect(out[0].type).toBe("activity.logged");
+  });
+});

@@ -95,6 +95,21 @@ export function resolveLiveEventsTransportMode(env: NodeJS.ProcessEnv = process.
   return "postgres";
 }
 
+/**
+ * Connection string for the LISTEN/NOTIFY transport. LISTEN needs only
+ * CONNECT, so it uses the application role: PAPERCLIP_LIVE_EVENTS_DATABASE_URL
+ * (a direct URL behind a transaction-mode pooler), then the application
+ * connection string. It must never fall back to the DDL-capable
+ * DATABASE_MIGRATION_URL, because the transport holds its login open for the
+ * life of the process.
+ */
+export function resolveLiveEventsDatabaseUrl(
+  env: NodeJS.ProcessEnv,
+  applicationDatabaseUrl: string,
+): string {
+  return env.PAPERCLIP_LIVE_EVENTS_DATABASE_URL?.trim() || applicationDatabaseUrl;
+}
+
 export interface ConfigureLiveEventsTransportOptions {
   mode: LiveEventsTransportMode;
   databaseUrl?: string;

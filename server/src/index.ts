@@ -2,6 +2,7 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import {
   configureLiveEventsTransport,
+  resolveLiveEventsDatabaseUrl,
   resolveLiveEventsTransportMode,
   subscribeAllCompanyLiveEvents,
   teardownLiveEventsTransport,
@@ -1008,16 +1009,13 @@ async function startServerWithDatabaseTeardown(
   });
   // Cross-replica live events over Postgres LISTEN/NOTIFY. LISTEN needs a
   // session-capable connection, so it must not go through a transaction-mode
-  // pooler: PAPERCLIP_LIVE_EVENTS_DATABASE_URL overrides, then the direct
-  // migration URL, then the main connection string. A single replica is
+  // pooler: PAPERCLIP_LIVE_EVENTS_DATABASE_URL overrides (app role, direct URL),
+  // then the main connection string. Never the migration URL. A single replica is
   // unaffected: in-process delivery stays the whole story if this fails.
   const liveEventsTransportMode = resolveLiveEventsTransportMode();
   await configureLiveEventsTransport({
     mode: liveEventsTransportMode,
-    databaseUrl:
-      process.env.PAPERCLIP_LIVE_EVENTS_DATABASE_URL?.trim() ||
-      config.databaseMigrationUrl ||
-      activeDatabaseConnectionString,
+    databaseUrl: resolveLiveEventsDatabaseUrl(process.env, activeDatabaseConnectionString),
   }).catch((err) => {
     logger.warn({ err }, "live-events: transport configuration failed; falling back to in-process");
   });

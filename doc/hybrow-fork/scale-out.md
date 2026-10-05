@@ -129,9 +129,22 @@ after theirs (see the runbook).
    - **Migrations:** set `DATABASE_MIGRATION_URL` to the direct URL. The
      migration lock is a session lock on a dedicated connection to that URL.
    - **Live events (`LISTEN`):** the transport uses
-     `PAPERCLIP_LIVE_EVENTS_DATABASE_URL`, then `DATABASE_MIGRATION_URL`, then
-     `DATABASE_URL`. Set one of the first two to the direct URL, or events will
-     not be delivered across replicas.
+     `PAPERCLIP_LIVE_EVENTS_DATABASE_URL`, then `DATABASE_URL`. It never uses
+     `DATABASE_MIGRATION_URL`: `LISTEN`/`NOTIFY` need only `CONNECT`, and the
+     transport keeps its login open for the life of the process, so it must not
+     be a DDL-capable role. Behind a transaction-mode pooler, set
+     `PAPERCLIP_LIVE_EVENTS_DATABASE_URL` to a direct URL that uses the
+     **application role**, or events will not be delivered across replicas.
+     - **Trust boundary:** `NOTIFY` frames carry full event payloads, including
+       `heartbeat.run.log` chunks. Any database role with `CONNECT` can `LISTEN`
+       on a company channel (the channel name is a hash of the company id, which
+       is not a secret) and read them, or `NOTIFY` forged frames. Tenant
+       isolation between browsers is the WebSocket gate; at the database level
+       it is role trust. Run Paperclip in its own database, keep read-only,
+       analytics and backup roles off it, or set
+       `PAPERCLIP_LIVE_EVENTS_TRANSPORT=off`. Received frames are validated
+       (known event type, plain-object payload, matching company; id and
+       `createdAt` replaced if malformed).
    - **Database backups:** the backup lock and `pg_dump` use `DATABASE_URL`
      as given. Behind a transaction-mode pooler, either point
      `DATABASE_URL` at a session-mode pool, or turn the in-app backup off
@@ -172,7 +185,7 @@ after theirs (see the runbook).
 | `PAPERCLIP_MULTI_REPLICA` | unset (`false`) | Set `true` on **every** replica when running more than one. A native runner run whose controller lease is live on another replica is never claimed, reaped or suspended by this one, and a `HEARTBEAT_SCHEDULER_ENABLED=false` replica runs no background sweeps. Unset with one replica: nothing changes. |
 | `DATABASE_ADVISORY_LOCK_POOL_MAX` | `16` | Size of the separate pool that holds advisory lock transactions. Lock holders wait on this pool, never on the main pool. Count it in `replicas * (DATABASE_POOL_MAX + this)` against the pooler and `max_connections`. |
 | `PAPERCLIP_LIVE_EVENTS_TRANSPORT` | `postgres` | `postgres` or `off` (in-process only; multi-replica UIs go stale). |
-| `PAPERCLIP_LIVE_EVENTS_DATABASE_URL` | unset | Direct connection string for `LISTEN`. Falls back to `DATABASE_MIGRATION_URL`, then `DATABASE_URL`. |
+| `PAPERCLIP_LIVE_EVENTS_DATABASE_URL` | unset | Direct connection string for `LISTEN`. Direct URL using the application role (never the migration role). Falls back to `DATABASE_URL`. |
 
 Single replica: nothing to set. The lone replica becomes leader on its first
 pass at boot and behaviour is unchanged.
@@ -220,6 +233,7 @@ pnpm exec vitest run \
   server/src/__tests__/scheduler-runtime.test.ts \
   server/src/__tests__/live-events-cross-replica.test.ts \
   server/src/__tests__/live-events-envelopes.test.ts \
+  server/src/__tests__/live-events-config.test.ts \
   server/src/__tests__/plugin-job-scheduler-claim.test.ts \
   server/src/__tests__/plugin-webhook-dedup.test.ts \
   server/src/__tests__/advisory-locks.test.ts \
@@ -244,6 +258,7 @@ several minutes on 4 vCPU because each replica is a full server process.
 | (d) plugin jobs do not run twice | `plugin-job-scheduler-claim.test.ts` |
 | (e) agent-start lock across replicas | `agent-start-lock-cross-replica.test.ts` |
 | Tick does not start before recovery; no overlapping ticks | `scheduler-runtime.test.ts` |
+| LISTEN never uses the migration role; inbound NOTIFY frames are validated (security review) | `live-events-config.test.ts`; `live-events-envelopes.test.ts` |
 | Lock holders cannot starve a small pool (M1) | `advisory-locks.test.ts` |
 | A new leader does not take over live runs on another replica (M2) | `leader-failover-live-runs.test.ts` |
 | Singleton sweeps single-flight; traffic-only replica runs none (M3) | `singleton-sweep.test.ts`; `multi-replica-cluster.test.ts` (a2) |
