@@ -6643,6 +6643,59 @@ export function issueRoutes(
     });
   }
 
+  async function assertExecutionReconciliationResolver(
+    req: Request,
+    database: Db,
+    issue: { companyId: string; assigneeAgentId: string | null },
+    decision: { actionOutcome?: string } | undefined,
+  ): Promise<"board" | "direct_supervisor_not_performed"> {
+    if (req.actor.type === "board") return "board";
+    const actorAgentId =
+      req.actor.type === "agent" ? req.actor.agentId : undefined;
+    const denied = (reason: string) =>
+      forbidden("Board access required", {
+        code: "execution_reconciliation_authority_required",
+        reason,
+        remediation:
+          "Only the board, or the assignee's direct supervisor for a not_performed reconciliation, can resolve this run-loss hold.",
+        securityPrinciples: [
+          "Least Privilege",
+          "Complete Mediation",
+          "Secure Defaults",
+        ],
+      });
+    if (!actorAgentId || !issue.assigneeAgentId) throw denied("not_agent");
+    if (decision?.actionOutcome !== "not_performed") {
+      throw denied("action_outcome_requires_board");
+    }
+    if (actorAgentId === issue.assigneeAgentId) throw denied("self_resolution");
+    const [assignee] = await database
+      .select({ reportsTo: agents.reportsTo })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.id, issue.assigneeAgentId),
+          eq(agents.companyId, issue.companyId),
+        ),
+      );
+    if (!assignee || assignee.reportsTo !== actorAgentId) {
+      throw denied("not_direct_supervisor");
+    }
+    const [supervisor] = await database
+      .select({ status: agents.status })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.id, actorAgentId),
+          eq(agents.companyId, issue.companyId),
+        ),
+      );
+    if (!supervisor || ["terminated", "pending_approval"].includes(supervisor.status)) {
+      throw denied("supervisor_inactive");
+    }
+    return "direct_supervisor_not_performed";
+  }
+
   function activeExecutionParticipantAgentId(issue: {
     executionState?: unknown;
   }) {
@@ -9167,7 +9220,12 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
+      let resolverAuthority:
+        | "board"
+        | "direct_supervisor_not_performed"
+        | null = null;
       const result = await db.transaction(async (tx) => {
+        resolverAuthority = null;
         const lockedIssue = await tx
           .select()
           .from(issueRows)
@@ -9213,7 +9271,12 @@ export function issueRoutes(
             if (automatic?.replay === "blocked" && executionReconciliation) {
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
-              assertBoard(req);
+              resolverAuthority = await assertExecutionReconciliationResolver(
+                req,
+                tx as unknown as Db,
+                lockedIssue,
+                executionReconciliation,
+              );
               if (
                 activeRecoveryAction ||
                 sourceIssueStatus !== "todo" ||
@@ -9322,7 +9385,12 @@ export function issueRoutes(
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
-          assertBoard(req);
+          resolverAuthority = await assertExecutionReconciliationResolver(
+            req,
+            tx as unknown as Db,
+            lockedIssue,
+            executionReconciliation,
+          );
           await validateExecutionReconciliation({
             db: tx as unknown as Db,
             companyId: lockedIssue.companyId,
@@ -9395,6 +9463,7 @@ export function issueRoutes(
             chatRetry
               ? { kind: "chat_failed_run_retry", actionId: chatRetry.actionId }
               : undefined,
+            { actorType: actor.actorType, resolvedVia: resolverAuthority ?? undefined },
           );
         }
         let issue = lockedIssue;
@@ -9611,6 +9680,18 @@ export function issueRoutes(
           outcome: result.recoveryAction.outcome,
           sourceIssueStatus: sourceIssueStatus ?? null,
           resolutionNote: result.recoveryAction.resolutionNote,
+          ...(executionReconciliation && resolverAuthority
+            ? {
+                resolvedVia: resolverAuthority,
+                resolvedByActorType: actor.actorType,
+                executionReconciliation: {
+                  runId: executionReconciliation.runId,
+                  providerStopped: executionReconciliation.providerStopped,
+                  actionOutcome: executionReconciliation.actionOutcome,
+                  outcomeEvidence: executionReconciliation.outcomeEvidence,
+                },
+              }
+            : {}),
         },
       });
 

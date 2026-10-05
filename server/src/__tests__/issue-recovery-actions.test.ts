@@ -12,6 +12,8 @@ import {
   authUsers,
   agentWakeupRequests,
   activityLog,
+  chatConversations,
+  chatEndpoints,
   companies,
   createDb,
   environmentLeases,
@@ -24,6 +26,8 @@ import {
   issueThreadInteractions,
   workspaceOperations,
   issues,
+  toolApplications,
+  toolConnections,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -158,6 +162,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
     await db.delete(issueInboxArchives);
+    await db.delete(chatConversations);
+    await db.delete(chatEndpoints);
+    await db.delete(toolConnections);
+    await db.delete(toolApplications);
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
@@ -2853,6 +2861,200 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "resolved",
       outcome: "false_positive",
       resolutionNote: "Recovery signal was stale; return to review.",
+    });
+  });
+
+  describe("direct supervisor resolution of not_performed run-loss holds", () => {
+    const evidenceText = "Provider receipts confirm the action was never submitted; the stopped process has no remaining effects.";
+
+    async function seedRunLossHold(variant: "active" | "settled" = "active") {
+      const fixture = await seedCompany();
+      const { companyId, coderId, sourceIssueId } = fixture;
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      const [action] = await db.insert(issueRecoveryActions).values({
+        companyId, sourceIssueId, kind: "active_run_watchdog",
+        status: variant === "active" ? "active" : "resolved",
+        outcome: variant === "active" ? null : "blocked",
+        ownerType: "board", returnOwnerAgentId: coderId, cause: "uncertain_external_action", fingerprint: runId,
+        nextAction: "Reconcile the lost run.",
+        evidence: variant === "active"
+          ? { runId }
+          : { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+      }).returning();
+      const body = (actionOutcome = "not_performed") => ({
+        actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
+        executionReconciliation: { runId, providerStopped: true, actionOutcome, outcomeEvidence: evidenceText },
+      });
+      const agentActor = async (agentId: string, actorCompanyId = companyId) => {
+        const actorRunId = randomUUID();
+        if (actorCompanyId === companyId) {
+          await seedHeartbeatRun({ companyId, agentId, runId: actorRunId, issueId: randomUUID(), status: "running" });
+        }
+        return { type: "agent", agentId, companyId: actorCompanyId, runId: actorRunId, source: "agent_jwt" };
+      };
+      return { ...fixture, runId, action: action!, body, agentActor };
+    }
+
+    async function expectHoldUntouched(sourceIssueId: string, actionId: string, variant: "active" | "settled") {
+      expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row!.status).toBe(variant === "active" ? "active" : "resolved");
+      expect(row!.evidence).not.toHaveProperty("executionReconciliation");
+    }
+
+    it.each(["active", "settled"] as const)(
+      "lets the direct supervisor release a %s hold with a not_performed reconciliation and audits the agent actor",
+      async (variant) => {
+        const { companyId, managerId, sourceIssueId, runId, action, body, agentActor } = await seedRunLossHold(variant);
+        const res = await request(createApp(await agentActor(managerId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body());
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(res.body.issue.status).toBe("todo");
+        const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+        expect(row!.status).toBe("resolved");
+        expect(row!.evidence).toMatchObject({
+          executionReconciliation: { runId, actionOutcome: "not_performed", actorId: managerId, actorType: "agent" },
+          continuationDelivery: "pending",
+        });
+        const [log] = await db.select().from(activityLog).where(and(
+          eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.recovery_action_resolved"),
+        ));
+        expect(log).toMatchObject({ actorType: "agent", actorId: managerId, agentId: managerId });
+        expect(log!.details).toMatchObject({
+          resolvedVia: "direct_supervisor_not_performed",
+          executionReconciliation: { runId, actionOutcome: "not_performed", outcomeEvidence: evidenceText },
+        });
+      },
+    );
+
+    it.each(["mixed", "completed"])("rejects the direct supervisor for a %s reconciliation but still lets the board resolve it", async (actionOutcome) => {
+      const { managerId, sourceIssueId, action, body, agentActor } = await seedRunLossHold("active");
+      await request(createApp(await agentActor(managerId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body(actionOutcome)).expect(403);
+      await expectHoldUntouched(sourceIssueId, action.id, "active");
+      await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body(actionOutcome)).expect(200);
+    });
+
+    it("keeps the board path working for not_performed", async () => {
+      const { sourceIssueId, body } = await seedRunLossHold("active");
+      const res = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body());
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
+    it.each(["active", "settled"] as const)("rejects the assignee, peers and skip-level managers on a %s hold", async (variant) => {
+      const { companyId, coderId, sourceIssueId, action, body, agentActor } = await seedRunLossHold(variant);
+      const peerId = randomUUID();
+      const topId = randomUUID();
+      const managerOfManagerId = randomUUID();
+      const [{ managerId }] = [{ managerId: (await db.select().from(agents).where(eq(agents.id, coderId)))[0]!.reportsTo! }];
+      await db.insert(agents).values([
+        { id: peerId, companyId, name: "Peer", role: "engineer", status: "idle", reportsTo: managerId, adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+        { id: managerOfManagerId, companyId, name: "Exec", role: "ceo", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+        { id: topId, companyId, name: "Chief", role: "ceo", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      ]);
+      await db.update(agents).set({ reportsTo: managerOfManagerId }).where(eq(agents.id, managerId));
+      for (const actorId of [coderId, peerId, managerOfManagerId, topId]) {
+        await request(createApp(await agentActor(actorId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body()).expect(403);
+      }
+      await expectHoldUntouched(sourceIssueId, action.id, variant);
+    });
+
+    it("does not authorize an agent from another company", async () => {
+      const { sourceIssueId, managerId, action, body, agentActor } = await seedRunLossHold("active");
+      const res = await request(createApp(await agentActor(managerId, randomUUID()))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body());
+      expect([403, 404]).toContain(res.status);
+      await expectHoldUntouched(sourceIssueId, action.id, "active");
+    });
+
+    it("still requires a run id for the supervisor", async () => {
+      const { companyId, managerId, sourceIssueId, action, body } = await seedRunLossHold("active");
+      const res = await request(createApp({ type: "agent", agentId: managerId, companyId, source: "agent_jwt" }))
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body());
+      expect(res.status).toBe(401);
+      await expectHoldUntouched(sourceIssueId, action.id, "active");
+    });
+
+    it("keeps validating the lost run for the supervisor path", async () => {
+      const { companyId, managerId, coderId, sourceIssueId, runId, action, body, agentActor } = await seedRunLossHold("active");
+      const killed = vi.spyOn(process, "kill").mockImplementation(() => true);
+      await db.update(heartbeatRuns).set({ processPid: 424242 }).where(eq(heartbeatRuns.id, runId));
+      try {
+        await request(createApp(await agentActor(managerId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body()).expect(409);
+      } finally {
+        killed.mockRestore();
+      }
+      await db.update(heartbeatRuns).set({ processPid: null }).where(eq(heartbeatRuns.id, runId));
+      const otherAssignee = randomUUID();
+      await db.insert(agents).values({ id: otherAssignee, companyId, name: "Other", role: "engineer", status: "idle", reportsTo: managerId, adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+      await db.update(issues).set({ assigneeAgentId: otherAssignee }).where(eq(issues.id, sourceIssueId));
+      await request(createApp(await agentActor(managerId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body()).expect(409);
+      await db.update(issues).set({ assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));
+      await expectHoldUntouched(sourceIssueId, action.id, "active");
+    });
+
+    it.each(["active", "settled"] as const)("denies a low-trust direct supervisor on a %s hold and leaves it untouched", async (variant) => {
+      const { companyId, managerId, sourceIssueId, action, body, agentActor } = await seedRunLossHold(variant);
+      await db.update(agents).set({
+        permissions: {
+          authorizationPolicy: {
+            trustPreset: "low_trust_review",
+            trustBoundary: { mode: "low_trust_review", companyId, rootIssueId: sourceIssueId },
+          },
+        },
+      }).where(eq(agents.id, managerId));
+      const res = await request(createApp(await agentActor(managerId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body());
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Low-trust actors cannot use this control-plane surface");
+      await expectHoldUntouched(sourceIssueId, action.id, variant);
+      const logs = await db.select().from(activityLog).where(and(
+        eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.recovery_action_resolved"),
+      ));
+      expect(logs).toHaveLength(0);
+    });
+
+    it("keeps chat-bound restricted conversations board-only for the supervisor", async () => {
+      const { companyId, managerId, sourceIssueId, action, body, agentActor } = await seedRunLossHold("active");
+      const endpointId = randomUUID();
+      const [application] = await db.insert(toolApplications).values({
+        companyId, applicationKey: `chat-app-${endpointId}`, name: "Chat app", type: "mcp", status: "active",
+      }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId, applicationId: application!.id, name: "Chat connection", uid: `chat-conn-${endpointId}`,
+        connectionKind: "managed", ownership: "customer", transport: "mcp_remote", authKind: "none", status: "active", enabled: true,
+      }).returning();
+      await db.insert(chatEndpoints).values({
+        id: endpointId,
+        companyId,
+        connectionId: connection!.id,
+        provider: "slack",
+        publicId: `ep-${endpointId.slice(0, 8)}`,
+        externalExecutionPolicy: "restricted",
+        assignedAgentId: managerId,
+        status: "active",
+      });
+      await db.insert(chatConversations).values({
+        companyId,
+        endpointId,
+        issueId: sourceIssueId,
+        externalConversationId: `conv-${endpointId.slice(0, 8)}`,
+        externalLabel: "Restricted chat",
+      });
+      const prepareFailedChatRunRetry = vi.fn();
+      const res = await request(createApp(await agentActor(managerId), { chatRunRetries: { prepareFailedChatRunRetry } as any }))
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body());
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details?.code).toBe("chat_recovery_requires_authorized_context");
+      expect(prepareFailedChatRunRetry).not.toHaveBeenCalled();
+      await expectHoldUntouched(sourceIssueId, action.id, "active");
+    });
+
+    it("keeps false_positive and cancelled board-only for the supervisor", async () => {
+      const { managerId, sourceIssueId, action, agentActor } = await seedRunLossHold("active");
+      for (const outcome of ["false_positive", "cancelled"]) {
+        await request(createApp(await agentActor(managerId))).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+          .send({ actionId: action.id, outcome, sourceIssueStatus: "done" }).expect(403);
+      }
+      await expectHoldUntouched(sourceIssueId, action.id, "active");
     });
   });
 
