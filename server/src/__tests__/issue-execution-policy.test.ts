@@ -1307,7 +1307,7 @@ describe("issue execution policy transitions", () => {
         lastDecisionOutcome: "approved",
       });
       expect(result.patch.status).toBeUndefined();
-      expect(result.patch.assigneeAgentId).toBeUndefined();
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
       expect(result.decision).toMatchObject({
         stageId: approvalStageId,
         stageType: "approval",
@@ -1761,6 +1761,372 @@ describe("issue execution policy transitions", () => {
           currentStageType: "approval",
           currentParticipant: { type: "user", userId: ctoUserId },
         },
+      });
+    });
+  });
+
+  describe("reopened multi-stage issue (HYBA-1256)", () => {
+    const makerId = "aaaaaaaa-0000-4000-8000-000000000001";
+    const reviewerId = "aaaaaaaa-0000-4000-8000-000000000002";
+    const checkerId = "aaaaaaaa-0000-4000-8000-000000000003";
+    const approverId = "aaaaaaaa-0000-4000-8000-000000000004";
+    const reopenerId = "aaaaaaaa-0000-4000-8000-000000000005";
+    const supervisorId = "aaaaaaaa-0000-4000-8000-000000000006";
+    const maker = { type: "agent" as const, agentId: makerId };
+    const approver = { type: "agent" as const, agentId: approverId };
+
+    function threeStagePolicy() {
+      return makePolicy([
+        { type: "review", participants: [{ type: "agent", agentId: reviewerId }] },
+        { type: "review", participants: [{ type: "agent", agentId: checkerId }] },
+        { type: "approval", participants: [{ type: "agent", agentId: approverId }] },
+      ]);
+    }
+
+    function pendingIssue(
+      policy: IssueExecutionPolicy,
+      stageIndex: number,
+      participantId: string,
+      returnAssignee: IssueExecutionState["returnAssignee"],
+    ) {
+      return {
+        status: "in_review",
+        assigneeAgentId: participantId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending" as const,
+          currentStageId: policy.stages[stageIndex].id,
+          currentStageIndex: stageIndex,
+          currentStageType: policy.stages[stageIndex].type,
+          currentParticipant: { type: "agent" as const, agentId: participantId },
+          returnAssignee,
+          completedStageIds: policy.stages.slice(0, stageIndex).map((stage) => stage.id),
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+    }
+
+    function catchError(fn: () => unknown) {
+      try {
+        fn();
+      } catch (error) {
+        return error as { status?: number; message: string; details?: Record<string, unknown> };
+      }
+      throw new Error("expected transition to throw");
+    }
+
+    it("returns the issue to the maker when the final stage approves", () => {
+      const policy = threeStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: pendingIssue(policy, 2, approverId, maker),
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: approverId },
+        commentBody: "Approved",
+      });
+
+      expect(result.patch).toMatchObject({ assigneeAgentId: makerId, assigneeUserId: null });
+      expect(result.patch.executionState).toMatchObject({ status: "completed" });
+      expect(result.workflowControlledAssignment).toBe(true);
+      expect(result.decision).toMatchObject({ outcome: "approved", stageType: "approval" });
+    });
+
+    it("leaves the assignee alone on final approval when there is no return assignee", () => {
+      const policy = threeStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: pendingIssue(policy, 2, approverId, null),
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: approverId },
+        commentBody: "Approved",
+      });
+
+      expect(result.patch.assigneeAgentId).toBeUndefined();
+      expect(result.patch.assigneeUserId).toBeUndefined();
+    });
+
+    it("does not take a stage's only participant as the maker when a workflow restarts", () => {
+      const policy = threeStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: approverId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: makerId },
+        commentBody: "Ready for review",
+      });
+
+      expect(result.patch).toMatchObject({ status: "in_review", assigneeAgentId: reviewerId });
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        returnAssignee: maker,
+      });
+    });
+
+    it("rejects a restart up front when no eligible participant remains for a later stage", () => {
+      const policy = threeStagePolicy();
+      const error = catchError(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: approverId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: null,
+          },
+          policy,
+          requestedStatus: "in_review",
+          requestedAssigneePatch: {},
+          actor: { agentId: approverId },
+          commentBody: "Ready for review",
+        }),
+      );
+
+      expect(error.status).toBe(422);
+      expect(error.details).toMatchObject({
+        code: "execution_stage_no_eligible_participant",
+        stageIndex: 2,
+        conflict: "only_return_assignee",
+      });
+    });
+
+    it("keeps the current assignee as maker when it is not a stage participant", () => {
+      const policy = threeStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: makerId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: reopenerId },
+        commentBody: "Ready for review",
+      });
+
+      expect(result.patch.executionState).toMatchObject({ returnAssignee: maker });
+    });
+
+    it("replays the HYBA-1209 sequence: approve final, reopen by a third agent, resubmit, reach approval with the approver", () => {
+      const policy = threeStagePolicy();
+
+      const approved = applyIssueExecutionPolicyTransition({
+        issue: pendingIssue(policy, 2, approverId, maker),
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: approverId },
+        commentBody: "Approved",
+      });
+      const doneIssue = {
+        status: "done",
+        assigneeAgentId: (approved.patch.assigneeAgentId as string | undefined) ?? approverId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: approved.patch.executionState as IssueExecutionState,
+      };
+      expect(doneIssue.assigneeAgentId).toBe(makerId);
+
+      const reopened = applyIssueExecutionPolicyTransition({
+        issue: doneIssue,
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: reopenerId },
+        commentBody: "Reopening",
+      });
+      expect(reopened.patch.executionState).toBeNull();
+      const reopenedIssue = {
+        status: "in_progress",
+        assigneeAgentId: doneIssue.assigneeAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      };
+
+      const resubmitted = applyIssueExecutionPolicyTransition({
+        issue: reopenedIssue,
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: makerId },
+        commentBody: "Resubmitting",
+      });
+      expect(resubmitted.patch).toMatchObject({ status: "in_review", assigneeAgentId: reviewerId });
+      let state = resubmitted.patch.executionState as IssueExecutionState;
+      expect(state.returnAssignee).toMatchObject(maker);
+
+      const stage1 = applyIssueExecutionPolicyTransition({
+        issue: { ...reopenedIssue, status: "in_review", assigneeAgentId: reviewerId, executionState: state },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: reviewerId },
+        commentBody: "Review PASS",
+      });
+      expect(stage1.patch.assigneeAgentId).toBe(checkerId);
+      state = stage1.patch.executionState as IssueExecutionState;
+
+      const stage2 = applyIssueExecutionPolicyTransition({
+        issue: { ...reopenedIssue, status: "in_review", assigneeAgentId: checkerId, executionState: state },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: checkerId },
+        commentBody: "Checker PASS",
+      });
+      expect(stage2.patch).toMatchObject({ status: "in_review", assigneeAgentId: approverId });
+      expect(stage2.patch.executionState).toMatchObject({
+        currentStageType: "approval",
+        currentParticipant: approver,
+        returnAssignee: maker,
+      });
+    });
+
+    it("repairs a stale return assignee on a restart that starts from the approver as maker", () => {
+      const policy = threeStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: approverId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: makerId },
+        commentBody: "Resubmitting",
+      });
+
+      expect(result.patch.executionState).toMatchObject({ returnAssignee: maker });
+    });
+
+    describe("repair path while a stage is pending", () => {
+      const staleReturn = approver;
+
+      it("lets the return assignee re-route the current stage without recording a decision", () => {
+        const policy = makePolicy([
+          { type: "review", participants: [{ type: "agent", agentId: reviewerId }] },
+          {
+            type: "review",
+            participants: [
+              { type: "agent", agentId: checkerId },
+              { type: "agent", agentId: supervisorId },
+            ],
+          },
+          { type: "approval", participants: [{ type: "agent", agentId: approverId }] },
+        ]);
+        const result = applyIssueExecutionPolicyTransition({
+          issue: pendingIssue(policy, 1, checkerId, maker),
+          policy,
+          requestedAssigneePatch: { assigneeAgentId: supervisorId },
+          actor: { agentId: makerId },
+        });
+
+        expect(result.decision).toBeUndefined();
+        expect(result.workflowControlledAssignment).toBe(true);
+        expect(result.patch).toMatchObject({ status: "in_review", assigneeAgentId: supervisorId });
+        expect(result.patch.executionState).toMatchObject({
+          status: "pending",
+          currentStageType: "review",
+          currentParticipant: { agentId: supervisorId },
+          returnAssignee: maker,
+        });
+      });
+
+      it("lets the return assignee change returnAssignee by assigning a non-participant", () => {
+        const policy = threeStagePolicy();
+        const result = applyIssueExecutionPolicyTransition({
+          issue: pendingIssue(policy, 1, checkerId, staleReturn),
+          policy,
+          requestedAssigneePatch: { assigneeAgentId: makerId },
+          actor: { agentId: approverId },
+        });
+
+        expect(result.decision).toBeUndefined();
+        expect(result.patch).toMatchObject({ status: "in_review", assigneeAgentId: checkerId });
+        expect(result.patch.executionState).toMatchObject({
+          status: "pending",
+          currentParticipant: { agentId: checkerId },
+          returnAssignee: maker,
+          completedStageIds: [policy.stages[0].id],
+        });
+      });
+
+      it("lets the assignee's direct supervisor repair routing", () => {
+        const policy = threeStagePolicy();
+        const result = applyIssueExecutionPolicyTransition({
+          issue: pendingIssue(policy, 1, checkerId, staleReturn),
+          policy,
+          requestedAssigneePatch: { assigneeAgentId: makerId },
+          actor: { agentId: supervisorId },
+          actorIsAssigneeSupervisor: true,
+        });
+
+        expect(result.decision).toBeUndefined();
+        expect(result.patch.executionState).toMatchObject({ returnAssignee: maker });
+      });
+
+      it("refuses a returnAssignee change that leaves a stage without an eligible participant", () => {
+        const policy = threeStagePolicy();
+        const error = catchError(() =>
+          applyIssueExecutionPolicyTransition({
+            issue: pendingIssue(policy, 1, checkerId, maker),
+            policy,
+            requestedAssigneePatch: { assigneeAgentId: approverId },
+            actor: { agentId: makerId },
+          }),
+        );
+
+        expect(error.status).toBe(422);
+        expect(error.details).toMatchObject({ code: "execution_stage_no_eligible_participant" });
+      });
+
+      it("does not let a repair request advance the stage with a status change", () => {
+        const policy = threeStagePolicy();
+        const error = catchError(() =>
+          applyIssueExecutionPolicyTransition({
+            issue: pendingIssue(policy, 1, checkerId, staleReturn),
+            policy,
+            requestedStatus: "done",
+            requestedAssigneePatch: {},
+            actor: { agentId: approverId },
+            commentBody: "Approve it myself",
+          }),
+        );
+
+        expect(error.status).toBe(422);
+        expect(error.message).toContain("Only the active reviewer or approver can advance the current execution stage");
+      });
+
+      it("still rejects other actors", () => {
+        const policy = threeStagePolicy();
+        const error = catchError(() =>
+          applyIssueExecutionPolicyTransition({
+            issue: pendingIssue(policy, 1, checkerId, staleReturn),
+            policy,
+            requestedAssigneePatch: { assigneeAgentId: makerId },
+            actor: { agentId: makerId },
+          }),
+        );
+
+        expect(error.status).toBe(422);
+        expect(error.message).toContain("Only the active reviewer or approver can advance the current execution stage");
       });
     });
   });
