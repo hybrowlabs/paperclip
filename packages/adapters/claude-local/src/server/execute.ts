@@ -516,12 +516,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   }
-  // Tell the model what the company library actually holds. Without this, an
-  // installed-but-not-enabled skill is indistinguishable from a nonexistent
-  // one from inside the sandbox, and agents tell users freshly installed
-  // skills "are not installed". Deterministic text appended to the
-  // instructions, so it participates in the prompt-bundle cache key and only
-  // busts the cache when the library really changes.
   const skillLibraryManifest = buildSkillLibraryManifestMarkdown({
     entries: claudeSkillEntries,
     desiredSkillKeys: desiredSkillNames,
