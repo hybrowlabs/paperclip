@@ -6,13 +6,38 @@ const mockActivityService = vi.hoisted(() => ({
   list: vi.fn(),
   forIssue: vi.fn(),
   runsForIssue: vi.fn(),
+  runsMetaForIssue: vi.fn(),
   issuesForRun: vi.fn(),
   create: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(),
+  getRunMeta: vi.fn(),
 }));
+
+// Restriction behaviour is covered by server/src/__tests__/run-content/*. This
+// suite exercises the activity routes' own contract, so it uses an admit-all gate.
+const mockRunContentGate = vi.hoisted(() => {
+  const lease = () => ({
+    id: "passthrough",
+    grantId: null,
+    decision: "ordinary" as const,
+    runIds: [] as string[],
+    signal: new AbortController().signal,
+    checkpoint: async () => undefined,
+    emit: <T,>(write: () => T) => write(),
+    release: async () => undefined,
+  });
+  return {
+    acquireLease: vi.fn(async () => lease()),
+    acquireListLease: vi.fn(async (input: { runIds: string[] }) => ({
+      lease: lease(),
+      allowed: new Set(input.runIds),
+      restricted: new Map(),
+    })),
+  };
+});
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -26,6 +51,11 @@ const mockAccessService = vi.hoisted(() => ({
 
 const mockAgentActionAuditService = vi.hoisted(() => ({
   list: vi.fn(),
+}));
+
+vi.mock("../services/run-content-gate.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/run-content-gate.js")>()),
+  getRunContentGate: () => mockRunContentGate,
 }));
 
 vi.mock("../services/activity.js", () => ({
@@ -106,6 +136,11 @@ describe.sequential("activity routes", () => {
     for (const mock of Object.values(mockActivityService)) mock.mockReset();
     for (const mock of Object.values(mockHeartbeatService)) mock.mockReset();
     for (const mock of Object.values(mockIssueService)) mock.mockReset();
+    // Meta/lookups are derived from the stubs each test already configures.
+    mockActivityService.runsMetaForIssue.mockImplementation(async (companyId: string, issueId: string) =>
+      ((await mockActivityService.runsForIssue(companyId, issueId)) as Array<{ runId: string }> | undefined ?? [])
+        .map((run) => ({ id: run.runId, createdAt: null })));
+    mockHeartbeatService.getRunMeta.mockImplementation(async (runId: string) => mockHeartbeatService.getRun(runId));
     mockAccessService.decide.mockReset();
     mockAccessService.canUser.mockReset();
     mockAgentActionAuditService.list.mockReset();
@@ -258,7 +293,7 @@ describe.sequential("activity routes", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.getByIdentifier).toHaveBeenCalledWith("PC1A2-475");
     expect(mockIssueService.getById).not.toHaveBeenCalled();
-    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1");
+    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1", expect.anything());
     expect(res.body).toEqual([{ runId: "run-1", adapterType: "codex_local" }]);
   });
 
