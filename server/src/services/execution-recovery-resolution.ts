@@ -22,6 +22,7 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { issueService } from "./issues.js";
 import {
   assertReconciliationMatchesCheckpoint,
   markCheckpointContinuationPending,
@@ -502,8 +503,27 @@ export async function settleUnrecoverableExecutions(
               executionRunId: null,
               checkoutRunId: null,
               updatedAt: now,
+              ...(task.status === "blocked" && task.unblockDescriptor
+                ? {}
+                : {
+                    blockedTransitionAt: now,
+                    blockedOwnerNotifiedAt: null,
+                    unblockDescriptor: {
+                      owner: { agentId: action.returnOwnerAgentId! },
+                      action: `Inspect stopped run ${run.id}, record the outcome of its actions with the recovery-actions resolve endpoint, then return the task to its workflow status. Recorded work is preserved and will not be replayed.`,
+                    },
+                  }),
             })
             .where(eq(issues.id, task.id)).returning();
+          await issueService(tx as unknown as Db).addComment(
+            task.id,
+            `Stopped run ${run.id} (${run.status}${run.errorCode ? `, ${run.errorCode}` : ""}) cannot be resumed automatically, so this task was moved to blocked. ` +
+              "Work already recorded is preserved and unverified actions will not be replayed. " +
+              "The assignee must inspect that run, record the outcome of its actions, and then return the task to its workflow status.",
+            {},
+            { authorType: "system" },
+            tx,
+          );
           // Only a transition owned by this failure grants a recovery receipt.
           // An already-blocked task may have a separate human/dependency hold.
           if (task.status !== "blocked" && run.runtimeMode === "native") {

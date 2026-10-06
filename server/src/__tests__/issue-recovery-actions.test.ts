@@ -1736,6 +1736,28 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(list.body.actions).toHaveLength(1);
   });
 
+  it("lists the settled no-replay hold that executionBlocker points at", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: coderId, status: "cancelled", runtimeMode: "legacy",
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const [settled] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${runId}`, resolvedAt: new Date(),
+      evidence: { runId, automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked" } },
+      nextAction: "Inspect the stopped run.",
+    }).returning();
+    const app = createApp();
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.executionBlocker).toMatchObject({ recoveryActionId: settled!.id });
+    const list = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).expect(200);
+    expect(list.body.active).toBeNull();
+    expect(list.body.actions.map((action: { id: string }) => action.id)).toEqual([settled!.id]);
+  });
+
   it("projects recovery action metadata into the structured wake payload", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     const action = await issueRecoveryActionService(db).upsertSourceScoped({

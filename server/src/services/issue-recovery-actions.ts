@@ -238,6 +238,26 @@ export function issueRecoveryActionService(db: Db) {
     return action;
   }
 
+  async function getForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    actionId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const [row] = await dbOrTx
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          eq(issueRecoveryActions.id, actionId),
+        ),
+      )
+      .limit(1);
+    return row ? toReadModel(row) : null;
+  }
+
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
     if (sourceIssueIds.length === 0) return new Map<string, IssueRecoveryAction>();
     const rows = await db
@@ -569,6 +589,7 @@ export function issueRecoveryActionService(db: Db) {
 
   return {
     getActiveForIssue,
+    getForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
     upsertSourceScoped,

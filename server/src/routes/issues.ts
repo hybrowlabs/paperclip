@@ -9068,9 +9068,19 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    const blocker = active
+      ? null
+      : await getExecutionBlocker(db, issue.companyId, issue.id);
+    const held = blocker?.recoveryActionId
+      ? await recoveryActionsSvc.getForIssue(
+          issue.companyId,
+          issue.id,
+          blocker.recoveryActionId,
+        )
+      : null;
     res.json({
       active,
-      actions: active ? [active] : [],
+      actions: active ? [active] : held ? [held] : [],
     });
   });
 
