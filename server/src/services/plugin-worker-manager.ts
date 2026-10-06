@@ -538,7 +538,14 @@ interface PendingRequest {
 }
 
 interface ActiveInvocation {
-  scope: PluginInvocationScope;
+  scope: PluginInvocationScope | null;
+  /**
+   * True only for a company-scoped call (getData, performAction, ...). Such an
+   * invocation makes a worker call that carries no id invalid. Notification
+   * (`onEvent`) and job (`runJob`) invocations are not strict: they must not
+   * decide whether an unrelated id-less call is admitted.
+   */
+  strict: boolean;
   timer?: ReturnType<typeof setTimeout>;
   // The host-minted W3C `traceparent` for the active startup span, or undefined
   // when no startup span is active. The span host handler reads it to mint the
@@ -1139,7 +1146,11 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+  function registerInvocation(
+    scope: PluginInvocationScope | null,
+    ttlMs?: number,
+    strict = true,
+  ): PluginInvocationContext {
     // Mint a W3C `traceparent` from the active startup span, so the worker's
     // provider span can parent to it. The host keeps the value on its own record
     // (below) and never trusts the worker to supply the parent. Outside a
@@ -1153,7 +1164,7 @@ export function createPluginWorkerHandle(
       scope,
       ...(traceparent ? { traceparent } : {}),
     };
-    const entry: ActiveInvocation = { scope, traceparent };
+    const entry: ActiveInvocation = { scope, strict, traceparent };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -2680,15 +2691,39 @@ export function createPluginWorkerHandle(
         (message as { params?: unknown }).params,
       );
       if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
-        return { invocationScope: { companyId: proactiveCompanyId } };
+        return {
+          invocationScope: { companyId: proactiveCompanyId },
+          allowedCompanyIds: [...proactiveCompanyScopes],
+        };
       }
-      const hasActiveInvocation = activeInvocations.size > 0 ||
-        Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
-      return hasActiveInvocation ? { invalidInvocationScope: true } : {};
+      const hasStrictInvocation = Array.from(activeInvocations.values()).some(
+        (entry) => entry.strict,
+      );
+      return hasStrictInvocation
+        ? { invalidInvocationScope: true }
+        : { allowedCompanyIds: [...proactiveCompanyScopes] };
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
-    return { invocationScope: entry.scope, traceparent: entry.traceparent };
+    if (entry.scope) {
+      return { invocationScope: entry.scope, traceparent: entry.traceparent };
+    }
+    // An invocation with no company (a scheduled job). Judge each call on its
+    // own: a call naming a configured company resolves to that company, a
+    // wildcard is limited to the configured companies, anything else stays
+    // denied by the governed-access gate.
+    const jobCompanyId = referencedCompanyId(
+      message.method,
+      (message as { params?: unknown }).params,
+    );
+    return {
+      invocationScope:
+        jobCompanyId && proactiveCompanyScopes.has(jobCompanyId)
+          ? { companyId: jobCompanyId }
+          : null,
+      allowedCompanyIds: [...proactiveCompanyScopes],
+      traceparent: entry.traceparent,
+    };
   }
 
   /**
@@ -3305,7 +3340,14 @@ export function createPluginWorkerHandle(
       const id = nextRequestId++;
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      // A scheduled job carries no company. It still gets a host-issued
+      // invocation so its nested host calls echo an id and are judged on their
+      // own scope (see contextForWorkerMessage), not on unrelated activity.
+      const invocation = invocationScope
+        ? registerInvocation(invocationScope)
+        : method === "runJob"
+          ? registerInvocation(null, undefined, false)
+          : null;
       // Register the host-owned execute route only for an execute call that
       // carries a log sink. The company id comes from the host-derived
       // invocation scope, never from the worker. This binds the sink to the
@@ -3463,7 +3505,7 @@ export function createPluginWorkerHandle(
       // Notifications have no response to settle on, so the invocation scope
       // is GC'd by TTL. Call-path invocations are registered without a TTL and
       // cleared on settlement, so they survive arbitrarily long call timeouts.
-      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS) : null;
+      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS, false) : null;
       try {
         sendMessage({
           jsonrpc: JSONRPC_VERSION,
