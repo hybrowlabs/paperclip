@@ -2697,6 +2697,107 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(actionAfter).toMatchObject({ status: "active", outcome: null });
   });
 
+  async function seedCancelledByDependencyCycle() {
+    const fixture = await seedCompany();
+    const { companyId, coderId, managerId, sourceIssueId, prefix } = fixture;
+    const parentId = randomUUID();
+    const recheckId = randomUUID();
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Batch", status: "blocked", priority: "medium", assigneeAgentId: managerId, issueNumber: 2, identifier: `${prefix}-2` },
+      { id: recheckId, companyId, title: "Re-check", status: "blocked", priority: "medium", assigneeAgentId: managerId, issueNumber: 3, identifier: `${prefix}-3` },
+    ]);
+    await db.update(issues).set({ parentId }).where(eq(issues.id, sourceIssueId));
+    await db.insert(issueRelations).values([
+      { companyId, issueId: recheckId, relatedIssueId: parentId, type: "blocks" },
+      { companyId, issueId: sourceIssueId, relatedIssueId: recheckId, type: "blocks" },
+      { companyId, issueId: recheckId, relatedIssueId: sourceIssueId, type: "blocks" },
+    ]);
+    const stageId = randomUUID();
+    const policy = { stages: [{ id: stageId, type: "approval", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: managerId }] }] };
+    const state = {
+      status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "approval",
+      currentParticipant: { type: "agent", agentId: coderId, userId: null },
+      returnAssignee: { type: "agent", agentId: managerId, userId: null },
+      completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: "changes_requested", changesRequestedCount: 2,
+    };
+    await db.update(issues).set({ status: "blocked", executionPolicy: policy, executionState: state }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: coderId, status: "cancelled", errorCode: "issue_dependencies_blocked",
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId, sourceIssueId, kind: "stranded_assigned_issue", ownerType: "board",
+      previousOwnerAgentId: coderId, returnOwnerAgentId: coderId,
+      cause: "execution_review_participant_recovery", fingerprint: `cycle:${sourceIssueId}`,
+      evidence: { latestRunId: runId, latestRunErrorCode: "issue_dependencies_blocked", latestRunStatus: "cancelled" },
+      nextAction: "Board operator: repair the failed review participant path.",
+      wakePolicy: { type: "board_escalation", preservesSourceAssignee: true },
+    });
+    return { ...fixture, parentId, recheckId, action, stageId, state };
+  }
+  const agentActor = async (companyId: string, agentId: string, issueId: string) => {
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId, runId, issueId });
+    return { type: "agent", agentId, companyId, runId, source: "agent_jwt" };
+  };
+  const asAgent = (test: request.Test, actor: { runId: string }) =>
+    test.set("X-Paperclip-Run-Id", actor.runId);
+
+  it("rejects cause_removed while the cancelling dependency cycle is still present", async () => {
+    const { companyId, coderId, sourceIssueId, action } = await seedCancelledByDependencyCycle();
+    const actor = await agentActor(companyId, coderId, sourceIssueId);
+    const rejected = await asAgent(request(createApp(actor))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`), actor)
+      .send({ actionId: action.id, outcome: "cause_removed", sourceIssueStatus: "todo" });
+    expect(rejected.body.details?.code ?? rejected.body.code).toBe("recovery_cause_still_present");
+    const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(row).toMatchObject({ status: "active", outcome: null });
+  });
+
+  it("lets the named agent owner resolve cause_removed after the cycle is cleared, keeping the pending stage unadvanced", async () => {
+    const { companyId, coderId, sourceIssueId, recheckId, action, stageId } = await seedCancelledByDependencyCycle();
+    await db.delete(issueRelations).where(eq(issueRelations.issueId, recheckId));
+    const wake = vi.fn(async () => null);
+    const actor = await agentActor(companyId, coderId, sourceIssueId);
+    const resolved = await asAgent(request(createApp(actor, { recoveryActionEnqueueWakeup: wake }))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`), actor)
+      .send({ actionId: action.id, outcome: "cause_removed", sourceIssueStatus: "todo", resolutionNote: "Cycle cleared." })
+      .expect(200);
+    expect(resolved.body.recoveryAction).toMatchObject({ id: action.id, status: "resolved", outcome: "cause_removed" });
+    const [row] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(row.status).toBe("todo");
+    expect(row.executionState).toMatchObject({
+      status: "pending", currentStageId: stageId, changesRequestedCount: 2, lastDecisionOutcome: "changes_requested",
+    });
+    expect(row.assigneeAgentId).toBe(coderId);
+  });
+
+  it("does not let cause_removed claim a cause it cannot verify", async () => {
+    const { companyId, coderId, sourceIssueId, recheckId, action } = await seedCancelledByDependencyCycle();
+    await db.delete(issueRelations).where(eq(issueRelations.issueId, recheckId));
+    await db.update(issueRecoveryActions).set({ evidence: { latestRunErrorCode: "adapter_failed" } }).where(eq(issueRecoveryActions.id, action.id));
+    const actor = await agentActor(companyId, coderId, sourceIssueId);
+    const rejected = await asAgent(request(createApp(actor))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`), actor)
+      .send({ actionId: action.id, outcome: "cause_removed", sourceIssueStatus: "todo" })
+      .expect(409);
+    expect(rejected.body.details?.code ?? rejected.body.code).toBe("recovery_cause_not_verifiable");
+  });
+
+  it("keeps a repair PATCH on a recovery-held pending stage from spending a changes-requested round", async () => {
+    const { companyId, coderId, sourceIssueId, recheckId, stageId } = await seedCancelledByDependencyCycle();
+    await db.delete(issueRelations).where(eq(issueRelations.issueId, recheckId));
+    const actor = await agentActor(companyId, coderId, sourceIssueId);
+    await asAgent(request(createApp(actor))
+      .patch(`/api/issues/${sourceIssueId}`), actor)
+      .send({ status: "todo", comment: "Cycle cleared; returning the task to its owner." })
+      .expect(200);
+    const [row] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(row.executionState).toMatchObject({ status: "pending", currentStageId: stageId, changesRequestedCount: 2 });
+    expect(row.assigneeUserId).toBeNull();
+  });
+
   it("rejects blocked recovery resolution when the source issue has no first-class blockers", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);

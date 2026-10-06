@@ -554,6 +554,7 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "false_positive",
   "blocked",
   "cancelled",
+  "cause_removed",
 ] as const;
 
 export const retryWorkspaceExportSchema = z.object({
@@ -592,6 +593,26 @@ export const resolveIssueRecoveryActionSchema = z
           message:
             "Restored recovery actions must move the source issue to todo, done, or in_review",
           path: ["sourceIssueStatus"],
+        });
+      }
+      return;
+    }
+
+    if (value.outcome === "cause_removed") {
+      if (value.sourceIssueStatus !== "todo" && value.sourceIssueStatus !== "in_review") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "A cause_removed recovery resolution returns the source issue to todo, or to in_review while its stage is pending",
+          path: ["sourceIssueStatus"],
+        });
+      }
+      if (value.executionReconciliation) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "A cause_removed recovery resolution cannot carry an executionReconciliation",
+          path: ["executionReconciliation"],
         });
       }
       return;

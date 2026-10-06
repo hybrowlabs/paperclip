@@ -23,6 +23,7 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { issueService } from "./issues.js";
+import { deliverAgentUnblockNotification } from "./routable-blocked.js";
 import {
   assertReconciliationMatchesCheckpoint,
   markCheckpointContinuationPending,
@@ -323,7 +324,10 @@ export async function deliverReconciledExecutions(
 export async function settleUnrecoverableExecutions(
   db: Db,
   now = new Date(),
-  options: { failpoint?: (phase: "persisted") => void } = {},
+  options: {
+    failpoint?: (phase: "persisted") => void;
+    wakeup?: SettledUnblockWakeup;
+  } = {},
 ) {
   // Fold obsolete conversation holds without waking historical work on upgrade.
   // Keep their evidence and record the policy change in the task's activity log.
@@ -510,7 +514,7 @@ export async function settleUnrecoverableExecutions(
                     blockedOwnerNotifiedAt: null,
                     unblockDescriptor: {
                       owner: { agentId: action.returnOwnerAgentId! },
-                      action: `Inspect stopped run ${run.id}, record the outcome of its actions with the recovery-actions resolve endpoint, then return the task to its workflow status. Recorded work is preserved and will not be replayed.`,
+                      action: `Inspect stopped run ${run.id} and confirm what it recorded, then return the task to todo (or in_progress if you resume it now). Recorded work is preserved and will not be replayed.`,
                     },
                   }),
             })
@@ -519,7 +523,7 @@ export async function settleUnrecoverableExecutions(
             task.id,
             `Stopped run ${run.id} (${run.status}${run.errorCode ? `, ${run.errorCode}` : ""}) cannot be resumed automatically, so this task was moved to blocked. ` +
               "Work already recorded is preserved and unverified actions will not be replayed. " +
-              "The assignee must inspect that run, record the outcome of its actions, and then return the task to its workflow status.",
+              "The assignee must inspect that run, confirm what it recorded, and then return the task to its workflow status.",
             {},
             { authorType: "system" },
             tx,
@@ -600,6 +604,67 @@ export async function settleUnrecoverableExecutions(
         { err, recoveryActionId: candidate.id },
         "Automatic recovery disposition remains pending",
       );
+    }
+  }
+  if (options.wakeup) await deliverSettledUnblockNotifications(db, options.wakeup);
+}
+
+export type SettledUnblockWakeup = Parameters<typeof deliverAgentUnblockNotification>[0]["wakeup"];
+
+/**
+ * Wakes the agent named by a settled preserve-without-replay hold exactly once
+ * per blocked transition. A failed wake leaves blockedOwnerNotifiedAt null so
+ * the next sweep retries; the wake idempotency key keeps retries from stacking.
+ */
+export async function deliverSettledUnblockNotifications(db: Db, wakeup: SettledUnblockWakeup) {
+  const candidates = await db
+    .select({ issue: issues })
+    .from(issues)
+    .innerJoin(
+      issueRecoveryActions,
+      and(
+        eq(issueRecoveryActions.companyId, issues.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issues.id),
+      ),
+    )
+    .where(
+      and(
+        sql`${issues.blockedTransitionAt} = ${issueRecoveryActions.resolvedAt}`,
+        eq(issues.status, "blocked"),
+        isNull(issues.blockedOwnerNotifiedAt),
+        sql`${issues.blockedTransitionAt} is not null`,
+        sql`${issues.unblockDescriptor} is not null`,
+        eq(issueRecoveryActions.status, "resolved"),
+        eq(issueRecoveryActions.outcome, "blocked"),
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      ),
+    )
+    .limit(25);
+  const seen = new Set<string>();
+  for (const { issue } of candidates) {
+    if (seen.has(issue.id)) continue;
+    seen.add(issue.id);
+    try {
+      const transitionAt = issue.blockedTransitionAt;
+      await deliverAgentUnblockNotification({
+        issue,
+        wakeup,
+        markNotified: async (notifiedAt) => {
+          await db
+            .update(issues)
+            .set({ blockedOwnerNotifiedAt: notifiedAt })
+            .where(
+              and(
+                eq(issues.id, issue.id),
+                eq(issues.companyId, issue.companyId),
+                isNull(issues.blockedOwnerNotifiedAt),
+                transitionAt ? eq(issues.blockedTransitionAt, transitionAt) : sql`true`,
+              ),
+            );
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "settled unblock notification deferred to next sweep");
     }
   }
 }

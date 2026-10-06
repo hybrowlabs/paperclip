@@ -406,6 +406,25 @@ export interface IssueBlockerAttentionIssueSummary {
   title: string;
 }
 
+export interface IssueBlockerAttentionCycleEdge {
+  issueId: string;
+  /** The issue this edge points at: a blocker for `blocked_by`, the parent for `parent`. */
+  targetIssueId: string;
+  via: "blocked_by" | "parent";
+}
+
+/**
+ * The dependency cycle that keeps an issue blocked, reported over the same
+ * graph dependency cancellation reads: blocked-by edges plus the parent chain.
+ */
+export interface IssueBlockerAttentionCycle {
+  edges: IssueBlockerAttentionCycleEdge[];
+  /** Node path starting and ending at the blocked issue. */
+  path: IssueBlockerAttentionIssueSummary[];
+  /** The first ancestor the cycle was reached through, when it climbs the parent chain. */
+  viaAncestor: IssueBlockerAttentionIssueSummary | null;
+}
+
 export interface IssueBlockerAttention {
   state: IssueBlockerAttentionState;
   reason: IssueBlockerAttentionReason;
@@ -424,6 +443,8 @@ export interface IssueBlockerAttention {
   terminalBlockerIssueId?: string | null;
   /** Link-ready details for the sampled blocker, including non-terminal intermediate nodes. */
   terminalBlocker?: IssueBlockerAttentionIssueSummary | null;
+  /** Present when the blocked issue sits on a dependency cycle. */
+  cycle?: IssueBlockerAttentionCycle | null;
 }
 
 export type IssueReviewAttentionState = "none" | "covered" | "stalled";

@@ -53,6 +53,12 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  /**
+   * The write repairs a recovery hold (blocked source with an active recovery
+   * action). It is not a verdict on the pending stage, so it must neither
+   * record a decision nor consume a changes-requested round.
+   */
+  recoveryRepair?: boolean;
 };
 
 type TransitionResult = {
@@ -702,6 +708,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       requestedStatus,
       returnAssignee: existingState.returnAssignee,
     });
+    return { patch };
+  }
+
+  if (activeStage && input.recoveryRepair) {
     return { patch };
   }
 

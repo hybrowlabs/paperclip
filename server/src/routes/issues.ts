@@ -6728,6 +6728,32 @@ export function issueRoutes(
     }
   }
 
+  async function assertRecoveryCauseRemoved(
+    tx: Db,
+    issue: { id: string; companyId: string },
+    recoveryAction: { id: string; evidence: Record<string, unknown> },
+  ) {
+    if (recoveryAction.evidence.latestRunErrorCode !== "issue_dependencies_blocked") {
+      throw conflict(
+        "This recovery cause cannot be verified as removed automatically; ask a board operator to resolve it",
+        { code: "recovery_cause_not_verifiable", recoveryActionId: recoveryAction.id },
+      );
+    }
+    const readiness = await svc.getDependencyReadiness(issue.id, tx);
+    const cycle = await svc.findDependencyCycle(issue.companyId, issue.id, tx, { includeParents: false });
+    if (readiness.unresolvedBlockerCount > 0 || cycle) {
+      throw conflict(
+        "The dependency that cancelled the run is still present",
+        {
+          code: "recovery_cause_still_present",
+          recoveryActionId: recoveryAction.id,
+          unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+          cycle,
+        },
+      );
+    }
+  }
+
   async function assertSafeRecoveryHandBackGates(input: {
     req: Request;
     issue: {
@@ -6742,6 +6768,7 @@ export function issueRoutes(
     recoveryAction: NonNullable<
       Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>
     >;
+    allowPendingExecutionStage?: boolean;
   }) {
     const returnOwnerAgentId = input.recoveryAction.returnOwnerAgentId;
     if (
@@ -6779,6 +6806,7 @@ export function issueRoutes(
       );
     }
     if (
+      !input.allowPendingExecutionStage &&
       parseIssueExecutionState(input.issue.executionState)?.status === "pending"
     ) {
       throw conflict(
@@ -9330,6 +9358,7 @@ export function issueRoutes(
 
         if (
           sourceIssueStatus === "todo" &&
+          outcome !== "cause_removed" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);
@@ -9409,6 +9438,30 @@ export function issueRoutes(
         }
         let issue = lockedIssue;
         const sourceStatusChanged = sourceIssueStatus !== lockedIssue.status;
+        const causeRemoved = outcome === "cause_removed";
+        if (causeRemoved) {
+          const pendingStage =
+            parseIssueExecutionState(lockedIssue.executionState)?.status === "pending";
+          const stageParticipant = parseIssueExecutionState(lockedIssue.executionState)?.currentParticipant;
+          if (
+            sourceIssueStatus === "in_review" &&
+            (!pendingStage ||
+              stageParticipant?.type !== "agent" ||
+              stageParticipant.agentId !== lockedIssue.assigneeAgentId)
+          ) {
+            throw conflict(
+              "Only a task whose assignee holds its pending execution stage can return to in_review",
+              { code: "recovery_cause_removed_status_mismatch", issueId: lockedIssue.id },
+            );
+          }
+          await assertSafeRecoveryHandBackGates({
+            req,
+            issue: lockedIssue,
+            recoveryAction: activeRecoveryAction,
+            allowPendingExecutionStage: true,
+          });
+          await assertRecoveryCauseRemoved(tx as unknown as Db, lockedIssue, activeRecoveryAction);
+        }
         if (outcome === "blocked" && sourceStatusChanged) {
           const unresolvedBlockers = await tx
             .select({ id: issueRows.id })
@@ -9437,7 +9490,11 @@ export function issueRoutes(
             activeRecoveryAction.returnOwnerAgentId != null &&
             lockedIssue.assigneeAgentId ===
               activeRecoveryAction.returnOwnerAgentId;
-          if (safeHandBack) {
+          if (causeRemoved) {
+            // Gates and cause were verified above; the source write below
+            // changes status only, so the pending stage is neither advanced
+            // nor satisfied.
+          } else if (safeHandBack) {
             await assertSafeRecoveryHandBackGates({
               req,
               issue: lockedIssue,
@@ -9463,7 +9520,7 @@ export function issueRoutes(
           const updateFields: Record<string, unknown> = {
             status: sourceIssueStatus,
           };
-          if (!safeHandBack) {
+          if (!safeHandBack && !causeRemoved) {
             await assertInReviewReviewPath({
               existing: lockedIssue,
               updateFields,
@@ -9639,7 +9696,7 @@ export function issueRoutes(
         }
       } else if (
         !executionReconciliation &&
-        sourceIssueStatus === "todo" &&
+        (sourceIssueStatus === "todo" || outcome === "cause_removed") &&
         result.issue.assigneeAgentId &&
         (existing.status !== result.issue.status ||
           existing.assigneeAgentId !== result.issue.assigneeAgentId)
@@ -13231,10 +13288,18 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
+      const recoveryRepairWrite =
+        existing.status === "blocked" &&
+        parseIssueExecutionState(existing.executionState)?.status === "pending" &&
+        updateFields.status !== "done" &&
+        updateFields.status !== "cancelled" &&
+        (activeRecoveryActionBeforeUpdate != null ||
+          (await getExecutionBlocker(db, existing.companyId, existing.id)) != null);
       const transition = applyIssueExecutionPolicyTransition({
         issue: existing,
         policy: nextExecutionPolicy,
         previousPolicy: previousExecutionPolicy,
+        recoveryRepair: recoveryRepairWrite,
         requestedStatus:
           typeof updateFields.status === "string"
             ? updateFields.status

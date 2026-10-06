@@ -1236,7 +1236,7 @@ async function startServerWithDatabaseTeardown(
     ["dispatch_checkpoints", () => reconcileAbandonedDispatchCheckpoints(db)],
     ["reconciliation_delivery", () => heartbeat ? deliverReconciledExecutions(db, heartbeat.wakeup) : undefined],
     ["status_delivery", () => deliverExecutionStatuses(db)],
-    ["automatic_disposition", () => settleUnrecoverableExecutions(db)],
+    ["automatic_disposition", () => settleUnrecoverableExecutions(db, undefined, { wakeup: heartbeat?.wakeup })],
     ["local_ai_login_cleanup", () => localAiLoginService(db).reapExpired()],
   ] as const;
   const sweepExecutionControl = () => {
