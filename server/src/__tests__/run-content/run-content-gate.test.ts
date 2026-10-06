@@ -190,6 +190,60 @@ d("run content gate (embedded postgres, synthetic canaries)", () => {
       await gate.stop();
     });
 
+    it("a per-lease timer aborts a response that is already flushing when the lease deadline passes (final byte)", async () => {
+      const gate = runContentGate(db, { ...fast, tickMs: 60_000 });
+      const s = await seedCompanyRuns(db);
+      const lease = await gate.acquireLease({ ...ctx(s.company.id, s.runA.id), kind: "stream" });
+      await lease.checkpoint();
+      expect(lease.signal.aborted).toBe(false);
+      await new Promise((r) => setTimeout(r, 450));
+      expect(lease.signal.aborted).toBe(false);
+      await new Promise((r) => setTimeout(r, 400));
+      expect(lease.signal.aborted, "no emit/checkpoint was called; the timer alone must abort").toBe(true);
+      expect(() => lease.emit(() => "late")).toThrow(/lease_expired/);
+      await lease.release("test").catch(() => {});
+      await gate.stop();
+    });
+
+    it("renewal moves the lease timer: a healthy holder is not aborted at the original deadline", async () => {
+      const gate = runContentGate(db, { ...fast, tickMs: 25 });
+      const s = await seedCompanyRuns(db);
+      const lease = await gate.acquireLease({ ...ctx(s.company.id, s.runA.id), kind: "stream" });
+      await new Promise((r) => setTimeout(r, 1_200));
+      expect(lease.signal.aborted).toBe(false);
+      expect(lease.emit(() => "still-live")).toBe("still-live");
+      await lease.release("test");
+      await gate.stop();
+    });
+
+    it("holder DB unreachable while the response is flushing: every held lease is fenced and aborted before the deadline", async () => {
+      let broken = false;
+      const flaky = new Proxy(db, {
+        get(target, prop, receiver) {
+          if (prop === "execute" && broken) return () => Promise.reject(new Error("db unreachable"));
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as Db;
+      const gate = runContentGate(flaky, { ...fast, leaseTtlMs: 5_000, clockSkewMs: 50, tickMs: 25 });
+      const s = await seedCompanyRuns(db);
+      const a = await gate.acquireLease({ ...ctx(s.company.id, s.runA.id), kind: "stream" });
+      const b = await gate.acquireLease({ ...ctx(s.company.id, s.runB.id), kind: "download" });
+      await a.checkpoint();
+      broken = true;
+      await new Promise((r) => setTimeout(r, 300));
+      expect(a.signal.aborted, "lease a aborted although its deadline is seconds away").toBe(true);
+      expect(b.signal.aborted).toBe(true);
+      const written: string[] = [];
+      expect(() => a.emit(() => written.push("x"))).toThrow(RunContentDeniedError);
+      await expect(b.checkpoint()).rejects.toThrow(RunContentDeniedError);
+      expect(written).toEqual([]);
+      broken = false;
+      await a.release("test").catch(() => {});
+      await b.release("test").catch(() => {});
+      await gate.stop();
+    });
+
     it("multi-instance: instance 1 reader blocks activation requested via instance 2; instance 2 drains after instance 1 releases", async () => {
       const g1 = runContentGate(db, { ...fast, instanceId: "pod-1" });
       const g2 = runContentGate(db, { ...fast, instanceId: "pod-2" });
@@ -244,7 +298,7 @@ d("run content gate (embedded postgres, synthetic canaries)", () => {
     });
 
     it("a crashed holder's expired lease is treated as drained only after ttl plus skew", async () => {
-      const g1 = runContentGate(db, { ...fast, instanceId: "dead-pod", tickMs: 60_000 });
+      const g1 = runContentGate(db, { ...fast, instanceId: "dead-pod", tickMs: 60_000, monotonicNow: () => 1_000 });
       const g2 = runContentGate(db, { ...fast, instanceId: "live-pod" });
       const s = await seedCompanyRuns(db);
       await g1.acquireLease({ ...ctx(s.company.id, s.runA.id), kind: "stream" });

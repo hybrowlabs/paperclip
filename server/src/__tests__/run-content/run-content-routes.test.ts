@@ -76,6 +76,7 @@ d("run content routes (real routers, embedded postgres, synthetic canaries)", ()
         status: "running",
         contextSnapshot: { issueId: issue!.id, executionWorkspaceId: ws!.id, note: canary },
         nextAction: `next ${canary}`,
+        nextEventSeq: 2,
         logStore: "local_file",
         logRef: `${s.company.id}/${run.id}.ndjson`,
       }).where(eq(heartbeatRuns.id, run.id));
@@ -192,6 +193,26 @@ d("run content routes (real routers, embedded postgres, synthetic canaries)", ()
     expect(entryB?.error ?? JSON.stringify(entryB)).toContain(CANARY_B);
     const wsOps = await http.get(`/api/execution-workspaces/${s.ws}/workspace-operations`);
     expect(wsOps.text).toContain(CANARY_B);
+    await gate.stop();
+  });
+
+  it("cancel stays available for a restricted run but returns metadata only, never the run row", async () => {
+    const s = await seedContent();
+    const c = s.company.id;
+    const http = request(app(admin([c])));
+    const gate = runContentGate(db);
+    await gate.activateRestriction({ companyId: c, runId: s.runA.id, actorId: "user:c", reasonCode: "x", authorizationRef: "SYN-C1" });
+    const res = await http.post(`/api/heartbeat-runs/${s.runA.id}/cancel`).send({});
+    expect(res.status, res.text).toBe(200);
+    expect(res.headers["cache-control"]).toContain("no-store");
+    expect(res.text).not.toContain(CANARY_A);
+    expect(res.body).toMatchObject({ id: s.runA.id, companyId: c, state: "restricted", contentWithheld: true });
+    expect(Object.keys(res.body).sort()).toEqual(["companyId", "contentWithheld", "createdAt", "id", "state", "status"]);
+    const row = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, s.runA.id)).then((r) => r[0]!);
+    expect(row.status).toBe("cancelled");
+    const ok = await request(app(admin([c]))).post(`/api/heartbeat-runs/${s.runB.id}/cancel`).send({});
+    expect(ok.status, ok.text).toBe(200);
+    expect(ok.body.id).toBe(s.runB.id);
     await gate.stop();
   });
 

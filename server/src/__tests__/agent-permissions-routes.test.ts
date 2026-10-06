@@ -85,6 +85,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   listTaskSessions: vi.fn(),
   resetRuntimeSession: vi.fn(),
   getRun: vi.fn(),
+  getRunMeta: vi.fn(),
   cancelRun: vi.fn(),
   cancelInvocationsForAgents: vi.fn(),
 }));
@@ -323,6 +324,7 @@ describe.sequential("agent permission routes", () => {
     mockHeartbeatService.listTaskSessions.mockReset();
     mockHeartbeatService.resetRuntimeSession.mockReset();
     mockHeartbeatService.getRun.mockReset();
+    mockHeartbeatService.getRunMeta.mockReset();
     mockHeartbeatService.cancelRun.mockReset();
     mockHeartbeatService.cancelInvocationsForAgents.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
@@ -2057,7 +2059,7 @@ describe.sequential("agent permission routes", () => {
   });
 
   it("rejects heartbeat cancellation outside the caller company scope", async () => {
-    mockHeartbeatService.getRun.mockResolvedValue({
+    mockHeartbeatService.getRunMeta.mockResolvedValue({
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "33333333-3333-4333-8333-333333333333",
       agentId,

@@ -6969,7 +6969,7 @@ export function agentRoutes(
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
     assertBoard(req);
     const runId = readHeartbeatRunId(req);
-    const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    const existing = await getAccessibleResource(req, res, heartbeat.getRunMeta(runId), "Heartbeat run not found");
     if (!existing) return;
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
@@ -6993,7 +6993,7 @@ export function agentRoutes(
       });
     }
 
-    res.json(run);
+    await serveRunControlResult({ db, req, res, run });
   });
 
   router.post(
@@ -7761,4 +7761,4 @@ export function agentRoutes(
 }
 import { listRunIdentityContexts } from "../services/run-identity.js";
 import { getRunContentGate } from "../services/run-content-gate.js";
-import { denyRestrictedMutation, runContentActorId, serveRunContent, serveRunList, serveWorkspaceOperation } from "./run-content-guard.js";
+import { denyRestrictedMutation, runContentActorId, serveRunContent, serveRunControlResult, serveRunList, serveWorkspaceOperation } from "./run-content-guard.js";

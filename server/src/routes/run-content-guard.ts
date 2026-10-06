@@ -117,6 +117,72 @@ export async function serveRunContent<T>(options: ServeOptions<T>): Promise<bool
   }
 }
 
+function controlTombstone(run: { id: string; companyId: string; status?: string | null; createdAt?: Date | string | null }) {
+  return {
+    id: run.id,
+    companyId: run.companyId,
+    createdAt: run.createdAt ?? null,
+    state: "restricted" as const,
+    contentWithheld: true as const,
+    status: run.status ?? null,
+  };
+}
+
+/**
+ * Response for a control action (cancel) that must stay available for a
+ * restricted run. A held run answers with metadata only, never the run row.
+ */
+export async function serveRunControlResult<T extends { id: string; companyId: string; status?: string | null; createdAt?: Date | string | null }>(options: {
+  db: Db;
+  req: Request;
+  res: Response;
+  run: T | null;
+  purpose?: RunContentPurpose;
+  gate?: RunContentGate;
+}): Promise<boolean> {
+  const { run, res } = options;
+  if (!run) {
+    res.json(run);
+    return true;
+  }
+  const gate = options.gate ?? getRunContentGate(options.db);
+  let lease: RunContentLease;
+  try {
+    lease = await gate.acquireLease({
+      companyId: run.companyId,
+      runId: run.id,
+      actorId: runContentActorId(options.req),
+      routePurpose: options.purpose ?? "read_run",
+      kind: "http_read",
+    });
+  } catch (error) {
+    if (!(error instanceof RunContentDeniedError)) throw error;
+    res.set("Cache-Control", "no-store");
+    res.json(controlTombstone(run));
+    return false;
+  }
+  let emitted = false;
+  try {
+    await lease.checkpoint();
+    lease.emit(() => {
+      emitted = true;
+      if (lease.decision === "forensic") res.set("Cache-Control", "no-store");
+      res.json(run);
+    });
+    await whenResponseDone(res, lease.signal);
+    return true;
+  } catch (error) {
+    if (error instanceof RunContentDeniedError && !emitted) {
+      res.set("Cache-Control", "no-store");
+      res.json(controlTombstone(run));
+      return false;
+    }
+    throw error;
+  } finally {
+    await lease.release(emitted ? "complete" : "not_emitted");
+  }
+}
+
 export type RunListMeta = { id: string; createdAt: Date | string | null };
 
 export function runTombstoneEntry(companyId: string, meta: RunListMeta) {

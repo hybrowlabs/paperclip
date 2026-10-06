@@ -60,7 +60,7 @@ const AUDITED_ROUTES: Record<string, Classification> = {
   "GET /issues/:id/runs": { kind: "gated", via: "serveRunList" },
   "GET /heartbeat-runs/:runId/issues": { kind: "gated", via: "serveRunContent" },
   "GET /companies/:companyId/tools/runs/:runId/decisions": { kind: "gated", via: "serveRunContent" },
-  "POST /heartbeat-runs/:runId/cancel": { kind: "not_run_content", reason: "control action; response is the run row but cancel must stay available during an incident" },
+  "POST /heartbeat-runs/:runId/cancel": { kind: "gated", via: "serveRunControlResult" },
   "POST /heartbeat-runs/:runId/watchdog-decisions": { kind: "not_run_content", reason: "writes an operator decision; returns the decision row only" },
   "POST /heartbeat-runs/:runId/runtime-requests/:requestId/resolve": { kind: "not_run_content", reason: "operator answer to a live runtime request; returns accepted/commandId" },
   "GET /routines/:id/runs": { kind: "not_run_content", reason: "routine run history, not heartbeat run content" },

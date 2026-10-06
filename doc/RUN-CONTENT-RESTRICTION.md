@@ -39,6 +39,12 @@ time. It does not touch any other run.
    its first emission and at each chunk or page boundary (`checkpoint()`), and
    `emit()` refuses to write once the lease is revoked, released, or past its
    local deadline (`ttl - clock skew`, measured on a monotonic clock).
+   Each lease also arms a timer at its local deadline that aborts the lease
+   signal, so a response that is already flushing is cut off without waiting for
+   the next `emit()` or `checkpoint()`. A successful renewal re-arms the timer.
+   If lease maintenance (the renewal tick) fails, for example because the
+   database is unreachable, every held lease and the company watchers are fenced
+   at once rather than left to run until their deadline.
 3. Activation waits until every revoked lease has been **acknowledged**
    (released by its holder), reaped as expired (past `ttl + skew`, i.e. the holder
    cannot still be writing), or reaped because the holder restarted.
@@ -110,6 +116,13 @@ Tuning environment variables: `PAPERCLIP_INSTANCE_ID` (stable per pod),
   custodian-controlled procedure, not an API fallback.
 
 ## Known limits (be explicit)
+
+* Activation must only be requested when every instance runs in enforcing mode.
+  An instance started in bypass mode creates no leases, so the barrier cannot
+  see or drain its readers.
+* `POST /heartbeat-runs/:runId/cancel` stays available for a restricted run and
+  returns a metadata-only body (`id`, `companyId`, `createdAt`, `state`,
+  `contentWithheld`, `status`) with `Cache-Control: no-store`, never the run row.
 
 * Bytes served before activation are not recalled.
 * Sentry, exports, backups, and S3 objects are outside the server's control.

@@ -159,6 +159,7 @@ type LocalLease = {
   released: boolean;
   controller: AbortController;
   kind: RunContentLeaseKind;
+  deadlineTimer: NodeJS.Timeout | null;
 };
 
 type LocalWatcher = {
@@ -396,15 +397,48 @@ export function runContentGate(db: Db, options: RunContentGateOptions = {}) {
     timer.unref?.();
   }
 
+  function clearDeadlineTimer(lease: LocalLease) {
+    if (lease.deadlineTimer) clearTimeout(lease.deadlineTimer);
+    lease.deadlineTimer = null;
+  }
+
   function fence(lease: LocalLease, reason: RunContentDenyReason) {
+    clearDeadlineTimer(lease);
     if (lease.fenced) return;
     lease.fenced = reason;
     lease.controller.abort(new RunContentDeniedError(reason));
   }
 
+  function armDeadlineTimer(lease: LocalLease) {
+    clearDeadlineTimer(lease);
+    if (lease.id.startsWith("bypass:") || lease.released || lease.fenced || stopped) return;
+    const delay = Math.max(0, lease.deadlineMono - mono());
+    lease.deadlineTimer = setTimeout(() => {
+      lease.deadlineTimer = null;
+      if (lease.released || lease.fenced) return;
+      if (mono() < lease.deadlineMono) return armDeadlineTimer(lease);
+      fence(lease, "lease_expired");
+      void ackRelease(lease, "revoked_ack");
+    }, delay);
+    lease.deadlineTimer.unref?.();
+  }
+
+  function fenceAllHeld(reason: RunContentDenyReason) {
+    for (const lease of local.values()) {
+      if (lease.released || lease.id.startsWith("bypass:")) continue;
+      fence(lease, reason);
+    }
+    for (const watcher of watchers.values()) {
+      if (watcher.closed) continue;
+      watcher.restricted = new Set(["*"]);
+      watcher.deadlineMono = -Infinity;
+    }
+  }
+
   async function ackRelease(lease: LocalLease, reason: string) {
     if (lease.released) return;
     lease.released = true;
+    clearDeadlineTimer(lease);
     local.delete(lease.id);
     await dbx
       .execute(sql`update run_content_leases set released_at = now(), release_reason = ${reason} where id = ${lease.id} and released_at is null`)
@@ -434,6 +468,7 @@ export function runContentGate(db: Db, options: RunContentGateOptions = {}) {
           if (lease.kind === "company_watch" || lease.id.startsWith("bypass:")) continue;
           if (renewedIds.has(lease.id)) {
             lease.deadlineMono = started + leaseTtlMs - clockSkewMs;
+            armDeadlineTimer(lease);
           } else {
             fence(lease, "lease_revoked");
           }
@@ -474,7 +509,8 @@ export function runContentGate(db: Db, options: RunContentGateOptions = {}) {
         watcher.deadlineMono = started + leaseTtlMs - clockSkewMs;
       }
     } catch (error) {
-      logger.warn({ err: error }, "run content lease maintenance failed; holders will lapse fail-closed");
+      logger.warn({ err: error }, "run content lease maintenance failed; fencing all held leases");
+      fenceAllHeld("lease_error");
     } finally {
       ticking = false;
     }
@@ -509,8 +545,10 @@ export function runContentGate(db: Db, options: RunContentGateOptions = {}) {
       released: false,
       controller,
       kind: row.kind,
+      deadlineTimer: null,
     };
     local.set(row.id, state);
+    armDeadlineTimer(state);
     ensureTicker();
 
     function assertLive(): void {
@@ -789,6 +827,7 @@ export function runContentGate(db: Db, options: RunContentGateOptions = {}) {
     stopped = true;
     if (timer) clearInterval(timer);
     timer = null;
+    for (const lease of local.values()) clearDeadlineTimer(lease);
     await dbx
       .execute(sql`
         update run_content_leases
