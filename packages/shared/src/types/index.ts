@@ -665,6 +665,8 @@ export type {
   IssueSubtreeDiagnosticsResponse,
   IssueBlockerAttention,
   IssueBlockerAttentionIssueSummary,
+  IssueBlockerAttentionCycle,
+  IssueBlockerAttentionCycleEdge,
   IssueBlockerAttentionReason,
   IssueBlockerAttentionState,
   IssueReviewAttention,

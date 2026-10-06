@@ -180,6 +180,62 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("never reports the blocked issue itself as its terminal blocker when no edges remain", async () => {
+    const { companyId, agentId } = await createCompany("PBS");
+    const issueId = await insertIssue({ companyId, identifier: "PBS-1", title: "Orphan hold", status: "blocked", assigneeAgentId: agentId });
+
+    const issue = (await svc.list(companyId, { status: "blocked" })).find((row) => row.id === issueId);
+
+    expect(issue?.blockerAttention).toMatchObject({ state: "needs_attention", unresolvedBlockerCount: 0 });
+    expect(issue?.blockerAttention?.terminalBlockerIssueId).toBeNull();
+    expect(issue?.blockerAttention?.terminalBlocker).toBeNull();
+  });
+
+  it("names the cycle edge and the ancestor it came through instead of the issue itself", async () => {
+    const { companyId, agentId } = await createCompany("PBY");
+    const grandparentId = await insertIssue({ companyId, identifier: "PBY-1", title: "Batch", status: "blocked", assigneeAgentId: agentId });
+    const childId = await insertIssue({ companyId, identifier: "PBY-2", title: "Apply", status: "blocked", parentId: grandparentId, assigneeAgentId: agentId });
+    const recheckId = await insertIssue({ companyId, identifier: "PBY-3", title: "Re-check", status: "blocked", assigneeAgentId: agentId });
+    await block({ companyId, blockerIssueId: recheckId, blockedIssueId: grandparentId });
+    await block({ companyId, blockerIssueId: childId, blockedIssueId: recheckId });
+
+    const child = (await svc.list(companyId, { status: "blocked" })).find((row) => row.id === childId);
+    const attention = child?.blockerAttention;
+
+    expect(attention?.unresolvedBlockerCount).toBe(0);
+    expect(attention?.terminalBlockerIssueId).toBe(recheckId);
+    expect(attention?.terminalBlockerIssueId).not.toBe(childId);
+    expect(attention?.terminalBlocker).toMatchObject({ id: recheckId, identifier: "PBY-3" });
+    expect(attention?.cycle).toMatchObject({
+      edges: [
+        { issueId: childId, targetIssueId: grandparentId, via: "parent" },
+        { issueId: grandparentId, targetIssueId: recheckId, via: "blocked_by" },
+        { issueId: recheckId, targetIssueId: childId, via: "blocked_by" },
+      ],
+      viaAncestor: { id: grandparentId, identifier: "PBY-1" },
+    });
+    expect(attention?.cycle?.path.map((node) => node.id)).toEqual([childId, grandparentId, recheckId, childId]);
+  });
+
+  it("reports a plain blocked-by cycle with its edges and no ancestor", async () => {
+    const { companyId, agentId } = await createCompany("PBZ");
+    const firstId = await insertIssue({ companyId, identifier: "PBZ-1", title: "First", status: "blocked", assigneeAgentId: agentId });
+    const secondId = await insertIssue({ companyId, identifier: "PBZ-2", title: "Second", status: "blocked", assigneeAgentId: agentId });
+    await block({ companyId, blockerIssueId: secondId, blockedIssueId: firstId });
+    await block({ companyId, blockerIssueId: firstId, blockedIssueId: secondId });
+
+    const first = (await svc.list(companyId, { status: "blocked" })).find((row) => row.id === firstId);
+
+    expect(first?.blockerAttention?.terminalBlockerIssueId).toBe(secondId);
+    expect(first?.blockerAttention?.cycle).toMatchObject({
+      edges: [
+        { issueId: firstId, targetIssueId: secondId, via: "blocked_by" },
+        { issueId: secondId, targetIssueId: firstId, via: "blocked_by" },
+      ],
+      viaAncestor: null,
+    });
+  });
+
   it("classifies an assigned backlog blocker leaf without a waiting path as attention-needed", async () => {
     const { companyId, agentId } = await createCompany("PBB");
     const parentId = await insertIssue({ companyId, identifier: "PBB-1", title: "Parent", status: "blocked" });

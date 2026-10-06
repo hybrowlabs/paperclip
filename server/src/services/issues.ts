@@ -84,6 +84,7 @@ import type {
   IssueCommentMetadata,
   IssueCommentPresentation,
   IssueBlockerAttention,
+  IssueBlockerAttentionIssueSummary,
   IssueReviewAttention,
   IssueReviewAttentionPath,
   IssueBlockedInboxAttention,
@@ -3535,6 +3536,14 @@ async function liveDescendantCountMapForIssues(
   return map;
 }
 
+/** The node whose edge closes the cycle back onto the blocked issue. */
+function cycleBlockerNode(
+  cycle: NonNullable<IssueBlockerAttention["cycle"]>,
+): IssueBlockerAttentionIssueSummary | null {
+  const closing = cycle.edges[cycle.edges.length - 1];
+  return cycle.path.find((node) => node.id === closing?.issueId) ?? null;
+}
+
 function createIssueBlockerAttention(
   input: Partial<IssueBlockerAttention> = {},
 ): IssueBlockerAttention {
@@ -3553,6 +3562,7 @@ function createIssueBlockerAttention(
     directBlockerIssueId: input.directBlockerIssueId ?? null,
     terminalBlockerIssueId: input.terminalBlockerIssueId ?? null,
     terminalBlocker: input.terminalBlocker ?? null,
+    cycle: input.cycle ?? null,
   };
 }
 
@@ -3693,6 +3703,132 @@ async function terminalExplicitBlockersByRoot(
   }
 
   return terminalByRoot;
+}
+
+type IssueBlockerAttentionCycleResult = NonNullable<IssueBlockerAttention["cycle"]>;
+
+/**
+ * Finds the shortest dependency cycle that returns to `rootId`, walking the
+ * graph dependency gating reads: unresolved blocked-by edges plus the parent
+ * chain. Returns null when the root sits on no cycle.
+ */
+async function findIssueDependencyCycle(
+  dbOrTx: any,
+  companyId: string,
+  rootId: string,
+  options: { includeParents?: boolean } = {},
+): Promise<IssueBlockerAttentionCycleResult | null> {
+  const nodes = new Map<string, IssueBlockerAttentionIssueSummary>();
+  const via = new Map<string, { from: string; kind: "blocked_by" | "parent" }>();
+  const closing: { from: string; kind: "blocked_by" | "parent" }[] = [];
+  const summaryOf = (row: { id: string; identifier: string | null; title: string }) => ({
+    id: row.id,
+    identifier: row.identifier,
+    title: row.title,
+  });
+  const [root] = await dbOrTx
+    .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, rootId)))
+    .limit(1);
+  if (!root) return null;
+  nodes.set(rootId, summaryOf(root));
+
+  let frontier = [rootId];
+  for (
+    let depth = 0;
+    frontier.length > 0 && closing.length === 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH;
+    depth += 1
+  ) {
+    const next: string[] = [];
+    const edges: Array<{
+      from: string;
+      to: string;
+      kind: "blocked_by" | "parent";
+      identifier: string | null;
+      title: string;
+    }> = [];
+    for (const chunk of chunkList(frontier, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+      const blockerRows: Array<{ from: string; id: string; identifier: string | null; title: string }> =
+        await dbOrTx
+          .select({
+            from: issueRelations.relatedIssueId,
+            id: issues.id,
+            identifier: issues.identifier,
+            title: issues.title,
+          })
+          .from(issueRelations)
+          .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+          .where(
+            and(
+              eq(issueRelations.companyId, companyId),
+              eq(issueRelations.type, "blocks"),
+              inArray(issueRelations.relatedIssueId, chunk),
+              eq(issues.companyId, companyId),
+              ne(issues.status, "done"),
+            ),
+          );
+      for (const row of blockerRows) {
+        edges.push({ from: row.from, to: row.id, kind: "blocked_by", identifier: row.identifier, title: row.title });
+      }
+      const childRows: Array<{ id: string; parentId: string | null }> = options.includeParents === false ? [] : await dbOrTx
+        .select({ id: issues.id, parentId: issues.parentId })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), inArray(issues.id, chunk)));
+      const parentIds = [
+        ...new Set(childRows.flatMap((row) => (row.parentId ? [row.parentId] : []))),
+      ];
+      const parentSummaries: Array<{ id: string; identifier: string | null; title: string }> =
+        parentIds.length === 0
+          ? []
+          : await dbOrTx
+              .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+              .from(issues)
+              .where(and(eq(issues.companyId, companyId), inArray(issues.id, parentIds)));
+      const parentSummaryById = new Map(parentSummaries.map((row) => [row.id, row]));
+      const parentRows = childRows.flatMap((row) => {
+        const parent = row.parentId ? parentSummaryById.get(row.parentId) : null;
+        return parent ? [{ from: row.id, ...parent }] : [];
+      });
+      for (const row of parentRows) {
+        edges.push({ from: row.from, to: row.id, kind: "parent", identifier: row.identifier, title: row.title });
+      }
+    }
+    for (const edge of edges) {
+      if (edge.to === rootId) {
+        closing.push({ from: edge.from, kind: edge.kind });
+        break;
+      }
+      if (nodes.has(edge.to)) continue;
+      nodes.set(edge.to, { id: edge.to, identifier: edge.identifier, title: edge.title });
+      via.set(edge.to, { from: edge.from, kind: edge.kind });
+      next.push(edge.to);
+    }
+    if (nodes.size > BLOCKER_ATTENTION_MAX_NODES) return null;
+    frontier = next;
+  }
+  if (closing.length === 0) return null;
+
+  const reversed: IssueBlockerAttentionCycleResult["edges"] = [
+    { issueId: closing[0]!.from, targetIssueId: rootId, via: closing[0]!.kind },
+  ];
+  let cursor = closing[0]!.from;
+  while (cursor !== rootId) {
+    const step = via.get(cursor);
+    if (!step) return null;
+    reversed.push({ issueId: step.from, targetIssueId: cursor, via: step.kind });
+    cursor = step.from;
+  }
+  const edges = reversed.reverse();
+  const path = [edges[0]!.issueId, ...edges.map((edge) => edge.targetIssueId)]
+    .map((id) => nodes.get(id))
+    .filter((node): node is IssueBlockerAttentionIssueSummary => Boolean(node));
+  const ancestorEdge = edges.find((edge) => edge.via === "parent");
+  return {
+    edges,
+    path,
+    viaAncestor: ancestorEdge ? (nodes.get(ancestorEdge.targetIssueId) ?? null) : null,
+  };
 }
 
 async function listIssueBlockerAttentionMap(
@@ -4302,12 +4438,16 @@ async function listIssueBlockerAttentionMap(
       );
     });
     if (topLevelEdges.length === 0) {
+      const cycle = await findIssueDependencyCycle(dbOrTx, companyId, root.id);
+      const cycleBlocker = cycle ? cycleBlockerNode(cycle) : null;
       attentionMap.set(
         root.id,
         createIssueBlockerAttention({
           state: "needs_attention",
           reason: "attention_required",
-          terminalBlockerIssueId: root.id,
+          terminalBlockerIssueId: cycleBlocker?.id ?? null,
+          terminalBlocker: cycleBlocker,
+          cycle,
         }),
       );
       continue;
@@ -4352,9 +4492,16 @@ async function listIssueBlockerAttentionMap(
         sampleEntry.result.sampleBlockerIdentifier)
       : (sampleEntry?.result.sampleBlockerIdentifier ??
         blockerSampleIdentifier(sampleNode));
-    const terminalBlockerIssueId =
+    let terminalBlockerIssueId =
       sampleEntry?.result.terminalBlockerIssueId ??
       issueIdForSample(sampledTerminalIdentifier);
+    let cycle: IssueBlockerAttention["cycle"] = null;
+    let cycleTerminal: IssueBlockerAttentionIssueSummary | null = null;
+    if (terminalBlockerIssueId === root.id) {
+      cycle = await findIssueDependencyCycle(dbOrTx, companyId, root.id);
+      cycleTerminal = cycle ? cycleBlockerNode(cycle) : null;
+      terminalBlockerIssueId = cycleTerminal?.id ?? null;
+    }
     const terminalBlockerNode = terminalBlockerIssueId
       ? (nodesById.get(terminalBlockerIssueId) ?? null)
       : null;
@@ -4408,7 +4555,8 @@ async function listIssueBlockerAttentionMap(
               identifier: terminalBlockerNode.identifier,
               title: terminalBlockerNode.title,
             }
-          : null,
+          : cycleTerminal,
+        cycle,
       }),
     );
   }
@@ -9033,6 +9181,13 @@ export function issueService(db: Db) {
       );
       return readiness.get(issueId) ?? createIssueDependencyReadiness(issueId);
     },
+
+    findDependencyCycle: async (
+      companyId: string,
+      issueId: string,
+      dbOrTx: any = db,
+      options: { includeParents?: boolean } = {},
+    ) => findIssueDependencyCycle(dbOrTx, companyId, issueId, options),
 
     listDependencyReadiness: async (
       companyId: string,
