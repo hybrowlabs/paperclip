@@ -2049,6 +2049,34 @@ describe("issue execution policy transitions", () => {
         });
       });
 
+      it("does not let the return assignee re-pend the stage onto themselves when they are a stage participant", () => {
+        const policy = makePolicy([
+          { type: "review", participants: [{ type: "agent", agentId: reviewerId }] },
+          {
+            type: "review",
+            participants: [
+              { type: "agent", agentId: checkerId },
+              { type: "agent", agentId: makerId },
+            ],
+          },
+          { type: "approval", participants: [{ type: "agent", agentId: approverId }] },
+        ]);
+        const result = applyIssueExecutionPolicyTransition({
+          issue: pendingIssue(policy, 1, checkerId, maker),
+          policy,
+          requestedAssigneePatch: { assigneeAgentId: makerId },
+          actor: { agentId: makerId },
+        });
+
+        expect(result.decision).toBeUndefined();
+        expect(result.patch).toMatchObject({ status: "in_review", assigneeAgentId: checkerId });
+        expect(result.patch.executionState).toMatchObject({
+          status: "pending",
+          currentParticipant: { agentId: checkerId },
+          returnAssignee: maker,
+        });
+      });
+
       it("lets the return assignee change returnAssignee by assigning a non-participant", () => {
         const policy = threeStagePolicy();
         const result = applyIssueExecutionPolicyTransition({

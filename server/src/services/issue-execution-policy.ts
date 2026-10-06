@@ -1051,7 +1051,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       // Routing repair, not a stage decision: either re-pend the stage on the
       // requested participant, or (for a non-participant) make that principal
       // the return assignee while the current participant keeps the stage.
-      const repairParticipant = stageHasParticipant(activeStage, explicitAssignee) ? explicitAssignee! : currentParticipant;
+      const explicitIsEligibleParticipant =
+        stageHasParticipant(activeStage, explicitAssignee) &&
+        !principalsEqual(explicitAssignee, existingState?.returnAssignee ?? null);
+      const repairParticipant = explicitIsEligibleParticipant ? explicitAssignee! : currentParticipant;
       const repairReturnAssignee = stageHasParticipant(activeStage, explicitAssignee)
         ? existingState?.returnAssignee ?? null
         : explicitAssignee;
