@@ -47,3 +47,11 @@ overrides:
   # Parsers and highlighters must share NodeProp IDs from one Lezer instance.
   # Mixed copies can interpret unrelated node metadata as highlighting tags.
   "@lezer/common": "^1.5.2"
+  # Trivy CRITICAL gate (HYBA-1777): proxy-addr 2.0.7 (CVE-2026-90711) and the
+  # esbuild Go binaries below 0.28.2 (CVE-2024-24790, CVE-2025-68121) have
+  # fixed releases. Scope esbuild to the legacy consumers (drizzle-kit,
+  # @esbuild-kit/core-utils, and the runner's vite@6).
+  "proxy-addr": ">=2.0.8"
+  "@esbuild-kit/core-utils>esbuild": "^0.28.2"
+  "drizzle-kit>esbuild": "^0.28.2"
+  "vite@6>esbuild": "^0.28.2"
