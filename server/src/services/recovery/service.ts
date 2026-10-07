@@ -492,6 +492,8 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "provider_tool_definition_invalid",
   "adapter_engine_unavailable",
+  "wake_payload_too_large",
+  "spawn_argument_too_large",
   "agent_not_invokable",
   "agent_not_found",
   "budget_blocked",
