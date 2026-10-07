@@ -15,6 +15,7 @@ import {
   fetchGitBundleIntoLocalRef,
   integrateImportedGitHead,
   isMissingGitPrerequisiteError,
+  readGitHeadState,
   readGitWorkspaceSnapshot as readRawSnapshot,
   disposeGitWorkspaceSnapshot,
   type ExpensiveWorkspaceGitInput,
@@ -26,6 +27,8 @@ import {
   runLocalGit,
   sanitizeGitRemoteUrl,
   setExpensiveWorkspaceGitExecutor,
+  WORKSPACE_PATH_UNUSABLE_CODE,
+  WorkspacePathUnusableError,
   withShallowGitWorkspaceClone,
 } from "./git-workspace-sync.js";
 
@@ -229,6 +232,120 @@ describe("git workspace sync", () => {
     expect(await git(selectedDir, ["rev-parse", "--is-inside-work-tree"])).toBe("true");
     expect(await readGitWorkspaceSnapshot(selectedDir)).toBeNull();
     expect((await readGitWorkspaceSnapshot(repo))?.headCommit).toBe(await git(repo, ["rev-parse", "HEAD"]));
+  });
+
+  describe("commitless (unborn HEAD) workspace", () => {
+    async function createCommitlessRepo(rootDir: string): Promise<string> {
+      const repo = path.join(rootDir, "repo");
+      await mkdir(repo, { recursive: true });
+      await git(repo, ["init"]);
+      await git(repo, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+      await writeFile(path.join(repo, "untracked.txt"), "untracked\n", "utf8");
+      return repo;
+    }
+
+    it("does not throw for a git repository with zero commits and falls back to directory sync", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-unborn-"));
+      cleanupDirs.push(rootDir);
+      const repo = await createCommitlessRepo(rootDir);
+
+      await expect(git(repo, ["rev-parse", "HEAD"])).rejects.toThrow(/ambiguous argument 'HEAD'/);
+      await expect(readGitWorkspaceSnapshot(repo)).resolves.toBeNull();
+    });
+
+    it("still honours .gitignore when the commitless workspace is read as a directory", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-unborn-ignore-"));
+      cleanupDirs.push(rootDir);
+      const repo = await createCommitlessRepo(rootDir);
+      await writeFile(path.join(repo, ".gitignore"), "ignored.log\n", "utf8");
+      await writeFile(path.join(repo, "ignored.log"), "x\n", "utf8");
+
+      const scan = await readReferencedSourceGitIgnoredPaths(repo);
+
+      expect(scan?.ignoredPaths).toContain("ignored.log");
+      expect(scan?.ignoredPaths).not.toContain("untracked.txt");
+    });
+
+    it("records the unborn state with a null revision and the branch name", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-unborn-state-"));
+      cleanupDirs.push(rootDir);
+      const repo = await createCommitlessRepo(rootDir);
+
+      await expect(readGitHeadState(repo)).resolves.toEqual({
+        state: "unborn",
+        headCommit: null,
+        branchName: "main",
+      });
+    });
+
+    it("leaves the commitless repository untouched", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-unborn-readonly-"));
+      cleanupDirs.push(rootDir);
+      const repo = await createCommitlessRepo(rootDir);
+
+      await readGitWorkspaceSnapshot(repo);
+
+      await expect(git(repo, ["rev-parse", "--verify", "--quiet", "HEAD"])).rejects.toThrow();
+      expect(await git(repo, ["count-objects"])).toMatch(/^0 objects/);
+      expect(await git(repo, ["status", "--porcelain"])).toBe("?? untracked.txt");
+    });
+
+    it("still reports the real HEAD sha and branch for a repository with commits", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-born-state-"));
+      cleanupDirs.push(rootDir);
+      const repo = await createRepo(rootDir);
+      const head = await git(repo, ["rev-parse", "HEAD"]);
+
+      await expect(readGitHeadState(repo)).resolves.toEqual({ state: "commit", headCommit: head, branchName: "main" });
+      expect((await readGitWorkspaceSnapshot(repo))?.headCommit).toBe(head);
+    });
+
+    it("reports a detached HEAD as a commit with a null branch", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-detached-state-"));
+      cleanupDirs.push(rootDir);
+      const repo = await createRepo(rootDir);
+      const head = await git(repo, ["rev-parse", "HEAD"]);
+      await git(repo, ["checkout", "--detach"]);
+
+      await expect(readGitHeadState(repo)).resolves.toEqual({ state: "commit", headCommit: head, branchName: null });
+      expect((await readGitWorkspaceSnapshot(repo))?.branchName).toBeNull();
+    });
+  });
+
+  describe("unusable workspace path", () => {
+    it("fails a missing path with a specific non-generic code that names the path", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-missing-"));
+      cleanupDirs.push(rootDir);
+      const missing = path.join(rootDir, "does-not-exist");
+
+      const error = await readGitWorkspaceSnapshot(missing).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(WorkspacePathUnusableError);
+      expect((error as WorkspacePathUnusableError).code).toBe(WORKSPACE_PATH_UNUSABLE_CODE);
+      expect(WORKSPACE_PATH_UNUSABLE_CODE).toBe("workspace_path_unusable");
+      expect((error as Error).message).toContain(missing);
+    });
+
+    it("fails a path that is a file, not a directory, with the same code", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-notdir-"));
+      cleanupDirs.push(rootDir);
+      const file = path.join(rootDir, "a-file");
+      await writeFile(file, "x", "utf8");
+
+      await expect(readGitHeadState(file)).rejects.toMatchObject({ code: WORKSPACE_PATH_UNUSABLE_CODE });
+      await expect(readGitHeadState(file)).rejects.toThrow(/is not a directory/);
+      await expect(readGitWorkspaceSnapshot(file)).rejects.toMatchObject({ code: WORKSPACE_PATH_UNUSABLE_CODE });
+    });
+
+    it("keeps a plain existing non-git directory on the directory-sync path", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-plain-"));
+      cleanupDirs.push(rootDir);
+      const plain = path.join(rootDir, "plain");
+      await mkdir(plain);
+
+      await expect(readGitHeadState(plain)).resolves.toBeNull();
+      await expect(readGitWorkspaceSnapshot(plain)).resolves.toBeNull();
+    });
   });
 
   it("creates a shallow standalone clone from the local HEAD snapshot", async () => {

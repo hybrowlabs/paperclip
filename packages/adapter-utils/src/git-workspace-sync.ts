@@ -150,6 +150,100 @@ async function runExpensiveWorkspaceGit(
   return await runLocalGit(localDir, args, options);
 }
 
+/**
+ * Typed code for a workspace path that cannot be used at all: it does not
+ * exist or is not a directory. No retry can repair it, so the heartbeat treats
+ * it as a non-retryable preflight failure instead of a generic `adapter_failed`.
+ */
+export const WORKSPACE_PATH_UNUSABLE_CODE = "workspace_path_unusable";
+
+export class WorkspacePathUnusableError extends Error {
+  code = WORKSPACE_PATH_UNUSABLE_CODE;
+  workspacePath: string;
+  reason: "missing" | "not_a_directory" | "inaccessible";
+
+  constructor(input: { workspacePath: string; reason: "missing" | "not_a_directory" | "inaccessible" }) {
+    const detail =
+      input.reason === "missing"
+        ? "does not exist"
+        : input.reason === "not_a_directory"
+          ? "is not a directory"
+          : "cannot be accessed";
+    super(
+      `Workspace path "${input.workspacePath}" ${detail}. Nothing was started and this run will not be retried automatically; ` +
+        "restore or reconfigure the workspace path.",
+    );
+    this.name = "WorkspacePathUnusableError";
+    this.workspacePath = input.workspacePath;
+    this.reason = input.reason;
+  }
+}
+
+async function assertWorkspaceDirectoryUsable(localDir: string): Promise<void> {
+  let stat;
+  try {
+    stat = await fs.stat(localDir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    throw new WorkspacePathUnusableError({
+      workspacePath: localDir,
+      reason: code === "ENOENT" || code === "ENOTDIR" ? "missing" : "inaccessible",
+    });
+  }
+  if (!stat.isDirectory()) {
+    throw new WorkspacePathUnusableError({ workspacePath: localDir, reason: "not_a_directory" });
+  }
+}
+
+export type GitHeadState =
+  | { state: "commit"; headCommit: string; branchName: string | null }
+  | { state: "unborn"; headCommit: null; branchName: string | null };
+
+/**
+ * Non-throwing HEAD probe. Returns null when `localDir` is not inside a Git
+ * work tree, `unborn` (null revision plus the branch HEAD points at) for a
+ * repository with zero commits, and the real HEAD sha otherwise. A missing or
+ * non-directory path throws {@link WorkspacePathUnusableError}; any other Git
+ * failure (timeout, corruption) still throws.
+ */
+export async function readGitHeadState(localDir: string): Promise<GitHeadState | null> {
+  await assertWorkspaceDirectoryUsable(localDir);
+  let insideWorkTree: GitCommandResult;
+  try {
+    insideWorkTree = await runLocalGit(localDir, ["rev-parse", "--is-inside-work-tree"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+  } catch (error) {
+    if (isNotAGitRepositoryError(error)) return null;
+    throw error;
+  }
+  if (insideWorkTree.stdout.trim() !== "true") return null;
+
+  const [headResult, branchResult] = await Promise.all([
+    runLocalGit(localDir, ["rev-parse", "--verify", "--quiet", "HEAD"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    }).catch((error: unknown) => {
+      const failure = error as { code?: unknown; stderr?: unknown } | null;
+      if (failure?.code === 1 && String(failure.stderr ?? "").trim() === "") return null;
+      throw error;
+    }),
+    runLocalGit(localDir, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    }).catch((error: unknown) => {
+      const failure = error as { code?: unknown; stderr?: unknown } | null;
+      if (failure?.code === 1 && String(failure.stderr ?? "").trim() === "") return null;
+      throw error;
+    }),
+  ]);
+  const branchName = branchResult?.stdout.trim() || null;
+  const headCommit = headResult?.stdout.trim() ?? "";
+  if (!headCommit) return { state: "unborn", headCommit: null, branchName };
+  return { state: "commit", headCommit, branchName };
+}
+
 const ownedSnapshots = new WeakMap<GitWorkspaceSnapshot, string>();
 
 export async function disposeGitWorkspaceSnapshot(snapshot: GitWorkspaceSnapshot | null): Promise<void> {
@@ -168,6 +262,7 @@ export function workspaceSnapshotTimeoutMs(): number {
 }
 
 export async function readGitWorkspaceSnapshot(localDir: string, includeRepositories = true, options: { signal?: AbortSignal } = {}): Promise<GitWorkspaceSnapshot | null> {
+  await assertWorkspaceDirectoryUsable(localDir);
   const repositories: NonNullable<GitWorkspaceSnapshot["repositories"]> = [];
   // Only repository discovery may report an ordinary directory. A failed
   // snapshot of a confirmed repository must never fall back to directory sync.
@@ -197,6 +292,12 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     fs.realpath(toplevelResult.stdout.trim()),
   ]);
   if (workspacePath !== repositoryPath) return null;
+
+  // A repository with zero commits has no revision to clone or diff against.
+  // It is a normal state, not a failure: report no Git snapshot so the caller
+  // syncs the directory as plain files (the same path a non-Git folder takes).
+  const headState = await readGitHeadState(localDir);
+  if (!headState || headState.state === "unborn") return null;
 
   const writer = await createWorkspaceManifest();
   const controller = new AbortController();
