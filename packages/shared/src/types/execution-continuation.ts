@@ -26,6 +26,8 @@ export interface ExecutionContinuationEnvelope {
     updatedAt: string;
     deleted: boolean;
     sourceTrust: unknown;
+    /** Set when the body was shortened to fit the wake payload budget. */
+    bodyTruncated?: boolean;
   }>;
   /** Only direct human resolutions, projected from server-owned resolver columns. */
   humanResponses?: Array<{
@@ -59,8 +61,18 @@ export interface ExecutionContinuationEnvelope {
     result: unknown;
   }>;
   unresolvedInteractionIds: string[];
+  /** Present only when older comments were dropped to fit the wake payload budget. */
+  truncation?: {
+    reason: "wake_payload_budget";
+    budgetBytes: number;
+    totalMessageCount: number;
+    includedMessageCount: number;
+    droppedMessageCount: number;
+    bodyTruncatedMessageCount: number;
+    readHint: string;
+  };
   coverage: {
-    kind: "full_task_history" | "task_history_delta";
+    kind: "full_task_history" | "task_history_delta" | "task_history_truncated";
     baseRunId?: string;
     throughCommentId: string | null;
     summaryThroughCommentId: null;

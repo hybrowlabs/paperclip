@@ -21,6 +21,7 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
+  PAPERCLIP_WAKE_PAYLOAD_BUDGET_BYTES,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -4034,5 +4035,206 @@ describe("wake continuation comment ownership", () => {
       executionContinuation: { ...continuation([]), objective },
     }, { suppressIssueDescription: true });
     expect(legacy).toContain(`"objective":"${objective}"`);
+  });
+});
+
+describe("wake payload size budget (spawn E2BIG regression)", () => {
+  const ISSUE_ID = "2cede663-4bf0-4402-809f-68e1095846ca";
+  const COMPANY_ID = "f2e4dcc4-22be-408b-8a1c-f55e863c9125";
+
+  function syntheticThreadWake(input: {
+    commentCount: number;
+    bodyBytes: number;
+    originIndexes?: number[];
+    extra?: Record<string, unknown>;
+  }) {
+    const messages = Array.from({ length: input.commentCount }, (_, index) => ({
+      id: `comment-${String(index).padStart(4, "0")}`,
+      authorType: "user",
+      authorId: "user-1",
+      body: `m${index}:`.padEnd(input.bodyBytes, "x"),
+      createdAt: new Date(Date.UTC(2026, 9, 6, 0, 0, index)).toISOString(),
+      updatedAt: new Date(Date.UTC(2026, 9, 6, 0, 0, index)).toISOString(),
+      deleted: false,
+      sourceTrust: null,
+    }));
+    const originIds = (input.originIndexes ?? [input.commentCount - 1]).map(
+      (index) => messages[index]!.id,
+    );
+    return {
+      reason: "issue_commented",
+      issue: {
+        id: ISSUE_ID,
+        identifier: "HYBA-1386",
+        title: "Oversized thread",
+        status: "in_progress",
+        workMode: "standard",
+        priority: "high",
+      },
+      executionContinuation: {
+        version: 1,
+        companyId: COMPANY_ID,
+        issueId: ISSUE_ID,
+        trigger: { reason: "issue_commented", interactionId: null, sourceRunId: null },
+        originCommentIds: originIds,
+        objective: "Answer the latest comment",
+        messages,
+        interactionOutcomes: [],
+        completedWork: null,
+        unresolvedInteractionIds: [],
+        coverage: {
+          kind: "full_task_history",
+          throughCommentId: messages.at(-1)!.id,
+          summaryThroughCommentId: null,
+        },
+        ...(input.extra ?? {}),
+      },
+    };
+  }
+
+  it("keeps a 150 KB thread under the 64 KiB budget and still delivers trigger comments", () => {
+    const wake = syntheticThreadWake({ commentCount: 150, bodyBytes: 1000, originIndexes: [3, 149] });
+    expect(Buffer.byteLength(JSON.stringify(wake))).toBeGreaterThan(150_000);
+
+    const json = stringifyPaperclipWakePayload(wake);
+    expect(json).not.toBeNull();
+    expect(Buffer.byteLength(json!)).toBeLessThanOrEqual(PAPERCLIP_WAKE_PAYLOAD_BUDGET_BYTES);
+    expect(PAPERCLIP_WAKE_PAYLOAD_BUDGET_BYTES).toBe(64 * 1024);
+
+    const parsed = JSON.parse(json!);
+    const ids = parsed.executionContinuation.messages.map((m: { id: string }) => m.id);
+    expect(ids).toContain("comment-0149");
+    expect(ids).toContain("comment-0003");
+    expect(ids).toEqual([...ids].sort());
+    expect(parsed.issue.identifier).toBe("HYBA-1386");
+    expect(parsed.executionContinuation.truncation).toMatchObject({
+      totalMessageCount: 150,
+      includedMessageCount: ids.length,
+      droppedMessageCount: 150 - ids.length,
+    });
+    expect(parsed.executionContinuation.truncation.droppedMessageCount).toBeGreaterThan(0);
+    expect(parsed.executionContinuation.truncation.readHint).toContain(
+      `/api/issues/${ISSUE_ID}/comments`,
+    );
+    expect(parsed.executionContinuation.coverage.kind).toBe("task_history_truncated");
+  });
+
+  it("is deterministic and stable across an env/JSON round trip", () => {
+    const wake = syntheticThreadWake({ commentCount: 150, bodyBytes: 1000 });
+    const first = stringifyPaperclipWakePayload(wake);
+    expect(stringifyPaperclipWakePayload(wake)).toBe(first);
+    const second = stringifyPaperclipWakePayload(JSON.parse(first!));
+    expect(JSON.parse(second!).executionContinuation.truncation).toEqual(
+      JSON.parse(first!).executionContinuation.truncation,
+    );
+  });
+
+  it("leaves a thread that already fits untouched", () => {
+    const wake = syntheticThreadWake({ commentCount: 10, bodyBytes: 500 });
+    const parsed = JSON.parse(stringifyPaperclipWakePayload(wake)!);
+    expect(parsed.executionContinuation.messages).toHaveLength(10);
+    expect(parsed.executionContinuation.truncation).toBeUndefined();
+    expect(parsed.executionContinuation.coverage.kind).toBe("full_task_history");
+  });
+
+  it("states the dropped-comment count and where to read them in the rendered prompt", () => {
+    const wake = syntheticThreadWake({ commentCount: 150, bodyBytes: 1000 });
+    const prompt = renderPaperclipWakePrompt(wake);
+    const dropped = JSON.parse(stringifyPaperclipWakePayload(wake)!).executionContinuation
+      .truncation.droppedMessageCount;
+    expect(prompt).toContain(`${dropped} older comment`);
+    expect(prompt).toContain(`/api/issues/${ISSUE_ID}/comments`);
+    expect(prompt).not.toContain("complete authorized task history");
+    expect(prompt).toContain("comment-0149");
+  });
+
+  it("fails with a specific error naming the issue and size when the payload cannot fit", () => {
+    const wake = syntheticThreadWake({
+      commentCount: 3,
+      bodyBytes: 200,
+      extra: {
+        completedActions: Array.from({ length: 10 }, (_, index) => ({
+          runId: `run-${index}`,
+          receiptId: `receipt-${index}`,
+          operationId: `op-${index}`,
+          result: "r".repeat(20_000),
+        })),
+      },
+    });
+    let caught: (Error & { code?: string; issueIdentifier?: string; measuredBytes?: number }) | null = null;
+    try {
+      stringifyPaperclipWakePayload(wake);
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.code).toBe("wake_payload_too_large");
+    expect(caught!.message).toContain("HYBA-1386");
+    expect(caught!.message).not.toMatch(/E2BIG/);
+    expect(caught!.measuredBytes).toBeGreaterThan(PAPERCLIP_WAKE_PAYLOAD_BUDGET_BYTES);
+    expect(caught!.message).toContain(String(caught!.measuredBytes));
+  });
+
+  it("spawns a child with a 150 KB synthetic thread and the child receives the trigger comment", async () => {
+    const wake = syntheticThreadWake({ commentCount: 150, bodyBytes: 1000, originIndexes: [149] });
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        "const w = JSON.parse(process.env.PAPERCLIP_WAKE_PAYLOAD_JSON); process.stdout.write(w.executionContinuation.messages.map((m) => m.id).join(','));",
+      ],
+      {
+        cwd: process.cwd(),
+        env: { PAPERCLIP_WAKE_PAYLOAD_JSON: stringifyPaperclipWakePayload(wake)! },
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.split(",")).toContain("comment-0149");
+  });
+
+  it("rejects an oversized env var before spawning, with an actionable error instead of E2BIG", async () => {
+    let spawned = false;
+    let caught: (Error & { code?: string }) | null = null;
+    try {
+      await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "process.stdout.write('ran')"],
+        {
+          cwd: process.cwd(),
+          env: { PAPERCLIP_TASK_ID: "task-1386", PAPERCLIP_WAKE_PAYLOAD_JSON: "x".repeat(150 * 1024) },
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+          onSpawn: async () => {
+            spawned = true;
+          },
+        },
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+    expect(spawned).toBe(false);
+    expect(caught).not.toBeNull();
+    expect(caught!.code).toBe("spawn_argument_too_large");
+    expect(caught!.message).toContain("PAPERCLIP_WAKE_PAYLOAD_JSON");
+    expect(caught!.message).toContain("task-1386");
+    expect(caught!.message).not.toMatch(/E2BIG/);
+  });
+
+  it("rejects an oversized argument before spawning", async () => {
+    await expect(
+      runChildProcess(randomUUID(), process.execPath, ["-e", "x", "y".repeat(140 * 1024)], {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+      }),
+    ).rejects.toMatchObject({ code: "spawn_argument_too_large" });
   });
 });
