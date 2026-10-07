@@ -865,6 +865,7 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
   "chat_failed_run_retry_not_authorized",
   "wake_payload_too_large",
   "spawn_argument_too_large",
+  "workspace_path_unusable",
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
 ]);
 // Error codes that mark a pre-dispatch setup failure. The adapter process never
@@ -880,6 +881,7 @@ const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
 const OVERSIZED_SPAWN_PAYLOAD_FAILURE_CODES = new Set<string>([
   "wake_payload_too_large",
   "spawn_argument_too_large",
+  "workspace_path_unusable",
 ]);
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
