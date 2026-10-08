@@ -5783,6 +5783,16 @@ export function shouldResetTaskSessionForWake(
   return false;
 }
 
+const EXECUTION_STAGE_WAKE_REASONS = new Set([
+  "execution_review_requested",
+  "execution_approval_requested",
+  "execution_changes_requested",
+]);
+
+export function isExecutionStageWakeReason(reason: string | null | undefined) {
+  return typeof reason === "string" && EXECUTION_STAGE_WAKE_REASONS.has(reason);
+}
+
 function shouldRequireIssueCommentForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -10643,6 +10653,113 @@ export function heartbeatService(
       issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
       idempotencyKey: `queued-comment-${interrupted ? "interrupt" : "delivery"}:${queueId}`,
     }, queueId);
+  }
+
+  /**
+   * Re-admit execution-stage wakes that were parked behind a stopped run's
+   * cleanup. Each retry goes through normal admission again, so recovery
+   * holds, pauses and assignment guards still apply.
+   */
+  async function resumeExecutionStageWaits(scope?: { companyId: string; issueId: string }) {
+    if ((await getSchedulingSuppression()).suppressed) return { resumed: 0 };
+    const parkedStageWait = and(
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      inArray(agentWakeupRequests.reason, [...EXECUTION_STAGE_WAKE_REASONS]),
+      sql`${agentWakeupRequests.payload}->'executionWait' is not null`,
+      sql`${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId' is null`,
+    );
+    // Pick issues, not wakes, so many parked wakes on one still-held issue
+    // cannot fill the batch. Held issues are rotated to the back below.
+    const issueIdSql = sql<string>`${agentWakeupRequests.payload}->>'issueId'`;
+    const candidates = await db.select({ companyId: agentWakeupRequests.companyId, issueId: issueIdSql })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${issueIdSql}`))
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(
+        parkedStageWait,
+        scope ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
+        scope ? sql`${issueIdSql} = ${scope.issueId}` : undefined,
+      ))
+      .groupBy(agentWakeupRequests.companyId, issueIdSql)
+      .orderBy(sql`min(${agentWakeupRequests.updatedAt}) asc`)
+      .limit(50);
+    let resumed = 0;
+    for (const candidate of candidates) {
+      const waits = await db.select({ wake: agentWakeupRequests, issue: issues })
+        .from(agentWakeupRequests)
+        .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = ${issueIdSql}`))
+        .where(and(
+          parkedStageWait,
+          eq(agentWakeupRequests.companyId, candidate.companyId),
+          sql`${issueIdSql} = ${candidate.issueId}`,
+        ))
+        .orderBy(asc(agentWakeupRequests.requestedAt)).limit(50);
+      const live: typeof waits = [];
+      for (const entry of waits) {
+        const { wake, issue } = entry;
+        const wakeStageId = readNonEmptyString(parseObject(parseObject(wake.payload).executionStage).stageId);
+        const issueStageId = readNonEmptyString(parseObject(issue.executionState).currentStageId);
+        const stillCurrent = issue.assigneeAgentId === wake.agentId && !issue.assigneeUserId &&
+          !["done", "cancelled"].includes(issue.status) &&
+          (!wakeStageId || wakeStageId === issueStageId);
+        if (stillCurrent) {
+          live.push(entry);
+          continue;
+        }
+        await db.update(agentWakeupRequests).set({
+          status: "cancelled", finishedAt: new Date(), updatedAt: new Date(),
+          error: "Execution stage moved on before the parked wake could start",
+        }).where(and(eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      }
+      if (live.length === 0) continue;
+      if (await getExecutionBlocker(db, candidate.companyId, candidate.issueId)) {
+        await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+          parkedStageWait,
+          eq(agentWakeupRequests.companyId, candidate.companyId),
+          sql`${issueIdSql} = ${candidate.issueId}`,
+        ));
+        continue;
+      }
+      for (const { wake, issue } of live) {
+        const [claimed] = await db.update(agentWakeupRequests).set({
+          status: "coalesced", finishedAt: new Date(), updatedAt: new Date(),
+        }).where(and(eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")))
+          .returning({ id: agentWakeupRequests.id });
+        if (!claimed) continue;
+        const payload = { ...parseObject(wake.payload) };
+        const contextSnapshot = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+        delete payload[DEFERRED_WAKE_CONTEXT_KEY];
+        delete payload.executionWait;
+        try {
+          const run = await enqueueWakeup(wake.agentId, {
+            source: (wake.source as WakeupOptions["source"]) ?? "assignment",
+            triggerDetail: (wake.triggerDetail as WakeupOptions["triggerDetail"]) ?? "system",
+            reason: wake.reason,
+            payload,
+            contextSnapshot,
+            requestedByActorType: (wake.requestedByActorType as WakeupOptions["requestedByActorType"]) ?? undefined,
+            requestedByActorId: wake.requestedByActorId,
+            idempotencyKey: wake.idempotencyKey,
+            issueStateGuard: { assigneeAgentId: wake.agentId, statuses: [issue.status] },
+          });
+          if (run) {
+            resumed += 1;
+            await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
+              .where(eq(agentWakeupRequests.id, wake.id));
+          }
+        } catch (err) {
+          await db.update(agentWakeupRequests).set({
+            status: "deferred_issue_execution", finishedAt: null, updatedAt: new Date(),
+          }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "coalesced")));
+          logger.warn({ err, wakeId: wake.id }, "failed to resume parked execution-stage wake");
+        }
+      }
+    }
+    return { resumed };
   }
 
   async function resumeExecutionWaitComments() {
@@ -19667,6 +19784,9 @@ export function heartbeatService(
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
+    await resumeExecutionStageWaits().catch(err => {
+      logger.warn({ err }, "failed to resume parked execution-stage wakes");
+    });
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -26950,6 +27070,14 @@ export function heartbeatService(
           logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
         });
       }
+      // The stopped run has released its lease. Start any next stage
+      // participant that was parked behind it.
+      const finishedIssueId = readNonEmptyString(latestRun?.contextSnapshot?.issueId);
+      if (latestRun && finishedIssueId && isHeartbeatRunTerminalStatus(latestRun.status)) {
+        await resumeExecutionStageWaits({ companyId: run.companyId, issueId: finishedIssueId }).catch(err => {
+          logger.warn({ err, runId: run.id }, "failed to resume parked execution-stage wake after cleanup");
+        });
+      }
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
@@ -27954,7 +28082,11 @@ export function heartbeatService(
           const deferBlockedExecution = async (
             executionBlocker: NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>,
           ) => {
-            const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
+            const condition = {
+              recoveryActionId: executionBlocker.recoveryActionId,
+              cause: executionBlocker.cause,
+              ...continuationWait,
+            };
             if (executionWaitRequestId) {
               await tx.update(agentWakeupRequests).set({
                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
@@ -27962,7 +28094,14 @@ export function heartbeatService(
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
             }
-            if (durableRequest || wakeCommentId ||
+            // A stage handoff stops the deciding participant's run in the same
+            // request that wakes the next participant. That stopped run can
+            // still hold its environment lease for a moment, so the next
+            // participant's wake must wait for cleanup instead of being dropped.
+            const transientStageHandoff =
+              executionBlocker.recoveryActionId === null &&
+              isExecutionStageWakeReason(reason);
+            if (durableRequest || wakeCommentId || transientStageHandoff ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
                 readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
               await tx.insert(agentWakeupRequests).values({
@@ -30446,6 +30585,7 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    resumeExecutionStageWaits,
 
     scheduleBoundedRetry: async (
       runId: string,
