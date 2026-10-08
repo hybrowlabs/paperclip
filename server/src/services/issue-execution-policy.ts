@@ -50,6 +50,8 @@ type TransitionInput = {
   requestedAssigneePatch: RequestedAssigneePatch;
   actor: ActorLike;
   allowBoardOverride?: boolean;
+  /** True when the actor is the direct supervisor agent of the issue's current assignee. */
+  actorIsAssigneeSupervisor?: boolean;
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
@@ -543,6 +545,50 @@ function assertLaterStagesHaveEligibleParticipants(input: {
   }
 }
 
+function isOnlyParticipantOfAnyStage(policy: IssueExecutionPolicy, principal: IssueExecutionStagePrincipal | null) {
+  if (!principal) return false;
+  return policy.stages.some(
+    (stage) =>
+      stage.participants.length > 0 &&
+      stage.participants.every((participant) => principalsEqual(participant, principal)),
+  );
+}
+
+/**
+ * Picks the maker (return assignee) when a workflow starts or restarts with no
+ * prior state. The current assignee is the default, but after a reopen it can
+ * be a stage's approver (e.g. left assigned after a final approval); such a
+ * principal would be excluded from its own stage and strand the workflow, so
+ * the acting submitter is used instead.
+ */
+function resolveStartingReturnAssignee(input: {
+  policy: IssueExecutionPolicy;
+  currentAssignee: IssueExecutionStagePrincipal | null;
+  actor: IssueExecutionStagePrincipal | null;
+}) {
+  if (!isOnlyParticipantOfAnyStage(input.policy, input.currentAssignee)) {
+    return input.currentAssignee;
+  }
+  if (input.actor && !isOnlyParticipantOfAnyStage(input.policy, input.actor)) {
+    return input.actor;
+  }
+  return input.currentAssignee;
+}
+
+function assertRemainingStagesHaveEligibleParticipants(input: {
+  policy: IssueExecutionPolicy;
+  completedStageIds: string[];
+  returnAssignee: IssueExecutionStagePrincipal | null;
+}) {
+  const completed = new Set(input.completedStageIds);
+  for (const stage of input.policy.stages) {
+    if (completed.has(stage.id)) continue;
+    if (!selectStageParticipant(stage, { exclude: input.returnAssignee })) {
+      throw noEligibleStageParticipantError({ policy: input.policy, stage, returnAssignee: input.returnAssignee });
+    }
+  }
+}
+
 function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
   if (!participant) return false;
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
@@ -843,6 +889,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
         if (!nextStage) {
           patch.executionState = approvedState;
+          const finalReturnAssignee = existingState?.returnAssignee ?? null;
+          if (finalReturnAssignee) {
+            Object.assign(patch, patchForPrincipal(finalReturnAssignee));
+          }
           return {
             patch,
             decision: {
@@ -851,6 +901,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               outcome: "approved",
               body: input.commentBody.trim(),
             },
+            ...(finalReturnAssignee ? { workflowControlledAssignment: true } : {}),
           };
         }
 
@@ -989,6 +1040,44 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       return { patch };
     }
 
+    const actorMayRepairRouting =
+      Boolean(actor) &&
+      (principalsEqual(actor, existingState?.returnAssignee ?? null) || input.actorIsAssigneeSupervisor === true);
+    const repairRequested =
+      requestedAssigneePatchProvided &&
+      Boolean(explicitAssignee) &&
+      (requestedStatus === undefined || requestedStatus === "in_review");
+    if (attemptedStageAdvance && repairRequested && actorMayRepairRouting && !principalsEqual(actor, currentParticipant)) {
+      // Routing repair, not a stage decision: either re-pend the stage on the
+      // requested participant, or (for a non-participant) make that principal
+      // the return assignee while the current participant keeps the stage.
+      const explicitIsEligibleParticipant =
+        stageHasParticipant(activeStage, explicitAssignee) &&
+        !principalsEqual(explicitAssignee, existingState?.returnAssignee ?? null);
+      const repairParticipant = explicitIsEligibleParticipant ? explicitAssignee! : currentParticipant;
+      const repairReturnAssignee = stageHasParticipant(activeStage, explicitAssignee)
+        ? existingState?.returnAssignee ?? null
+        : explicitAssignee;
+      assertRemainingStagesHaveEligibleParticipants({
+        policy: input.policy,
+        completedStageIds: existingState?.completedStageIds ?? [],
+        returnAssignee: repairReturnAssignee,
+      });
+      buildPendingStagePatch({
+        patch,
+        previous: existingState,
+        policy: input.policy,
+        stage: activeStage,
+        participant: repairParticipant,
+        returnAssignee: repairReturnAssignee,
+        reviewRequest: effectiveReviewRequest,
+      });
+      return {
+        patch,
+        workflowControlledAssignment: true,
+      };
+    }
+
     if (attemptedStageAdvance && !stageStateDrifted) {
       throw unprocessable("Only the active reviewer or approver can advance the current execution stage");
     }
@@ -1032,7 +1121,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       : nextPendingStage(input.policy, existingState);
   if (!pendingStage) return { patch };
 
-  const returnAssignee = existingState?.returnAssignee ?? currentAssignee;
+  const returnAssignee =
+    existingState?.returnAssignee ??
+    resolveStartingReturnAssignee({ policy: input.policy, currentAssignee, actor });
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
   let participant = selectStageParticipant(pendingStage, {
     preferred:

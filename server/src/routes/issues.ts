@@ -13248,10 +13248,26 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
+      let actorIsAssigneeSupervisor = false;
+      if (
+        actor.actorType === "agent" &&
+        actor.agentId &&
+        existing.status === "in_review" &&
+        existing.assigneeAgentId &&
+        existing.assigneeAgentId !== actor.agentId &&
+        (normalizedAssigneeAgentId !== undefined || req.body.assigneeUserId !== undefined)
+      ) {
+        const currentAssigneeAgent = await agentsSvc.getById(existing.assigneeAgentId);
+        actorIsAssigneeSupervisor =
+          currentAssigneeAgent?.companyId === existing.companyId &&
+          currentAssigneeAgent.reportsTo === actor.agentId;
+      }
+
       const transition = applyIssueExecutionPolicyTransition({
         issue: existing,
         policy: nextExecutionPolicy,
         previousPolicy: previousExecutionPolicy,
+        actorIsAssigneeSupervisor,
         requestedStatus:
           typeof updateFields.status === "string"
             ? updateFields.status
