@@ -1,3 +1,4 @@
+import { applyAdapterConfigPatch } from "../services/adapter-config-patch.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
 import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
@@ -5496,8 +5497,12 @@ export function agentRoutes(
       let rawEffectiveAdapterConfig = requestedAdapterConfig
         ? restoreRedactedAgentEnv(requestedAdapterConfig, existingAdapterConfig)
         : changingAdapterType ? {} : existingAdapterConfig;
-      if (requestedAdapterConfig && !changingAdapterType && !replaceAdapterConfig) {
-        rawEffectiveAdapterConfig = { ...existingAdapterConfig, ...rawEffectiveAdapterConfig };
+      if (requestedAdapterConfig) {
+        rawEffectiveAdapterConfig = applyAdapterConfigPatch(
+          existingAdapterConfig,
+          rawEffectiveAdapterConfig,
+          { replace: changingAdapterType || replaceAdapterConfig },
+        );
       }
       if (changingAdapterType) {
         // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
