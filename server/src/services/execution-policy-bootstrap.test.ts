@@ -134,6 +134,96 @@ describe("parseExecutionPolicyBootstrapEnv", () => {
   });
 });
 
+describe("parseExecutionPolicyBootstrapEnv tenant quota / limit range", () => {
+  const base = { PAPERCLIP_EXECUTION_MODE: "kubernetes" };
+  const quotaEnv = {
+    PAPERCLIP_K8S_QUOTA_PODS: "10",
+    PAPERCLIP_K8S_QUOTA_REQUESTS_CPU: "4",
+    PAPERCLIP_K8S_QUOTA_REQUESTS_MEMORY: "8Gi",
+    PAPERCLIP_K8S_QUOTA_LIMITS_CPU: "8",
+    PAPERCLIP_K8S_QUOTA_LIMITS_MEMORY: "16Gi",
+  };
+  const limitRangeEnv = {
+    PAPERCLIP_K8S_LIMITRANGE_DEFAULT_CPU: "1",
+    PAPERCLIP_K8S_LIMITRANGE_DEFAULT_MEMORY: "2Gi",
+    PAPERCLIP_K8S_LIMITRANGE_DEFAULT_REQUEST_CPU: "250m",
+    PAPERCLIP_K8S_LIMITRANGE_DEFAULT_REQUEST_MEMORY: "512Mi",
+    PAPERCLIP_K8S_LIMITRANGE_MAX_CPU: "4",
+    PAPERCLIP_K8S_LIMITRANGE_MAX_MEMORY: "8Gi",
+  };
+
+  it("maps PAPERCLIP_K8S_QUOTA_* into kubernetesConfig.tenantResourceQuota", () => {
+    const result = parseExecutionPolicyBootstrapEnv(env({ ...base, ...quotaEnv }));
+    expect(result?.kubernetesConfig.tenantResourceQuota).toEqual({
+      pods: "10",
+      requestsCpu: "4",
+      requestsMemory: "8Gi",
+      limitsCpu: "8",
+      limitsMemory: "16Gi",
+    });
+  });
+
+  it("maps PAPERCLIP_K8S_LIMITRANGE_* into kubernetesConfig.tenantLimitRange", () => {
+    const result = parseExecutionPolicyBootstrapEnv(env({ ...base, ...limitRangeEnv }));
+    expect(result?.kubernetesConfig.tenantLimitRange).toEqual({
+      defaultCpu: "1",
+      defaultMemory: "2Gi",
+      defaultRequestCpu: "250m",
+      defaultRequestMemory: "512Mi",
+      maxCpu: "4",
+      maxMemory: "8Gi",
+    });
+  });
+
+  it("omits both when no quota / limit-range env is set", () => {
+    const result = parseExecutionPolicyBootstrapEnv(env(base));
+    expect(result?.kubernetesConfig).not.toHaveProperty("tenantResourceQuota");
+    expect(result?.kubernetesConfig).not.toHaveProperty("tenantLimitRange");
+  });
+
+  it("treats blank values as unset", () => {
+    const blank = Object.fromEntries(Object.keys(quotaEnv).map((k) => [k, "  "]));
+    const result = parseExecutionPolicyBootstrapEnv(env({ ...base, ...blank }));
+    expect(result?.kubernetesConfig).not.toHaveProperty("tenantResourceQuota");
+  });
+
+  it("throws naming the variable on an invalid quantity", () => {
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(
+        env({ ...base, ...quotaEnv, PAPERCLIP_K8S_QUOTA_REQUESTS_CPU: "four" }),
+      ),
+    ).toThrow(/PAPERCLIP_K8S_QUOTA_REQUESTS_CPU.*four/);
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(
+        env({ ...base, ...limitRangeEnv, PAPERCLIP_K8S_LIMITRANGE_MAX_MEMORY: "8GB" }),
+      ),
+    ).toThrow(/PAPERCLIP_K8S_LIMITRANGE_MAX_MEMORY.*8GB/);
+  });
+
+  it("throws when PAPERCLIP_K8S_QUOTA_PODS is not a positive integer", () => {
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(env({ ...base, ...quotaEnv, PAPERCLIP_K8S_QUOTA_PODS: "0" })),
+    ).toThrow(/PAPERCLIP_K8S_QUOTA_PODS/);
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(env({ ...base, ...quotaEnv, PAPERCLIP_K8S_QUOTA_PODS: "1.5" })),
+    ).toThrow(/PAPERCLIP_K8S_QUOTA_PODS/);
+  });
+
+  it("throws listing the missing variables when the quota set is partial", () => {
+    const { PAPERCLIP_K8S_QUOTA_LIMITS_MEMORY: _omit, ...partial } = quotaEnv;
+    expect(() => parseExecutionPolicyBootstrapEnv(env({ ...base, ...partial }))).toThrow(
+      /PAPERCLIP_K8S_QUOTA_LIMITS_MEMORY/,
+    );
+  });
+
+  it("throws listing the missing variables when the limit-range set is partial", () => {
+    const { PAPERCLIP_K8S_LIMITRANGE_MAX_CPU: _omit, ...partial } = limitRangeEnv;
+    expect(() => parseExecutionPolicyBootstrapEnv(env({ ...base, ...partial }))).toThrow(
+      /PAPERCLIP_K8S_LIMITRANGE_MAX_CPU/,
+    );
+  });
+});
+
 describe("applyExecutionPolicyBootstrap", () => {
   beforeEach(() => {
     updateGeneral.mockReset().mockResolvedValue(undefined);

@@ -1,6 +1,12 @@
+// Re-exported so server code can open dedicated raw connections (session
+// advisory locks) without declaring its own postgres dependency/version.
+export { default as postgres } from "postgres";
 export {
+  PAPERCLIP_LOCK_NAMESPACE,
   createDb,
   withDedicatedDbConnection,
+  getAdvisoryLockDb,
+  closeAdvisoryLockDb,
   closeRegisteredClients,
   getPostgresDataDirectory,
   ensurePostgresDatabase,

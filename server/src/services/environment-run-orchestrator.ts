@@ -492,16 +492,26 @@ export function environmentRunOrchestrator(
     }
 
     // Step 3: Persist realization metadata on lease and execution workspace
-    if (Object.keys(workspaceRealization).length > 0) {
+    const hasWorkspaceRealization = Object.keys(workspaceRealization).length > 0;
+    // The realized cwd is the workspace root every later lease-only step (native
+    // file sync, lease resume) confines itself to. Persist it as `remoteCwd`
+    // on the lease; a driver whose realization nests it under
+    // `workspaceRealization` would otherwise leave the lease without a root.
+    const currentRemoteCwd =
+      typeof lease.metadata?.remoteCwd === "string" ? lease.metadata.remoteCwd.trim() : "";
+    const realizedRemoteCwd =
+      realizedWorkspaceCwd && realizedWorkspaceCwd !== currentRemoteCwd ? realizedWorkspaceCwd : null;
+    if (hasWorkspaceRealization || realizedRemoteCwd) {
       const nextLeaseMetadata = {
         ...(lease.metadata ?? {}),
-        workspaceRealization,
+        ...(hasWorkspaceRealization ? { workspaceRealization } : {}),
+        ...(realizedRemoteCwd ? { remoteCwd: realizedRemoteCwd } : {}),
       };
       const updatedLease = await environmentsSvc.updateLeaseMetadata(lease.id, nextLeaseMetadata);
       if (updatedLease) {
         lease = updatedLease;
       }
-      if (persistedExecutionWorkspace) {
+      if (hasWorkspaceRealization && persistedExecutionWorkspace) {
         const updatedEw = await executionWorkspacesSvc.update(persistedExecutionWorkspace.id, {
           metadata: {
             ...(persistedExecutionWorkspace.metadata ?? {}),

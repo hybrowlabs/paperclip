@@ -15,6 +15,7 @@ export type RunnerGeneration = "legacy" | "native";
 export type RunnerEnvironmentId = "local" | "daytona";
 export type RunnerTaskWorkMode = "standard" | "planning" | "ask";
 export type RunnerTaskFlow =
+  | "blocker_guidance"
   | "everyday_workflow"
   | "context_integrity"
 
@@ -137,6 +138,8 @@ export interface RunnerTaskFixture {
   expectedRunCount: number;
   /** Optional lower bound; expectedRunCount remains the maximum/cost estimate. */
   minimumExpectedRunCount?: number;
+  /** Admit only the first attempt, including provider or infrastructure failures. */
+  automaticRetryPolicy?: "single_attempt";
   attemptTimeoutMs: Readonly<Record<RunnerEnvironmentId, number>>;
   expectedTerminalState: {
     issue: "done" | "in_review" | "blocked" | "in_progress";

@@ -1,4 +1,5 @@
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
+import { withAdapterExecutionPhase, type AdapterExecutionPhase } from "../execution-phase.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -40,6 +41,7 @@ import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } 
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
 import {
+  classifyToolDefinitionFailure,
   formatTerminalSessionFailure,
   sanitizeTerminalSessionFailure,
   type AcpxTerminalSessionFailure,
@@ -73,6 +75,8 @@ import {
   readPaperclipIssueWorkModeFromContext,
   renderTemplate,
   resolvePaperclipInstanceRootForAdapter,
+  hydrateFreshSessionHandoff,
+  selectInitialCommunicationGuidance,
   selectPaperclipPromptSections,
   resolveLegacyPaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
@@ -1540,6 +1544,7 @@ function buildSessionParams(input: {
     mode: prepared.mode,
     stateDir: prepared.stateDir,
     configFingerprint: prepared.fingerprint,
+    mcpFingerprint: shortHash(prepared.mcpIdentity),
     ...(prepared.requestedModel ? { model: prepared.requestedModel } : {}),
     ...(prepared.requestedThinkingEffort ? { thinkingEffort: prepared.requestedThinkingEffort } : {}),
     ...(prepared.fastMode ? { fastMode: true } : {}),
@@ -2207,7 +2212,9 @@ async function buildRuntime(input: {
           defaultMode: paperclipClaudeSettings.defaultMode,
         }
       : null,
-    mcpServers: mcpIdentity,
+    // Qualified built-in ACP harnesses reconnect to the supplied MCP servers
+    // on session/load. Keep their conversation identity independent of tools.
+    mcpServers: ["claude", "codex", "grok", "gemini", "kimi"].includes(acpxAgent) ? [] : mcpIdentity,
     secretManifestHash: shortHash(secretManifest),
     // Fold the resolved adapter env (all applied user-configured values —
     // plain, secret_ref, and stable PAPERCLIP_* config such as an explicit
@@ -3020,7 +3027,8 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
     !resumedSession && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
-  const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(context, { resumedSession });
+  await hydrateFreshSessionHandoff(ctx, { resumedSession });
+  const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(context, { resumedSession, includeCommunicationGuidance: false });
   const externalChatTurn = isPaperclipExternalChatTurn(context.paperclipWake);
   const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
   const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
@@ -3034,6 +3042,7 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const prompt = joinPromptSections([
     promptInstructionsPrefix,
     renderedBootstrapPrompt,
+    selectInitialCommunicationGuidance(context, { resumedSession }),
     wakePrompt,
     sessionHandoffNote,
     taskContextNote,
@@ -4071,9 +4080,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             : teardownErr instanceof Error
               ? teardownErr.message
               : String(teardownErr);
-        await ctx
+        await withAdapterExecutionPhase(ctx, "phase_reporting", () => ctx
           .onLog("stderr", `[paperclip] ACPX teardown step "${step}" failed: ${reason}\n`)
-          .catch(() => {});
+          .catch(() => {}));
       };
       // Emit one per-phase timing run-log event. It is not an OpenTelemetry
       // export and it is not a Telemetry event: it carries the phase name
@@ -4084,15 +4093,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         emitRunPhaseTiming(ctx, phase, now() - startMs, outcome);
       // Time a settlement step and emit its phase timing on every path. A step
       // error still emits `failed` before it re-throws to the Phase 3 error policy.
-      const timedPhase = async (phase: string, run: () => Promise<void> | void): Promise<void> => {
+      const timedPhase = async (phase: AdapterExecutionPhase, run: () => Promise<void> | void): Promise<void> => {
         const start = now();
         try {
-          await run();
+          await withAdapterExecutionPhase(ctx, phase, run);
         } catch (error) {
-          await emitPhase(phase, start, "failed");
+          await withAdapterExecutionPhase(ctx, "phase_reporting", () => emitPhase(phase, start, "failed"));
           throw error;
         }
-        await emitPhase(phase, start, "ok");
+        await withAdapterExecutionPhase(ctx, "phase_reporting", () => emitPhase(phase, start, "ok"));
       };
       // The turn the run started. It is hoisted to the run scope so the settlement
       // `endSession` step can cancel a running turn before it closes the runtime
@@ -4220,7 +4229,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // same session still sees it. The borrow clears the entry's idle timer, so
         // the reused runtime cannot expire under its own timer while this run uses
         // it (today's `clearWarmHandleTimer(cached)` after the reuse decision).
-        const cached = canResume ? hostStore.borrow(prepared.sessionKey) : undefined;
+        let cached = canResume ? hostStore.borrow(prepared.sessionKey) : undefined;
+        if (cached && (ctx.context.refreshTools === true
+          || asString(previousParams.mcpFingerprint, "") !== shortHash(prepared.mcpIdentity)
+          // MCP bearer credentials are run-scoped, even for an unchanged catalog.
+          || prepared.mcpServers.length > 0)) {
+          await hostStore.discard(prepared.sessionKey);
+          cached = undefined;
+        }
         childStderrState = cached?.childStderrState ?? { logPath: null, pendingLiveLine: "" };
         processIdentitySink = cached?.processIdentitySink ?? {
           current: ctx.onSpawn,
@@ -4691,6 +4707,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       };
       let eventBreakdown: AcpRuntimeUsageBreakdown | null = null;
       let eventCostUsd: number | null = null;
+      let lastRuntimeEventAt: number | null = null;
+      let observedRuntimeEvents = 0;
       // The turn-local state the sequence steps share. `promptBuild` sets the
       // prompt, `preTurnUsage` sets the pre-turn status, `turnStart` sets the
       // active turn, and `turnFinalize` reads all three. `activeTurn` is the run-
@@ -4784,10 +4802,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // Diagnostics are retained even when an adapter has no recovery
           // classifier. Redact before bounding so partial secrets cannot leak.
           onTerminalSessionFailure: (failure: AcpxTerminalSessionFailure) => {
+            terminalFailureClassification = classifyToolDefinitionFailure(failure)
+              ?? deps.classifyTerminalSessionFailure?.(failure, new Date(now())) ?? null;
             terminalSessionFailure = sanitizeTerminalSessionFailure(
               failure, prepared.env, ctx.authToken, parseObject(ctx.config.env),
             );
-            terminalFailureClassification = deps.classifyTerminalSessionFailure?.(failure, new Date(now())) ?? null;
           },
         });
         activeTurn = turn;
@@ -4842,7 +4861,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         if (ctx.signal?.aborted) armStopDeadline();
         return {
           cancel: async (reason: string) => {
-            await turn.cancel({ reason });
+            await withAdapterExecutionPhase(ctx, "cancel_turn", () => turn.cancel({ reason }));
           },
         };
       };
@@ -4861,6 +4880,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const toolTitles = new Map<string, string>();
         const drainEvents = (async (): Promise<void> => {
           for await (const event of turn.events) {
+            lastRuntimeEventAt = now();
+            observedRuntimeEvents += 1;
             // ACPX currently flattens client-side filesystem/terminal receipts
             // into status text. They cannot establish complete action outcomes.
             if (event.type === "status" && /^(fs|terminal)\//.test(event.text)) incompleteToolInventory = true;
@@ -4918,6 +4939,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const stepTurnFinalize = async (
         input: TurnFinalizeInput<AcpRuntimeTurnResult>,
       ): Promise<TurnCompletion> => {
+        // Capture runtime activity before usage reads, error logs, or cleanup
+        // make an otherwise silent turn look active at its execution deadline.
+        const lastEventAgeMs = lastRuntimeEventAt === null ? undefined : now() - lastRuntimeEventAt;
+        const activityDiagnostics = {
+          acpObservedEventCount: observedRuntimeEvents,
+          ...(lastEventAgeMs !== undefined && Number.isSafeInteger(lastEventAgeMs) && lastEventAgeMs >= 0
+            ? { acpLastEventAgeMs: lastEventAgeMs } : {}),
+          acpPendingToolCount: [...interruptionTools.values()].filter(
+            (tool) => tool.status !== "completed" && tool.status !== "failed" && tool.status !== "cancelled",
+          ).length,
+          acpToolInventoryComplete: !incompleteToolInventory,
+        };
         if (input.kind === "terminal") {
         const terminal = input.terminal;
         const timedOut = input.timedOut;
@@ -5047,6 +5080,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           costUsd: turnUsage.costUsd,
           resultJson: {
             status: channelLost ? "failed" : terminal.status,
+            ...activityDiagnostics,
             ...(failureDiagnostic ? { terminalSessionFailure: failureDiagnostic } : {}),
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
             ...(classifiedFailure?.retryNotBefore
@@ -5181,7 +5215,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ...referencedProjectStagingFailuresField,
           model: prepared.requestedModel || null,
           clearSession: clearSession || timedOut,
-          resultJson: { phase },
+          resultJson: { phase, ...activityDiagnostics },
           summary: message,
         };
         // Return a typed failed completion so the coordinator settles for a cause
@@ -5281,7 +5315,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             : baseSettlement;
           // Cancel a running turn before the close (the turn-error path).
           if (settlement.cancelTurnReason && activeTurn) {
-            await activeTurn.cancel({ reason: settlement.cancelTurnReason }).catch(() => {});
+            await withAdapterExecutionPhase(ctx, "cancel_turn", () => activeTurn!.cancel({ reason: settlement.cancelTurnReason! }).catch(() => {}));
           }
           const existing = warmHandles.get(prepared.sessionKey);
           // Re-read the duplex control-channel disposition here, at the
@@ -5320,26 +5354,26 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ) {
             // A matching warm entry closes through the warm store, which also
             // clears its idle timer and flushes its child stderr.
-            runtimeStopConfirmed = await closeWarmHandle({
+            runtimeStopConfirmed = await withAdapterExecutionPhase(ctx, "close_session", () => closeWarmHandle({
               handles: warmHandles,
               key: prepared.sessionKey,
               entry: existing,
               reason: settlement.reason,
               discardPersistentState: settlement.discardPersistentState,
-            });
+            }));
             return;
           }
           const onCloseError = settlement.recordCloseError || ctx.signal?.aborted
             ? (closeErr: unknown) => recordTeardownError("runtime-close", closeErr)
             : () => {};
-          await runtime
+          await withAdapterExecutionPhase(ctx, "close_session", () => runtime
             .close({
               handle: settlement.handle,
               reason: settlement.reason,
               discardPersistentState: settlement.discardPersistentState,
             })
             .then(() => { runtimeStopConfirmed = true; })
-            .catch(onCloseError);
+            .catch(onCloseError));
           if (settlement.dropWarmEntry && warmHandleMatches(existing, runtime, settlement.handle) && existing) {
             clearWarmHandleTimer(existing);
             warmHandles.delete(prepared.sessionKey);
@@ -5370,18 +5404,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // mutable provider files. Require the owned close or local OS handle.
           const stopped = runtimeStopConfirmed || (!prepared.processSessionBridge && capturedProcessExited(processIdentitySink?.localProcess));
           try {
-            if (stopped) await ctx.onProviderStopped?.();
+            if (stopped) await withAdapterExecutionPhase(ctx, "instruction_collection", () => ctx.onProviderStopped?.());
           } catch {
             // Match ACP's fail-soft teardown policy without describing this as
             // a workspace restore failure or exposing paths from a raw error.
             await recordTeardownError("instruction-collection", new Error("Instruction collection failed after provider stop. No instruction save is claimed."));
           } finally {
-            await runRuntimeSpan("sandbox.syncBack", async () => {
+            await withAdapterExecutionPhase(ctx, "workspace_restore", () => runRuntimeSpan("sandbox.syncBack", async () => {
               const restoreOutcome = await syncBackManagedHome(prepared);
               if (!restoreOutcome.ok) {
                 workspaceRestoreFailureField = { workspaceRestoreFailure: restoreOutcome.code };
               }
-            });
+            }));
           }
         }),
         // The staging lease releases as the run's final act, AFTER the coordinator
@@ -5450,6 +5484,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               } },
             };
           }
+          // Preserve the policy resolved for this execution target. The server
+          // cannot reconstruct sandbox defaults from the stored agent config.
+          capturedResult = {
+            ...capturedResult,
+            resultJson: {
+              ...capturedResult.resultJson,
+              adapterExecutionTimeout: { ...prepared.timeoutResolution },
+            },
+          };
           // The sync-back settlement step runs before this reproduces the result
           // (settlement precedes reproduction), so a failed workspace restore is
           // already recorded by the time we get here. Merge it into `resultJson`

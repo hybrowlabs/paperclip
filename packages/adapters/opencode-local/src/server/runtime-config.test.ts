@@ -320,4 +320,85 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(prepared.notes).toEqual([]);
     await prepared.cleanup();
   });
+  describe("runtime MCP servers", () => {
+    const servers = [
+      { name: "Cloudflare", url: "https://mcp.example.test/cf", token: "secret-token-cf", connectionId: "1160a715-aaaa" },
+      { name: "GitHub", url: "https://mcp.example.test/gh", token: "secret-token-gh", connectionId: "2222bbbb-cccc" },
+    ];
+    const readConfig = async (home: string) =>
+      JSON.parse(await fs.readFile(path.join(home, "opencode", "opencode.json"), "utf8")) as {
+        mcp?: Record<string, Record<string, unknown>>;
+        permission?: unknown;
+      };
+
+    it("writes remote MCP entries with bearer headers and keeps existing mcp entries", async () => {
+      const configHome = await makeConfigHome({
+        mcp: { local: { type: "local", command: ["x"] } },
+      });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+        mcpServers: servers,
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      const runtimeConfig = await readConfig(prepared.env.XDG_CONFIG_HOME);
+      expect(runtimeConfig.mcp?.local).toEqual({ type: "local", command: ["x"] });
+      expect(runtimeConfig.mcp?.Cloudflare).toEqual({
+        type: "remote",
+        url: "https://mcp.example.test/cf",
+        headers: { Authorization: "Bearer secret-token-cf" },
+        enabled: true,
+      });
+      expect(runtimeConfig.mcp?.GitHub).toMatchObject({ type: "remote", url: "https://mcp.example.test/gh" });
+      expect(runtimeConfig.permission).toBe("allow");
+      expect(JSON.stringify(prepared.notes)).not.toContain("secret-token");
+      expect(prepared.notes.some((n) => n.includes("2 runtime MCP"))).toBe(true);
+      await prepared.cleanup();
+    });
+
+    it("de-duplicates names with the connection id and keeps the file private", async () => {
+      const configHome = await makeConfigHome();
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+        mcpServers: [
+          { name: "svc", url: "https://a.test", token: "t1", connectionId: "aaaaaaaa-1" },
+          { name: "svc", url: "https://b.test", token: "t2", connectionId: "bbbbbbbb-2" },
+        ],
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      const runtimeConfig = await readConfig(prepared.env.XDG_CONFIG_HOME);
+      expect(Object.keys(runtimeConfig.mcp ?? {}).sort()).toEqual(["svc", "svc-bbbbbbbb"]);
+      const stat = await fs.stat(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"));
+      expect(stat.mode & 0o077).toBe(0);
+      await prepared.cleanup();
+    });
+
+    it("mounts MCP servers even when dangerouslySkipPermissions is false, without loosening permissions", async () => {
+      const configHome = await makeConfigHome({ permission: { read: "allow" } });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: { dangerouslySkipPermissions: false },
+        mcpServers: servers,
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      const runtimeConfig = await readConfig(prepared.env.XDG_CONFIG_HOME);
+      expect(Object.keys(runtimeConfig.mcp ?? {})).toHaveLength(2);
+      expect(runtimeConfig.permission).toEqual({ read: "allow" });
+      expect(prepared.notes.some((n) => n.includes("permission=allow"))).toBe(false);
+      await prepared.cleanup();
+    });
+
+    it("does not add an mcp block when there are no servers", async () => {
+      const configHome = await makeConfigHome();
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+        mcpServers: [],
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      expect((await readConfig(prepared.env.XDG_CONFIG_HOME)).mcp).toBeUndefined();
+      await prepared.cleanup();
+    });
+  });
 });

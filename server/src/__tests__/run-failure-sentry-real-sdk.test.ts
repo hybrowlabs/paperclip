@@ -35,6 +35,59 @@ afterEach(async () => {
 });
 
 describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", () => {
+  it.each([
+    { phase: "workspace_restore", phaseElapsedMs: 60_123, expectedPhase: "workspace_restore", expectedElapsedMs: 60_123 },
+    { phase: "private-provider-phase", phaseElapsedMs: 100, expectedPhase: "unknown", expectedElapsedMs: null },
+    { phase: "workspace_restore", phaseElapsedMs: Infinity, expectedPhase: "workspace_restore", expectedElapsedMs: null },
+  ])("keeps bounded unconfirmed Stop context off unrelated events ($expectedPhase)", async ({ phase, phaseElapsedMs, expectedPhase, expectedElapsedMs }) => {
+    const Sentry = sentryPackage!;
+    const events: Array<Record<string, unknown>> = [];
+    vi.stubEnv("SENTRY_DSN_BACKEND", "https://public@example.invalid/1");
+    vi.doMock("../peer-version-check.js", () => ({ checkExactPeerVersions: () => ({ ok: true }) }));
+    vi.doMock("@sentry/node", () => ({
+      ...Sentry,
+      init: (options: Record<string, unknown>) => Sentry.init({
+        ...options,
+        transport: () => ({ send: async () => ({}), flush: async () => true }),
+        beforeSend: (event: Record<string, unknown>) => { events.push(event); return event; },
+      }),
+    }));
+    vi.resetModules();
+    const { sentryReady, captureException } = await import("../sentry.js");
+    const { AdapterStopTimeoutError } = await import("../services/adapter-stop-timeout.js");
+    await sentryReady;
+    const timeout = Object.assign(new AdapterStopTimeoutError(60_000, {
+      runId: "11111111-1111-4111-8111-111111111111", adapterType: "cursor",
+      runtimeMode: "legacy", abortRequested: true,
+      phase, phaseElapsedMs,
+    }), {
+      cause: new Error("private-provider-cause"),
+      providerResponse: { headers: "private-provider-headers", body: "private-provider-body" },
+    });
+    captureException(timeout);
+    await Promise.resolve();
+    captureException(new Error("unrelated stop diagnostic fixture"));
+    await Sentry.flush(2000);
+    expect(events).toHaveLength(2);
+    const captured = (message: string) => events.find((event) =>
+      (event.exception as { values: Array<{ value: string }> }).values.some((entry) => entry.value === message),
+    );
+    expect(captured(timeout.message)).toMatchObject({
+      tags: { error_code: "adapter_stop_unconfirmed" }, fingerprint: ["{{ default }}"],
+      contexts: { adapter_stop: {
+        runId: "11111111-1111-4111-8111-111111111111", adapterType: "cursor",
+        runtimeMode: "legacy", abortRequested: true, timeoutMs: 60_000,
+        phase: expectedPhase, phaseElapsedMs: expectedElapsedMs,
+      } },
+    });
+    expect(JSON.stringify(events)).not.toContain("private-provider-");
+    const unrelated = captured("unrelated stop diagnostic fixture");
+    expect(unrelated).toBeDefined();
+    expect(unrelated).not.toHaveProperty("contexts.adapter_stop");
+    expect(unrelated).not.toHaveProperty("tags.error_code");
+    expect(unrelated).not.toHaveProperty("fingerprint");
+  });
+
   it("keeps each run's identity and fingerprint off unrelated errors", async () => {
     const Sentry = sentryPackage!;
     const events: Array<Record<string, unknown>> = [];
@@ -82,7 +135,11 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
       code: "ECONNRESET", requestId: "request-123", status: 503,
       stack: "Error: upstream connection reset\n    at socketRead (/app/provider.js:19:7)",
       response: { body: "private-response" },
-    }) }), { stack: "Error: first run failed\n    at originalAdapter (/app/adapter.js:42:7)", request: { headers: "private-headers" } });
+    }) }), { stack: "Error: first run failed\n    at originalAdapter (/app/adapter.js:42:7)", request: { headers: "private-headers" },
+      code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT", workspaceRestoreLock: {
+        operation: "agent_directory_release", ownerState: "alive", ownerSameProcess: true, ownerPredatesProcess: true,
+        knownLocalHolder: false, ownerAgeMs: 120_000, waitMs: 30_001, path: "/private-lock-path",
+      } });
     const diagnostics = sanitizeRunFailureDiagnostics(collectRunFailureDiagnostics({
       runtimeMode: "legacy", resultJson: { terminalSessionFailure: {
         category: "service", title: "Provider failed", details: "d".repeat(9000),
@@ -128,6 +185,9 @@ describe.skipIf(!sentryPackage)("run failure context with the real Sentry SDK", 
     expect(JSON.stringify(exceptions)).not.toContain("captureRunFailure");
     expect(JSON.stringify(captured(second.errorMessage)?.exception)).not.toContain("captureRunFailure");
     expect(firstCapture).toMatchObject({ contexts: {
+      run_execution: { restoreLockOperation: "agent_directory_release", restoreLockOwnerState: "alive", restoreLockOwnerSameProcess: true,
+        restoreLockOwnerPredatesProcess: true, restoreLockKnownLocalHolder: false,
+        restoreLockOwnerAgeMs: 120_000, restoreLockWaitMs: 30_001 },
       provider_failure: { category: "service", details: "d".repeat(9000) },
       run_exception_1: { code: "ECONNRESET", requestId: "request-123", status: 503 },
     } });

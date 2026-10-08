@@ -184,6 +184,8 @@ export interface NativeSessionGoalControl {
 }
 
 export interface ExecuteNativeSessionOptions {
+  /** Read bounded task history only after recovery requires a fresh conversation. */
+  getFreshSessionHandoff?: () => Promise<string | null>;
   /** Durable launch intent, after cleanup admission and before provider calls. */
   onSessionAdmission?: () => Promise<void>;
   input: NativeExecutionInput;
@@ -2123,7 +2125,7 @@ export async function executeNativeSession(
   let goalCheckpointRequiresSuspension = Boolean(
     options.sessionGoalControl || options.resumeSessionGoalHeartbeat || persistedSession?.goal,
   );
-  let protocolIntegrityFailure: NativeSessionProtocolIntegrityError | null = null;
+  let executionFailure: { error: unknown } | null = null;
   try {
     // Ownership publication is part of the execution-owned lifetime. If the
     // callback fails, the finally block below still quarantines and closes the
@@ -2335,6 +2337,10 @@ export async function executeNativeSession(
           let modelEnvelope = recovered
             ? buildNativeModelEnvelope(input, { resumedSession: true })
             : buildNativeModelEnvelope(input);
+          if (!recovered && options.getFreshSessionHandoff && "task" in modelEnvelope) {
+            const handoff = await options.getFreshSessionHandoff();
+            if (handoff) modelEnvelope.task.prompt = `${handoff}\n\n${modelEnvelope.task.prompt}`;
+          }
           const dispositionOnlyRecovery = Boolean(
             recovered &&
             !recoveredSnapshot.semanticResult &&
@@ -2730,9 +2736,7 @@ export async function executeNativeSession(
     executionSucceeded = true;
     return { ...durableExecutionResult, ...enrichment };
   } catch (error) {
-    if (error instanceof NativeSessionProtocolIntegrityError) {
-      protocolIntegrityFailure = error;
-    }
+    executionFailure = { error };
     throw error;
   } finally {
     const shouldClose =
@@ -2757,7 +2761,20 @@ export async function executeNativeSession(
           // The exact cleanup owner remains retained/quarantined above. Its
           // rejection must not turn permanent integrity failure into a
           // generic retryable transport failure at the control-plane boundary.
-          throw protocolIntegrityFailure ?? closeError;
+          if (executionFailure !== null) {
+            // Keep the original identity/classification (including arbitrary
+            // thrown values). Cleanup remains inspectable without replacing
+            // the initiating failure with a generic shutdown timeout.
+            if (executionFailure.error instanceof Error) {
+              try {
+                Object.defineProperty(executionFailure.error, "cleanupError", {
+                  value: closeError, configurable: true,
+                });
+              } catch { /* Frozen errors still retain their original identity. */ }
+            }
+            throw executionFailure.error;
+          }
+          throw closeError;
         }
         await options.onSessionClosed?.();
       }

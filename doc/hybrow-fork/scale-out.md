@@ -1,0 +1,328 @@
+# Hybrow fork: multi-replica scale-out (Phase A)
+
+This fork (`hybrowlabs/paperclip`) carries a small patch series that lets
+Paperclip run on **2 or more server replicas** against one Postgres. It is
+maintained by Hybrow Labs and rebased on `paperclipai/paperclip` every month.
+Upstream is MIT-licensed; every ported patch keeps its original author.
+
+Tracking: HYBA-1317 (this series), HYBA-1291 (architecture review and the
+board's decision to keep a fork), HYBA-1316 (independent check).
+
+## What Phase A does, and what it does not
+
+Phase A makes extra replicas **safe**. Each of these used to break with more
+than one server:
+
+| Problem with more than one replica | Fixed by |
+|---|---|
+| Every replica ran every scheduler sweep | Patch 2 and 3: one elected scheduler leader |
+| Two replicas migrated the schema at the same time on boot | Patch 1: migration advisory lock |
+| Backups and plugin jobs ran once per replica | Patch 1: backup lock, atomic plugin-job slot claim |
+| The same webhook delivery was dispatched twice | Patch 1: delivery dedupe (migration 0296) |
+| The per-agent start lock was in memory, so two replicas overran an agent's concurrency | Patch 1: Postgres advisory try-lock |
+| A live event on replica A never reached a browser on replica B | Patch 5: Postgres `LISTEN/NOTIFY` |
+| A slow tick was followed by a second tick that stacked on it | Patch 4: tick overlap guard |
+| Lock transactions could take every pooled connection and stall the work inside them | Patch 6: separate small lock pool |
+| A new leader took over, or a stopping replica suspended, a native run another replica still controls | Patch 6: lease fence (`PAPERCLIP_MULTI_REPLICA=true`) |
+| A traffic-only replica (`HEARTBEAT_SCHEDULER_ENABLED=false`) still ran the singleton sweeps | Patch 6: cluster-wide single-flight, none on traffic-only replicas |
+
+### Known limit: agent runs stay on the replica that claimed them
+
+Phase A does **not** move agent runs between replicas. A run executes as a
+child process on the replica that claimed it, and its liveness is checked by
+local process id. If that replica dies, its runs are recovered by the scheduler
+leader the same way a single-server restart recovers them (orphan reaping and
+retry), not handed over live. Spreading runs across replicas, with
+`SKIP LOCKED` claims and lease-based liveness, is **Phase B**
+(upstream issue paperclipai/paperclip#7997) and is not part of this series.
+Plugin worker processes and plugin artifacts are also per replica
+(upstream issue #7996); do not rely on a plugin being installed on only one
+replica.
+
+What this means in practice:
+
+- **Legacy runs** (for example `opencode_local`, `codex_local`) hold a database
+  lease (`controller_lease_expires_at`, 60 s, renewed every 10 s). A new leader
+  does not reap a run while that lease is live, and takes it over only after
+  the lease expires (the owning replica died). Tested in
+  `leader-failover-live-runs.test.ts`.
+- **Native runner runs** (`paperclip_runner`) record the controlling process id
+  on the replica that started them, which another replica cannot probe. With
+  `PAPERCLIP_MULTI_REPLICA=true` a live controller lease (20 minutes, renewed
+  every 5) held by another boot is waited out: no claim, no reap, no suspend on
+  shutdown. If that replica dies, the run is taken over after the lease expires,
+  so recovery of a native run after a crash can take up to 20 minutes. Even with
+  the fence, two failed-run sweeps probe local process ids (see "Background
+  sweeps"), so **native runner agents are not supported on more than one
+  replica in this phase**. Fail closed: keep `paperclip_runner` agents off a
+  multi-replica deployment until Phase B. Hybrow's agents all use
+  `opencode_local`.
+- **Start-up delay (agent-start lock).** The per-agent start lock skips instead
+  of blocking. If a run is queued just after another replica read the queue, it
+  can wait up to one scheduler tick (30 s by default) before it starts.
+
+Because of this limit, scaling replicas up spreads **API and WebSocket load**.
+It does not by itself spread agent CPU. Move agent CPU off the API pods with the
+built-in Kubernetes sandbox execution mode (`PAPERCLIP_EXECUTION_MODE=kubernetes`),
+which is configuration, not part of this series.
+
+## Patch list
+
+Each patch is one commit (or a short run of commits) so the monthly rebase can
+drop or re-resolve them one at a time. Commit subjects start with
+`feat(scale-out)` or `fix(scale-out)`. The `Upstream-Source:` trailer in each
+commit message names the upstream PR.
+
+| # | Commit subject | Upstream source | Migration | Rebase risk |
+|---|---|---|---|---|
+| 0 | `test(scale-out): multi-replica acceptance suite` | New in this fork | none | Low (new files) |
+| 1 | `feat(scale-out): cross-replica coordination via Postgres advisory locks` | [paperclipai/paperclip#7993](https://github.com/paperclipai/paperclip/pull/7993), by Jannes Stubbemann (closed, not merged) | `0296_plugin_webhook_delivery_dedup` | High: touches `heartbeat.ts` (`startNextQueuedRunForAgent`), `index.ts` (backup), `company-skills.ts`, `plugin-job-scheduler.ts` |
+| 2 | `feat(scale-out): scheduler_leader lease and leader election service` | [#7995](https://github.com/paperclipai/paperclip/pull/7995), by Jannes Stubbemann (closed, not merged) | `0297_scheduler_leader` | Low (new files) plus `routes/health.ts` |
+| 3 | `feat(scale-out): run the heartbeat scheduler only on the elected leader` | #7995, re-wired by hand; includes the Greptile must-fix (recovery completes before the tick timer starts) | none | **Highest**: `server/src/index.ts` scheduler body and shutdown |
+| 4 | `fix(scale-out): never start a scheduler tick while the previous one runs` | New in this fork (scale-out review, Phase 1) | none | Low (`scheduler-runtime.ts`) |
+| 5 | `feat(scale-out): cross-replica live events over Postgres LISTEN/NOTIFY` | [#5875](https://github.com/paperclipai/paperclip/pull/5875), by Jannes Stubbemann (closed, not merged), without its Redis transport | none | Medium: `services/live-events.ts`, `index.ts`, `routes/health.ts` |
+| 6 | `fix(scale-out): ...` (review fixes M1, M2, M3: lock pool, native lease fence, singleton sweeps) | New in this fork (HYBA-1317 review) | none | Medium: `heartbeat.ts` (`reapOrphanedRuns`, `drainRunningRunsForShutdown`), `native-restart-recovery.ts`, `index.ts`, `packages/db/src/client.ts` |
+
+Migration numbers `0296` and `0297` are this fork's. Upstream numbered the same
+files `0102` and `0100`/`0103`. When upstream adds migrations, renumber ours
+after theirs (see the runbook).
+
+### Differences from the upstream PRs
+
+- The Redis live-events transport from #5875 is **not** carried. Postgres only:
+  no new infrastructure, smaller fork.
+- #7995's `/api/health` ran a lease query on every probe. Here the
+  unauthenticated probe reports `scheduler: { candidate, isLeader }` from process
+  memory and never queries the database; the lease row (leader id, host,
+  expiry) appears only in the authenticated full view.
+- Lease renewal keeps running while the new leader's startup recovery is still
+  in progress. Recovery can take longer than the 15 s lease, and without this a
+  second replica would take over and repeat it.
+- `subscribeAllCompanyLiveEvents` (fork master has it, #5875 predates it) is
+  process-local on purpose. Its consumers are best-effort fast paths over
+  durable sweeps that the leader runs.
+
+## Environment settings for a multi-replica deployment
+
+### Required rules
+
+1. **External Postgres.** Do not run the embedded database with more than one
+   replica. Use a managed or in-cluster Postgres that all replicas reach.
+2. **Shared object storage.** Set `PAPERCLIP_STORAGE_PROVIDER=s3` plus
+   `PAPERCLIP_STORAGE_S3_BUCKET`, `PAPERCLIP_STORAGE_S3_REGION` (and
+   `PAPERCLIP_STORAGE_S3_ENDPOINT` / `PAPERCLIP_STORAGE_S3_PREFIX` if needed).
+   Local-disk attachments exist on one pod only.
+3. **Shared secrets.** Use a shared secrets provider (for example the AWS
+   Secrets Manager provider) or the same `PAPERCLIP_SECRETS_MASTER_KEY` on every
+   replica. A per-pod local master key makes secrets unreadable on the others.
+4. **Same signing and auth secrets on every replica**:
+   `PAPERCLIP_AGENT_JWT_SECRET`, `BETTER_AUTH_SECRET`,
+   `PAPERCLIP_DECISION_SIGNING_SECRET`, `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET`.
+5. **Run-log mirror.** Set `RUN_LOG_S3_BUCKET` (and region/endpoint) so run logs
+   survive a pod and can be read from any replica.
+6. **Behind PgBouncer in transaction mode**, set `DATABASE_PREPARED_STATEMENTS=false`
+   on every replica. Keep the pool small enough that
+   `replicas * DATABASE_POOL_MAX` fits the pooler and Postgres `max_connections`.
+7. **Use a direct (non-pooled) path for the session-level features** when
+   `DATABASE_URL` is a transaction-mode pooler. Transaction pooling breaks
+   three things, and they use different settings:
+   - **Migrations:** set `DATABASE_MIGRATION_URL` to the direct URL. The
+     migration lock is a session lock on a dedicated connection to that URL.
+   - **Live events (`LISTEN`):** the transport uses
+     `PAPERCLIP_LIVE_EVENTS_DATABASE_URL`, then `DATABASE_URL`. It never uses
+     `DATABASE_MIGRATION_URL`: `LISTEN`/`NOTIFY` need only `CONNECT`, and the
+     transport keeps its login open for the life of the process, so it must not
+     be a DDL-capable role. Behind a transaction-mode pooler, set
+     `PAPERCLIP_LIVE_EVENTS_DATABASE_URL` to a direct URL that uses the
+     **application role**, or events will not be delivered across replicas.
+     - **Trust boundary:** `NOTIFY` frames carry full event payloads, including
+       `heartbeat.run.log` chunks. Any database role with `CONNECT` can `LISTEN`
+       on a company channel (the channel name is a hash of the company id, which
+       is not a secret) and read them, or `NOTIFY` forged frames. Tenant
+       isolation between browsers is the WebSocket gate; at the database level
+       it is role trust. Run Paperclip in its own database, keep read-only,
+       analytics and backup roles off it, or set
+       `PAPERCLIP_LIVE_EVENTS_TRANSPORT=off`. Received frames are validated
+       (known event type, plain-object payload, matching company; id and
+       `createdAt` replaced if malformed).
+   - **Database backups:** the backup lock and `pg_dump` use `DATABASE_URL`
+     as given. Behind a transaction-mode pooler, either point
+     `DATABASE_URL` at a session-mode pool, or turn the in-app backup off
+     (`PAPERCLIP_DB_BACKUP_ENABLED=false`) and back up at the database layer
+     (managed snapshots). Do not run the in-app backup through
+     transaction pooling.
+7a. **Background sweeps.** The execution-control reconcilers, the GitHub event
+   poll and continuity sweep, the sandbox cleanup and the external-object
+   refresh are singletons. Each runs under a cluster-wide advisory lock
+   (`sweep:<name>`): if another replica is already running it, this one skips and
+   the next interval covers it. They run on the elected leader. A replica with
+   `HEARTBEAT_SCHEDULER_ENABLED=false` and `PAPERCLIP_MULTI_REPLICA=true` runs
+   none of them. Review note O2, checked against the code: the GitHub poll and
+   continuity sweeps, the sandbox cleanup, the external-object refresh and the
+   finalization, dispatch-checkpoint, status-delivery and login-cleanup
+   reconcilers read and write only the database (the sandbox cleanup calls the
+   provider by lease id). **Two do probe local process ids, and only for native
+   runner runs that already failed:** `replacement`
+   (`reconcileSafeNativeReplacements`) and `automatic_disposition`
+   (`settleUnrecoverableExecutions`). On a different replica than the one that
+   ran the provider, that probe cannot see the process. This is why native
+   runner agents are **not supported on more than one replica** (see the known
+   limit above); legacy adapters such as `opencode_local` are unaffected. The
+   scheduler leader runs all of the sweeps, so a deployment with only
+   traffic-only replicas and no candidate has no sweeps at all.
+8. **Sticky sessions are not required for correctness.** WebSockets work from any
+   replica because events fan out over Postgres. Stickiness only avoids
+   reconnect churn.
+9. **Probe `/api/health`** for readiness. Its `scheduler` block shows which pod
+   is the leader (`isLeader: true`).
+
+### Settings added or changed by this series
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HEARTBEAT_SCHEDULER_ENABLED` | `true` | Be a candidate for scheduler leader. `false` means **serve traffic only, never become leader**. |
+| `HEARTBEAT_SCHEDULER_INTERVAL_MS` | `30000` (min `10000`) | Tick interval on the leader. A new tick never starts while the previous one is still running. |
+| `PAPERCLIP_MULTI_REPLICA` | unset (`false`) | Set `true` on **every** replica when running more than one. A native runner run whose controller lease is live on another replica is never claimed, reaped or suspended by this one, and a `HEARTBEAT_SCHEDULER_ENABLED=false` replica runs no background sweeps. Unset with one replica: nothing changes. |
+| `DATABASE_ADVISORY_LOCK_POOL_MAX` | `16` | Size of the separate pool that holds advisory lock transactions. Lock holders wait on this pool, never on the main pool. Count it in `replicas * (DATABASE_POOL_MAX + this)` against the pooler and `max_connections`. |
+| `PAPERCLIP_LIVE_EVENTS_TRANSPORT` | `postgres` | `postgres` or `off` (in-process only; multi-replica UIs go stale). |
+| `PAPERCLIP_LIVE_EVENTS_DATABASE_URL` | unset | Direct connection string for `LISTEN`. Direct URL using the application role (never the migration role). Falls back to `DATABASE_URL`. |
+
+Single replica: nothing to set. The lone replica becomes leader on its first
+pass at boot and behaviour is unchanged.
+
+### Suggested starting shape
+
+- 2 API replicas with `HEARTBEAT_SCHEDULER_ENABLED=true` (either may lead; the
+  other is a standby that takes over in about 15 s after a crash or within a few
+  seconds after a graceful stop).
+- Add traffic-only replicas with `HEARTBEAT_SCHEDULER_ENABLED=false` if you want
+  replicas that can never become leader.
+- Pod disruption budget `minAvailable: 1`, rolling update `maxUnavailable: 0`.
+
+## Rollback
+
+Rollback is a deployment action, not a data migration. The two new tables and
+the dedupe index are additive and harmless to older code.
+
+1. Scale the Deployment back to **1 replica**
+   (`kubectl scale deployment/paperclip --replicas=1`).
+2. Redeploy the **previous image digest** (the digest recorded in the release
+   task before the rollout; never a mutable tag).
+3. Verify: `/api/health` returns `ok`, one pod serves traffic, and the agent
+   runs resume (the single pod runs recovery at boot as before).
+4. Leave the `scheduler_leader` table and migrations `0296`/`0297` in place.
+   Older code ignores them. Do not drop them as part of a rollback.
+
+Rolling back **only** this series on a fork rebuild (drop the patches): the
+migrations stay applied in the database; ship a later image that still contains
+`0296` and `0297` in its journal, or the older image will refuse to start on an
+unknown applied migration if upstream ever enforces journal equality. Prefer the
+image-digest rollback above.
+
+## Tests
+
+The acceptance suite starts real server processes against one real Postgres:
+
+```
+pnpm run preflight:workspace-links
+pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+pnpm exec vitest run \
+  server/src/__tests__/multi-replica-cluster.test.ts \
+  server/src/__tests__/agent-start-lock-cross-replica.test.ts \
+  server/src/__tests__/scheduler-leadership.test.ts \
+  server/src/__tests__/scheduler-runtime.test.ts \
+  server/src/__tests__/live-events-cross-replica.test.ts \
+  server/src/__tests__/live-events-envelopes.test.ts \
+  server/src/__tests__/live-events-config.test.ts \
+  server/src/__tests__/plugin-job-scheduler-claim.test.ts \
+  server/src/__tests__/plugin-webhook-dedup.test.ts \
+  server/src/__tests__/advisory-locks.test.ts \
+  server/src/__tests__/health-scheduler.test.ts \
+  server/src/__tests__/singleton-sweep.test.ts \
+  server/src/__tests__/leader-failover-live-runs.test.ts \
+  packages/db/src/migration-lock.test.ts \
+  --testTimeout=600000 --hookTimeout=200000
+```
+
+Run with `NODE_ENV` unset or `development` (not `production`, which skips dev
+dependencies on install). The cluster test needs about 2 GB of memory and
+several minutes on 4 vCPU because each replica is a full server process.
+
+| Acceptance item | Test |
+|---|---|
+| (a) one leader, failover on graceful stop and on crash | `multi-replica-cluster.test.ts` (a); `scheduler-leadership.test.ts` |
+| (a) `HEARTBEAT_SCHEDULER_ENABLED=false` never leads | `multi-replica-cluster.test.ts` (a) |
+| (b) event on replica A reaches a WebSocket on replica B | `multi-replica-cluster.test.ts` (b); `live-events-cross-replica.test.ts` |
+| (c) concurrent boot applies migrations once | `multi-replica-cluster.test.ts` (c); `migration-lock.test.ts` |
+| (d) backups do not run twice | `multi-replica-cluster.test.ts` (d) |
+| (d) plugin jobs do not run twice | `plugin-job-scheduler-claim.test.ts` |
+| (e) agent-start lock across replicas | `agent-start-lock-cross-replica.test.ts` |
+| Tick does not start before recovery; no overlapping ticks | `scheduler-runtime.test.ts` |
+| LISTEN never uses the migration role; inbound NOTIFY frames are validated (security review) | `live-events-config.test.ts`; `live-events-envelopes.test.ts` |
+| Lock holders cannot starve a small pool (M1) | `advisory-locks.test.ts` |
+| A new leader does not take over live runs on another replica (M2) | `leader-failover-live-runs.test.ts` |
+| Singleton sweeps single-flight; traffic-only replica runs none (M3) | `singleton-sweep.test.ts`; `multi-replica-cluster.test.ts` (a2) |
+
+## Monthly upstream sync runbook
+
+Owner: Forge (a monthly routine creates the task). Reviewer: Nova. Checker:
+Sentinel. Approver: Rez. Merge: Forge after approval at the approved head.
+
+Goal: keep the fork a thin, current patch series on top of upstream.
+
+1. **Open the sync task** (the routine does this). Record the upstream `master`
+   SHA you are syncing to and the current fork `master` SHA.
+2. **Check whether upstream already shipped an equivalent change.** For each
+   patch in the table, search upstream `master` for the same feature
+   (`git log upstream/master --grep` for "advisory lock", "scheduler leader",
+   "LISTEN/NOTIFY", and read `server/src/services/` for equivalents). If
+   upstream merged an equivalent, **drop our patch** and delete its row, its
+   doc, and any tests that only cover it. Keep the acceptance suite tests; they
+   must still pass against upstream's implementation.
+3. **Branch and rebase.**
+   ```
+   git fetch upstream origin
+   git checkout -b sync/YYYY-MM origin/master
+   git rebase upstream/master
+   ```
+   The fork's `master` also carries Hybrow-only commits (recovery, dispatch
+   checkpoints). Rebase them too; do not squash patches together.
+4. **Resolve conflicts patch by patch.** Expected hotspots, in order of risk:
+   `server/src/index.ts` (scheduler body, shutdown), `server/src/services/heartbeat.ts`
+   (`startNextQueuedRunForAgent`), `server/src/services/live-events.ts`,
+   `server/src/routes/health.ts`, `server/src/services/plugin-job-scheduler.ts`.
+   Keep each patch in its own commit. Never take "theirs" blindly on `index.ts`:
+   re-check that startup recovery still completes **before** the tick timer
+   starts and that shutdown resigns leadership first.
+5. **Renumber migrations.** If upstream added migrations after `0295`, renumber
+   `0296_plugin_webhook_delivery_dedup` and `0297_scheduler_leader` after
+   upstream's highest number, update `meta/_journal.json` (idx, tag, a `when`
+   later than the previous entry) and run
+   `pnpm --filter @paperclipai/db run check:migrations`. Never edit a migration
+   that has already shipped in a released image; add a new one.
+6. **Re-run the checks.**
+   - the multi-replica suite (the command in "Tests");
+   - the existing server and db suites touched by the conflicts;
+   - `pnpm --filter @paperclipai/server exec tsc --noEmit -p tsconfig.json`
+     (server typecheck; known unrelated errors, if any, are listed in the task);
+   - the Jenkins job `paperclip/paperclip-pr-ci` on `cicd.caprover.hybrowlabs.com`
+     at the exact head SHA (Atlas runs it; record the build id).
+7. **Open a PR** from `sync/YYYY-MM` to `master` with: upstream SHA, patches
+   kept/dropped/renumbered, conflict notes, test evidence, Jenkins build id.
+   Move the independent check task to `todo` with the PR number and head SHA.
+8. **Do not force-push `master`.** The sync lands as a normal reviewed PR. The
+   rollback for a bad sync is the previous image digest.
+9. **Close the task** only after review PASS, checker PASS on the same head, and
+   approval. Then merge at the approved head.
+
+### Drop-a-patch rule
+
+When upstream merges an equivalent change, remove ours in the same sync PR.
+Keep the commit that removes it separate so the history shows why.
+
+### What not to do in a sync
+
+- Do not carry a patch just because it was ours first.
+- Do not add Phase B or plugin-artifact work to a sync PR; those are separate
+  tasks.
+- Do not enable GitHub Actions on the fork (upstream workflows publish images).

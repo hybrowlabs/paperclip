@@ -23,6 +23,12 @@ idle, busy, multiple-task, and restart Agent Chat handoffs on native Claude/Code
 completion delivery/result access from semantic review of the retained answer;
 see the [probe contract](../tests/runner-e2e/README.md#completion-update-probes-explicit-only).
 
+The explicit-only [task-titles suite](../tests/runner-e2e/README.md#automatic-task-titles)
+checks that production guidance causes a real native agent to name prompt-only
+standard/Ask tasks early, while preserving user-supplied titles. Its oracle
+correlates browser creation, native tool receipts, durable titles, audit ownership,
+and the reloaded task UI; fixture prompts contain no naming instructions.
+
 ## Selecting a family
 
 Use **Runner Evals** for a runner protocol, adapter, transport, native session,
@@ -71,6 +77,17 @@ Daytona paths. Its [fixture contract](../tests/runner-e2e/README.md) distinguish
 startup cancellation from active response cancellation and HTTP send replay
 from ambiguous provider action recovery. Select it explicitly; `--all` excludes it.
 
+The explicit-only [production hiring templates suite](../tests/runner-e2e/README.md#production-hiring-templates)
+adds two local native Codex/Claude cells. It exercises API-created production
+CEO defaults, an explicitly requested hiring skill/reference read, a permanent
+coder hire, independently computed saved JSON fixtures and worker reuse.
+Each cell requires five work turns and admits at most two strictly attributed
+server task-completion turns. Every actual run remains counted; unknown or
+extra-work turns fail. Source/read coverage and workflow outcome are
+separate: missing read provenance leaves the candidate/baseline pair
+uncomparable even if work succeeds. Baseline bundles and coder examples derive
+from their own source revision, without requiring candidate wording or length.
+
 The explicit-only `context-integrity` Product E2E suite covers ordered public
 comment continuation and explicit invocation of an assigned pinned skill across
 the seven selected legacy/native local profiles. Select it by suite or exact
@@ -89,6 +106,10 @@ Product suites exercise Grok Build with API and company subscription
 authentication respectively. Keep their results separate; the subscription
 fixture seeds an explicitly supplied login and does not qualify interactive
 login. See the [Grok fixture contract](../tests/runner-e2e/README.md#grok-build-qualification).
+
+The explicit [Direct blocker guidance suite](../tests/runner-e2e/README.md#direct-blocker-guidance)
+checks the legacy coordination skill against human authority, missing hiring
+permission, and requester scope decisions through saved browser interactions.
 
 ## Validation ladder
 
@@ -362,3 +383,10 @@ Copilot and Pi ACP profiles on local and Daytona. See the
 [fixture admission, credentials and budget contract](../tests/runner-e2e/README.md#extended-acp-harnesses-explicit-only).
 The private Runner Evals campaign of the same name provides complementary
 semantic protocol cases; catalog membership is not live qualification.
+
+The explicit-only Product E2E `confirmation-replies` suite tests conversational
+approval and rejection, persisted message provenance, approval before execution,
+ambiguous proposals, and the existing card-click path with native Claude/Codex.
+See the [suite contract](../tests/runner-e2e/README.md#conversational-confirmation-replies-explicit-only).
+
+Hiring notification accounting now also requires exact completed action attribution. Missing native/provider ID mapping is uncomparable evidence; it must not be reported as a model task regression or waived through name/order matching. The fixture waits for both known completion callbacks and settled bracketed observations, including the gap before pending outbox work becomes a wake. Strict action replay and original machine verdicts are retained separately.

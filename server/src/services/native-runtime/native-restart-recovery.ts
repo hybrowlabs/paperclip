@@ -156,6 +156,34 @@ function definitivelyDifferentProcessStart(
   return Math.abs(left.getTime() - right.getTime()) >= 1_000;
 }
 
+/**
+ * Set PAPERCLIP_MULTI_REPLICA=true on every replica when running more than one
+ * server. Controller identity (pid, process start) is only meaningful on the
+ * host that recorded it, so with several replicas a live lease owned by another
+ * boot must be waited out instead of judged by a local pid probe that would
+ * report a healthy remote controller as dead.
+ */
+export function isMultiReplicaDeployment(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return env.PAPERCLIP_MULTI_REPLICA === "true";
+}
+
+export function isNativeRunHeldByOtherReplica(input: {
+  controllerBootId: string | null | undefined;
+  leaseExpiresAt: Date | null | undefined;
+  currentBootId: string;
+  now: Date;
+}): boolean {
+  return (
+    isMultiReplicaDeployment() &&
+    !!input.controllerBootId &&
+    input.controllerBootId !== input.currentBootId &&
+    !!input.leaseExpiresAt &&
+    input.leaseExpiresAt.getTime() > input.now.getTime()
+  );
+}
+
 export async function evaluateNativeControllerTakeover(input: {
   owner: Pick<
     typeof nativeRunFinalizations.$inferSelect,
@@ -163,7 +191,8 @@ export async function evaluateNativeControllerTakeover(input: {
     | "leaseExpiresAt"
     | "controllerPid"
     | "controllerProcessStartedAt"
-  >;
+  > & { controllerBootId?: string | null };
+  currentBootId?: string;
   now: Date;
   coordinatedPreviousController?: {
     pid: number;
@@ -177,6 +206,18 @@ export async function evaluateNativeControllerTakeover(input: {
   const readStartedAt = input.readProcessStartedAt ?? observedProcessStart;
   if (!owner.leaseOwner || !owner.leaseExpiresAt) {
     return { allowed: true, reason: "unowned" };
+  }
+
+  if (
+    input.currentBootId !== undefined &&
+    isNativeRunHeldByOtherReplica({
+      controllerBootId: owner.controllerBootId,
+      leaseExpiresAt: owner.leaseExpiresAt,
+      currentBootId: input.currentBootId,
+      now,
+    })
+  ) {
+    return { allowed: false, reason: "live_lease_held_by_other_replica" };
   }
 
   const priorPid = owner.controllerPid;
@@ -569,6 +610,7 @@ export async function claimNativeRestartRecoveries(input: {
 
       const takeover = await evaluateNativeControllerTakeover({
         owner: row.coordinator,
+        currentBootId: controller.bootId,
         now,
         coordinatedPreviousController:
           input.coordinatedPreviousController ?? null,

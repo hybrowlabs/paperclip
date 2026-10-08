@@ -4,6 +4,33 @@ import { KNOWN_ADAPTER_TYPES } from "./adapter-defaults.js";
 
 const cidrRegex = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
 
+const quantityRegex = /^(\d+(\.\d+)?|\.\d+)(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/;
+const quantitySchema = z.string().regex(quantityRegex, "Invalid Kubernetes quantity");
+const podCountSchema = z
+  .string()
+  .regex(/^[1-9]\d*$/, "pods must be a positive integer");
+
+export const tenantResourceQuotaSchema = z
+  .object({
+    pods: podCountSchema,
+    requestsCpu: quantitySchema,
+    requestsMemory: quantitySchema,
+    limitsCpu: quantitySchema,
+    limitsMemory: quantitySchema,
+  })
+  .strict();
+
+export const tenantLimitRangeSchema = z
+  .object({
+    defaultCpu: quantitySchema,
+    defaultMemory: quantitySchema,
+    defaultRequestCpu: quantitySchema,
+    defaultRequestMemory: quantitySchema,
+    maxCpu: quantitySchema,
+    maxMemory: quantitySchema,
+  })
+  .strict();
+
 export const kubernetesProviderConfigSchema = z
   .object({
     inCluster: z.boolean().default(false),
@@ -19,6 +46,9 @@ export const kubernetesProviderConfigSchema = z
     egressAllowFqdns: z.array(z.string()).default([]),
     egressAllowCidrs: z.array(z.string().regex(cidrRegex, "Invalid CIDR")).default([]),
     egressMode: z.enum(["cilium", "standard"]).default("standard"),
+
+    tenantResourceQuota: tenantResourceQuotaSchema.optional(),
+    tenantLimitRange: tenantLimitRangeSchema.optional(),
 
     defaultResources: z
       .object({
@@ -90,6 +120,8 @@ export interface KubernetesLeaseMetadata {
   phase: "Pending" | "Running" | "Succeeded" | "Failed";
   /** Which backend provisioned this lease. */
   backend: "sandbox-cr" | "job";
+  /** Native sync confinement root; the pod's mounted workspace until a workspace is realized. */
+  remoteCwd: string;
   scopedNetworkPolicyName: string | null;
   scopedNetworkEgress: {
     allowFqdns: string[];

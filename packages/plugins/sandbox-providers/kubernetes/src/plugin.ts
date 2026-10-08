@@ -28,7 +28,7 @@ import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./ad
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
 import { buildSandboxCrManifest } from "./sandbox-cr-builder.js";
-import { ensureTenant } from "./tenant-orchestrator.js";
+import { ensureTenant, resolveTenantLimits } from "./tenant-orchestrator.js";
 import { createPerRunSecret } from "./secret-manager.js";
 import { FastUploadInterceptor } from "./upload-interceptor.js";
 import { jobOrchestrator, JobTimeoutError } from "./job-orchestrator.js";
@@ -57,18 +57,12 @@ import {
 // from the server pod.
 const PAPERCLIP_SERVER_NAMESPACE = "paperclip";
 
+// The pod mounts an emptyDir at this path (see pod-spec-builder / sandbox-cr-builder).
+// It is the native file-sync confinement root until the server realizes a workspace.
+const DEFAULT_WORKSPACE_REMOTE_CWD = "/workspace";
+
 // Name of the ServiceAccount created inside each tenant namespace by ensureTenant.
 const TENANT_SERVICE_ACCOUNT = "paperclip-tenant-sa";
-
-// Resource quota defaults applied to every tenant namespace (tunable via
-// config in a future iteration).
-const DEFAULT_RESOURCE_QUOTA = {
-  pods: "20",
-  requestsCpu: "10",
-  requestsMemory: "20Gi",
-  limitsCpu: "20",
-  limitsMemory: "40Gi",
-};
 
 function deriveTenantNamespace(config: KubernetesProviderConfig, companyId: string): string {
   // TODO: future versions could thread companyName through AcquireLeaseParams
@@ -344,7 +338,7 @@ const plugin = definePlugin({
       egressMode: config.egressMode,
       egressAllowFqdns: [...adapterDefaults.allowFqdns, ...config.egressAllowFqdns],
       egressAllowCidrs: config.egressAllowCidrs,
-      resourceQuota: DEFAULT_RESOURCE_QUOTA,
+      ...resolveTenantLimits(config),
     });
 
     const jobName = `pc-${newRunUlidDns()}`;
@@ -454,6 +448,9 @@ const plugin = definePlugin({
       secretName,
       phase: "Pending",
       backend: config.backend,
+      // The server syncs managed assets before it realizes the workspace, so the
+      // lease must already carry the pod's mounted workspace as the sync root.
+      remoteCwd: DEFAULT_WORKSPACE_REMOTE_CWD,
       scopedNetworkPolicyName,
       scopedNetworkEgress,
       // Native file sync streams over a pod exec; only the sandbox-cr backend
@@ -529,6 +526,11 @@ const plugin = definePlugin({
       secretName,
       phase: check.phase,
       backend: leaseBackend,
+      // Keep a root recorded after realization; legacy leases fall back to the mount.
+      remoteCwd:
+        typeof params.leaseMetadata?.remoteCwd === "string" && params.leaseMetadata.remoteCwd.trim().length > 0
+          ? params.leaseMetadata.remoteCwd.trim()
+          : DEFAULT_WORKSPACE_REMOTE_CWD,
       scopedNetworkPolicyName:
         typeof params.leaseMetadata?.scopedNetworkPolicyName === "string"
           ? params.leaseMetadata.scopedNetworkPolicyName
@@ -559,7 +561,7 @@ const plugin = definePlugin({
     const cwd =
       params.workspace.remotePath && params.workspace.remotePath.trim().length > 0
         ? params.workspace.remotePath.trim()
-        : "/workspace";
+        : DEFAULT_WORKSPACE_REMOTE_CWD;
     return {
       cwd,
       metadata: {

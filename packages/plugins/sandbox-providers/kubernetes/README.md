@@ -70,6 +70,8 @@ Common optional fields:
 | `egressAllowFqdns` | `[]` | Additional FQDNs (beyond adapter defaults like `api.anthropic.com`). |
 | `egressAllowCidrs` | `[]` | Additional CIDRs to allow egress to. |
 | `egressMode` | `"standard"` | `standard` (NetworkPolicy + CIDRs) or `cilium` (CiliumNetworkPolicy + FQDN allow-list). |
+| `tenantResourceQuota` | pods 20, requests 10 CPU / 20Gi, limits 20 CPU / 40Gi | Hard limits stamped on the per-tenant ResourceQuota. Object with `pods`, `requestsCpu`, `requestsMemory`, `limitsCpu`, `limitsMemory` (all required, quantity strings; `pods` a positive integer). Set on the server via `PAPERCLIP_K8S_QUOTA_{PODS,REQUESTS_CPU,REQUESTS_MEMORY,LIMITS_CPU,LIMITS_MEMORY}`. Applied when the tenant namespace is first provisioned; existing quotas are not rewritten. |
+| `tenantLimitRange` | default 1 CPU / 2Gi, defaultRequest 250m / 512Mi, max 4 CPU / 8Gi | Per-container LimitRange. Object with `defaultCpu`, `defaultMemory`, `defaultRequestCpu`, `defaultRequestMemory`, `maxCpu`, `maxMemory` (all required). Set on the server via `PAPERCLIP_K8S_LIMITRANGE_{DEFAULT_CPU,DEFAULT_MEMORY,DEFAULT_REQUEST_CPU,DEFAULT_REQUEST_MEMORY,MAX_CPU,MAX_MEMORY}`. Applied at first provisioning only. |
 | `runtimeClassName` | (none) | e.g. `kata-fc` for Firecracker-backed microVMs. Cluster must have the RuntimeClass installed. |
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
@@ -139,6 +141,8 @@ Every agent pod is:
 - `automountServiceAccountToken: true` (for the agent shim's paperclip-server callback)
 
 Plus per-namespace `pod-security.kubernetes.io/enforce: restricted` and a deny-all NetworkPolicy baseline with explicit egress allow-list (DNS, paperclip-server, configured FQDNs/CIDRs).
+
+A lease starts with `remoteCwd: /workspace` (the mounted emptyDir) as its native file-sync confinement root, because the server syncs managed assets before it realizes the workspace. The server persists the realized cwd on the lease as `remoteCwd`, and a resumed lease keeps any recorded value.
 
 The per-run Secret carrying the bootstrap token and adapter API keys has `ownerReferences` pointing at the owning Job, so a single `kubectl delete job …` cascades cleanly to the Pod and Secret.
 

@@ -1,5 +1,11 @@
+import { nativeCompletionTasks, nativeCompletionDefinitionDigest } from "./native-completion-cases.js";
+import { nativeCompletionProfile, NATIVE_COMPLETION_BUDGET_CENTS } from "./native-completion-defaults.js";
+import { chatConfirmationTasks } from "./chat-cases.js";
+import { hiringTemplateTasks, hiringTemplateProfile, hiringTemplateDefinitionDigest } from "./hiring-template-cases.js";
 import { instructionPersistenceTask } from "./instruction-persistence.js";
 import { apiResponseReadingTask } from "./api-response-reading.js";
+import { taskTitleTasks, taskTitleDefinitionDigest, TASK_TITLE_BUDGET_CENTS } from "./task-titles.js";
+import { blockerTasks, blockerProfile } from "./blocker-cases.js";
 import { accountingTasks } from "./accounting-cases.js";
 import { continuationTasks } from "./continuation-cases.js";
 import { contextIntegrityTasks } from "./context-integrity-cases.js";
@@ -9,6 +15,7 @@ import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
 import { firstTaskTasks } from "./first-task-cases.js";
 import { chatTasks, chatHardeningTasks, chatStoryTasks, chatQualificationTasks, chatCompletionTasks } from "./chat-cases.js";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { createAgentSchema } from "../../packages/shared/src/validators/agent.js";
 import { createEnvironmentSchema } from "../../packages/shared/src/validators/environment.js";
 import { DEFAULT_CODEX_LOCAL_MODEL } from "../../packages/adapters/codex-local/src/index.js";
@@ -18,6 +25,7 @@ import { DEFAULT_GROK_LOCAL_MODEL } from "../../packages/adapters/grok-local/src
 import { QUALIFIED_ACPX_PROFILES } from "../../packages/paperclip-runner/src/drivers/acpx/qualified-profiles.js";
 import { QUALIFIED_OPENCODE_MODEL } from "../../packages/paperclip-runner/src/drivers/opencode/opencode-server-driver.js";
 import { CREDENTIAL_NAMES } from "./types.js";
+import { createGitStreamingTask } from "./daytona-git-streaming.js";
 import { PENDING_PROFILE_PREREQUISITES } from "./prerequisites.js";
 import {
   openRouterProfileId,
@@ -931,6 +939,16 @@ function warmTurnInstructions(turn: 1 | 2 | 3, nonce: string) {
   ].join("\n");
 }
 
+function managedWarmTurnInstructions(turn: 1 | 2 | 3, nonce: string) {
+  return [warmTurnInstructions(turn, nonce),
+    "Also update your personal AGENT_HOME with ordinary filesystem tools. Do not edit the loaded AGENTS.md instructions and do not use an API to save these files.",
+    turn === 1
+      ? `Create notes/warm-memory.txt containing exactly T1-${nonce} followed by a newline. Create notes/unchanged.bin with exactly 8388608 bytes, each byte equal to 93. Create notes/delete-me.txt containing temporary.`
+      : `Read notes/warm-memory.txt under AGENT_HOME and verify it contains exactly the prior turn lines ${Array.from({ length: turn - 1 }, (_, i) => `T${i + 1}-${nonce}`).join(" | ")}, each followed by a newline. Append exactly T${turn}-${nonce} and a newline. Verify notes/unchanged.bin still has 8388608 bytes, each equal to 93, and leave it unchanged. ${turn === 2 ? "Delete notes/delete-me.txt." : "Verify notes/delete-me.txt is absent."}`,
+    "Perform these personal-file edits and verification before calling paperclip_finish. Paperclip saves them at the turn boundary.",
+  ].join("\n");
+}
+
 export const daytonaWarmContinuityTask: RunnerTaskFixture = {
   id: "warm-three-turn",
   label: "Warm three-turn workspace continuity",
@@ -943,10 +961,10 @@ export const daytonaWarmContinuityTask: RunnerTaskFixture = {
   expectedTerminalState: { issue: "done", run: "succeeded" },
   buildTitle: (nonce) => `Runner E2E warm Daytona continuity ${nonce}`,
   buildVisibleMarker: (nonce) => warmTurnMarker(3, nonce),
-  buildPrompt: (nonce) => warmTurnInstructions(1, nonce),
+  buildPrompt: (nonce) => managedWarmTurnInstructions(1, nonce),
   buildFollowupMessages: (nonce) => [
-    warmTurnInstructions(2, nonce),
-    warmTurnInstructions(3, nonce),
+    managedWarmTurnInstructions(2, nonce),
+    managedWarmTurnInstructions(3, nonce),
   ],
   buildMatchers(nonce, execution) {
     // Workspace persistence is the oracle for this story. Exact response text
@@ -972,8 +990,41 @@ export const daytonaWarmContinuityTask: RunnerTaskFixture = {
   },
 };
 
+export const daytonaLargeJournalTask: RunnerTaskFixture = {
+  ...daytonaWarmContinuityTask,
+  id: "large-journal-three-turn",
+  label: "Large journal three-turn workspace continuity",
+  buildFollowupMessages: nonce => [warmTurnInstructions(2, nonce), warmTurnInstructions(3, nonce)],
+  buildTitle: (nonce) => `Runner E2E large journal continuity ${nonce}`,
+  buildPrompt: (nonce) => [
+    "First exercise ordinary execution history with 240 separate execution-tool calls. In each call, run the Python command below exactly once. Issue the calls one by one. Do not combine them into a shell loop, script, parallel wrapper, or a single tool call: each command must be a separate ordinary execution-tool invocation. Keep a count from 1 through 240. The output is synthetic fixture data and needs no analysis.",
+    `python3 -c 'print("journal-continuity-" + "x" * 65000)'`,
+    "Wait for all 240 execution-tool calls to exit successfully. Do not redirect, suppress, or pipe their stdout. Then do the workspace task below and submit its completion report.",
+    warmTurnInstructions(1, nonce),
+  ].join("\n"),
+};
+export const daytonaGitStreamingTask = createGitStreamingTask({ ...daytonaWarmContinuityTask, buildPrompt: nonce => warmTurnInstructions(1, nonce), buildFollowupMessages: nonce => [warmTurnInstructions(2, nonce), warmTurnInstructions(3, nonce)] });
+
 const codexContinuityProfiles = runnerProfiles.filter((profile) =>
   ["legacy-codex", "runner-codex"].includes(profile.id),
+);
+
+// The journal stress fixture keeps a fixed external bundle as a control.
+// Ordinary warm continuity exercises managed files and incremental checkpoints.
+const warmCodexContinuityProfiles = codexContinuityProfiles.map((profile) =>
+  profile.generation !== "native" ? profile : {
+    ...profile,
+    buildAgent(input: AgentFixtureBuildInput) {
+      const agent = profile.buildAgent(input);
+      return { ...agent, adapterConfig: {
+        ...(agent.adapterConfig as Record<string, unknown>),
+        instructionsBundleMode: "external",
+        instructionsRootPath: fileURLToPath(new URL("./fixtures/warm-continuity/", import.meta.url)),
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: fileURLToPath(new URL("./fixtures/warm-continuity/AGENTS.md", import.meta.url)),
+      } };
+    },
+  },
 );
 
 export const connectionReviewSuite: RunnerSuiteFixture = {
@@ -1028,6 +1079,13 @@ export const extendedHarnessFileTask: RunnerTaskFixture = {
 };
 
 export const runnerSuites: readonly RunnerSuiteFixture[] = [
+  {
+    id: "blocker-guidance", label: "Direct blocker handling", manualOnly: true,
+    description: "Human authority, hiring permissions, and requester scope under the production coordination skill.",
+    groups: ["legacy"], profiles: runnerProfiles.filter(p => ["legacy-codex", "legacy-claude"].includes(p.id)).map(blockerProfile),
+    environments: [localEnvironment], tasks: blockerTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 1, instructions: "production-coordination-skill", grading: "saved-human-decision-ownership-and-resume", scheduling: "explicit-only" },
+  },
   {
     id: "extended-harnesses", label: "Extended ACP harnesses", manualOnly: true,
     description: "Explicit candidate qualification through real Paperclip tools, browser interactions, file edits and restart recovery.",
@@ -1085,6 +1143,17 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     definitionMetadata: { version: 1, grading: "hidden-evidence-exact-copy-and-api-tool-events", scheduling: "explicit-only" },
   },
   {
+    id: "task-titles", label: "Automatic task titles", manualOnly: true,
+    description: "A real agent names a prompt-only task early using production guidance and preserves a supplied title.",
+    groups: ["native", "local"], environments: [localEnvironment],
+    profiles: everydayProfiles.filter(profile => profile.provider === "codex").map(profile => ({
+      ...profile,
+      buildAgent(input) { return { ...profile.buildAgent(input), budgetMonthlyCents: TASK_TITLE_BUDGET_CENTS }; },
+    })),
+    tasks: taskTitleTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 1, gradingDigest: taskTitleDefinitionDigest, instructions: "production", grading: "initial-response-early-correlated-tool-and-agent-audit", providerRuns: 1, budgetMonthlyCents: TASK_TITLE_BUDGET_CENTS, scheduling: "explicit-only" },
+  },
+  {
     id: "continuation-accounting", label: "Continuation accounting baseline", manualOnly: true,
     description: "Structured productive steps, bounded repair, restart and late gates; comments cannot buy more attempts.",
     groups: ["local"], environments: [localEnvironment], profiles: codexContinuityProfiles.map(productionStoryProfile),
@@ -1120,11 +1189,21 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     id: "everyday-workflows", label: "Everyday Paperclip Work", manualOnly: true,
     description: "Real user requests, useful downloaded work, and durable continuation using production instructions.",
     groups: ["native"], profiles: everydayProfiles, environments: [localEnvironment, daytonaWarmEnvironment],
-    tasks: everydayTasks, expectedMatrixSize: 47,
+    tasks: everydayTasks, expectedMatrixSize: 50,
     excludedExecutionIds: [...everydayProfiles.flatMap(profile => everydayTasks
       .filter(task => !["build-revise", "delegate-feedback", "recover-controller", "create-skill-studio"].includes(task.id))
       .map(task => `everyday-workflows.${profile.id}.daytona.${task.id}`))],
-    definitionMetadata: { version: 3, instructions: "production", grading: "outcome-and-invariants", scheduling: "explicit-only" },
+    definitionMetadata: { version: 4, instructions: "production", grading: "outcome-and-invariants", scheduling: "explicit-only" },
+  },
+  {
+    id: "native-completion", label: "Native completion guidance", manualOnly: true,
+    description: "Production-default assigned-skill document completion and concrete whole-task blocking, with independent native result/final ordering.",
+    groups: ["native", "local"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude", "runner-opencode"].includes(profile.id)).map(nativeCompletionProfile),
+    environments: [localEnvironment], tasks: nativeCompletionTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 1, fixtureDigest: nativeCompletionDefinitionDigest(), instructions: "unchanged-master-production-default",
+      providerTurns: 6, maximumAttemptsPerCell: 1, automaticRetryPolicy: "single_attempt", budgetMonthlyCents: NATIVE_COMPLETION_BUDGET_CENTS,
+      grading: "original-assigned-skill-durable-document-plus-native-disposition-and-observable-final-order", scheduling: "explicit-only" },
   },
   {
     id: "context-integrity",
@@ -1174,6 +1253,16 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     definitionMetadata: { version: 5, permissions: "production-defaults", instructions: "production", grading: "durable-state-and-source-evidence", scheduling: "explicit-only", restartMemory: "required-after-restart", statusEvidence: "structured-current-blocker-and-active-run-count", readOnlyState: "public-mutation-contract-and-relations", hiringReference: "neutral-document-reference-line" },
   },
   {
+    id: "hiring-templates", label: "Production Hiring Templates", manualOnly: true,
+    description: "Production CEO and hiring skill/reference discovery, one coder hire, independently checked JSON artifacts and worker reuse.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => hiringTemplateProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment], tasks: hiringTemplateTasks, expectedMatrixSize: 2,
+    definitionMetadata: { version: 1, definitionDigest: hiringTemplateDefinitionDigest, instructions: "source-revision-default-ceo", scheduling: "explicit-only",
+      grading: "independent-json-and-read-receipts", baselineComparison: "same-fixture-source-derived-bundles", providerTurns: 5 },
+  },
+  {
     id: "agent-chat-stories", label: "Agent Chat Setup and Interruptions", manualOnly: true,
     description: "Experimental settings lifecycle and user follow-ups during active native work.",
     groups: ["chat", "native"],
@@ -1190,6 +1279,17 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
       .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
     environments: [localEnvironment], tasks: chatQualificationTasks, expectedMatrixSize: 6,
     definitionMetadata: { version: 10, instructionSetup: "read-before-write-base-hash", permissions: "production-defaults", instructions: "production", crashBoundary: "verified-native-worker-pid-at-file-wait", recovery: "new-user-message-after-verified-cleanup", answerGrading: "exact-grounded-propositions-plus-separate-semantic-review", scheduling: "explicit-only" },
+  },
+  {
+    id: "confirmation-replies", label: "Conversational Approval Cards", manualOnly: true,
+    description: "Persist approval/refusal from chat before execution, preserve card clicks, clarify ambiguous proposals, and answer historical questions after moving on.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment],
+    tasks: [...firstTaskTasks.filter(task => ["task-reply-accept", "interview-plan-accept", "reject-no-execution", "task-card-accept"].includes(task.id)), ...chatConfirmationTasks],
+    expectedMatrixSize: 12,
+    definitionMetadata: { version: 6, instructions: "production", grading: "card-message-provenance-before-child-creation", unansweredQuestionComposer: "history-card-only-including-fresh-dismissal", completionObservation: "120-seconds", scheduling: "explicit-only" },
   },
   {
     id: "completion-updates", label: "Delegated Completion Updates", manualOnly: true,
@@ -1256,6 +1356,55 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     environments: [daytonaWarmEnvironment],
     tasks: [daytonaWarmContinuityTask],
     expectedMatrixSize: 2,
+    definitionMetadata: { version: 3, nativeInstructions: "managed-incremental", managedFileBytes: 8 * 1024 * 1024 },
+  },
+  {
+    id: "daytona-journal-continuity",
+    label: "Daytona Large Journal Continuity",
+    manualOnly: true,
+    description: "Continue the same native session after separate ordinary tool invocations and their output grow its durable journal beyond 2 MiB.",
+    groups: ["daytona", "warm"],
+    profiles: warmCodexContinuityProfiles.filter((profile) => profile.id === "runner-codex"),
+    environments: [daytonaWarmEnvironment],
+    tasks: [daytonaLargeJournalTask],
+    expectedMatrixSize: 1,
+    definitionMetadata: { version: 5, nativeInstructions: "fixed-external", journalMinimumBytes: 2 * 1024 * 1024, toolInvocations: 240, outputBytesPerInvocation: 65020, scheduling: "explicit-only" },
+  },
+  {
+    id: "daytona-git-streaming",
+    label: "Daytona Git Streaming",
+    manualOnly: true,
+    description: "Copy back 60,000 real untracked files and continue twice with a Git filename manifest above 32 MiB.",
+    groups: ["daytona", "warm"],
+    // Copyback plus the next preparation can exceed the ordinary five-minute
+    // idle window for this 60,000-file workload. Keep the PID oracle strict
+    // while explicitly retaining both runner and sandbox for the workload.
+    profiles: codexContinuityProfiles.filter(profile => profile.id === "runner-codex").map(profile => ({
+      ...profile,
+      buildAgent(input: AgentFixtureBuildInput) {
+        const agent = profile.buildAgent(input);
+        // Managed agent-folder collection intentionally stops the provider at
+        // every turn. Fixed external instructions exercise retained processes.
+        return { ...agent, adapterConfig: {
+          ...(agent.adapterConfig as Record<string, unknown>),
+          idleTimeoutMs: 1_200_000,
+          instructionsBundleMode: "external",
+          instructionsRootPath: fileURLToPath(new URL("./fixtures/git-streaming/", import.meta.url)),
+          instructionsEntryFile: "AGENTS.md",
+          instructionsFilePath: fileURLToPath(new URL("./fixtures/git-streaming/AGENTS.md", import.meta.url)),
+        } };
+      },
+    })),
+    environments: [{
+      ...daytonaWarmEnvironment,
+      buildEnvironment(input: EnvironmentFixtureBuildInput) {
+        const environment = daytonaWarmEnvironment.buildEnvironment(input);
+        return { ...environment, config: { ...(environment.config as Record<string, unknown>), runnerIdleTimeoutMs: 1_200_000, autoStopInterval: 25, autoArchiveInterval: 30 } };
+      },
+    }],
+    tasks: [daytonaGitStreamingTask],
+    expectedMatrixSize: 1,
+    definitionMetadata: { version: 8, instructions: "fixed-external", nativeIdleTimeoutMs: 1_200_000, autoStopIntervalMinutes: 25, generatedFileCount: 60_000, filenameBytes: 39_828_890, scheduling: "explicit-only", finalization: "committed-without-active-sync-or-retry", copyback: "all-generated-file-contents-change-each-turn" },
   },
 ] as const;
 
@@ -1367,15 +1516,19 @@ export function validateRunnerCatalog(): MatrixExecution[] {
   const allTasks = [
     extendedHarnessFileTask,
     ...contextIntegrityTasks,
+    ...blockerTasks,
     ...accountingTasks,
     ...lifecycleLiveTasks,
     ...continuationTasks,
     ...everydayTasks,
+    ...taskTitleTasks,
     ...runnerTasks,
     ...localIntegrityTasks,
     ...openRouterBreadthTasks,
     daytonaWarmContinuityTask,
+    daytonaGitStreamingTask,
     instructionPersistenceTask,
+    daytonaLargeJournalTask,
   ];
   for (const [label, values] of [
     ["suite", runnerSuites],
