@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -102,13 +103,30 @@ async function readJsonObject(filepath: string): Promise<Record<string, unknown>
   }
 }
 
+function buildRemoteMcpEntries(servers: AdapterRuntimeMcpServer[]): Record<string, unknown> {
+  const entries: Record<string, unknown> = {};
+  for (const server of servers) {
+    const base = server.name.trim() || `connection-${server.connectionId.slice(0, 8)}`;
+    const name = base in entries ? `${base}-${server.connectionId.slice(0, 8)}` : base;
+    entries[name] = {
+      type: "remote",
+      url: server.url,
+      headers: { Authorization: `Bearer ${server.token}` },
+      enabled: true,
+    };
+  }
+  return entries;
+}
+
 export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
   targetIsRemote?: boolean;
+  mcpServers?: AdapterRuntimeMcpServer[];
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) {
+  const mcpServers = input.mcpServers ?? [];
+  if (!skipPermissions && mcpServers.length === 0) {
     return {
       env: input.env,
       notes: [],
@@ -149,9 +167,9 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   }
 
   const existingConfig = await readJsonObject(runtimeConfigPath);
-  const notes = [
-    "Injected runtime OpenCode config with permission=allow for all tools and connections.",
-  ];
+  const notes: string[] = skipPermissions
+    ? ["Injected runtime OpenCode config with permission=allow for all tools and connections."]
+    : [];
 
   // Merge gateway/custom provider definitions supplied via PAPERCLIP_OPENCODE_PROVIDERS
   // (a JSON object in OpenCode's `provider` shape). OpenCode resolves a `--model
@@ -202,10 +220,8 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     }
   }
 
-  const nextConfig: Record<string, unknown> = {
-    ...existingConfig,
-    permission: "allow",
-  };
+  const nextConfig: Record<string, unknown> = { ...existingConfig };
+  if (skipPermissions) nextConfig.permission = "allow";
   if (Object.keys(nextProvider).length > 0) {
     nextConfig.provider = nextProvider;
   }
@@ -221,7 +237,12 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     nextConfig.small_model = smallModel;
     notes.push(`Pinned OpenCode small_model to ${smallModel}.`);
   }
-  await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+  if (mcpServers.length > 0) {
+    const existingMcp = isPlainObject(existingConfig.mcp) ? existingConfig.mcp : {};
+    nextConfig.mcp = { ...existingMcp, ...buildRemoteMcpEntries(mcpServers) };
+    notes.push(`Mounted ${mcpServers.length} runtime MCP server(s) as remote OpenCode MCP entries.`);
+  }
+  await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 
   return {
     env: {
