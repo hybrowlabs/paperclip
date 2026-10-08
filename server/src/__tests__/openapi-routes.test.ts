@@ -227,6 +227,15 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents the board-only branches of recovery-action resolution", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/recovery-actions/resolve"].post;
+    expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    expect(operation.description).toContain("executionReconciliation");
+    expect(operation.description).toContain("false_positive");
+    expect(operation.responses["403"]).toBeDefined();
+  });
+
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;

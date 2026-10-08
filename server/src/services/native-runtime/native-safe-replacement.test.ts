@@ -460,7 +460,9 @@ const support = externalDatabaseUrl
       if (status === "accepted" || status === "rejected") expect(continuation.humanResponses).toContainEqual(expect.objectContaining({ id: interactionId, status }));
       else expect(continuation.humanResponses).not.toContainEqual(expect.objectContaining({ id: interactionId }));
       expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, source.issueId))).toEqual(before);
-      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, source.issueId))).toEqual(savedComments);
+      const commentsAfter = await db.select().from(issueComments).where(eq(issueComments.issueId, source.issueId));
+      expect(commentsAfter.filter((comment) => comment.authorType !== "system")).toEqual(savedComments);
+      expect(commentsAfter.filter((comment) => comment.authorType === "system")).toHaveLength(1);
       expect(await db.select().from(documentRevisions).where(eq(documentRevisions.documentId, documentId))).toHaveLength(1);
       const [savedDocument] = await db.select().from(documents).where(eq(documents.id, documentId));
       expect(savedDocument).toMatchObject({ latestBody: "Only the two approved changes.", latestRevisionId: revisionId });
@@ -478,6 +480,36 @@ const support = externalDatabaseUrl
       expect(actions).toHaveLength(1);
       expect(actions[0]).toMatchObject({ status: "resolved", evidence: { continuationDelivery: "pending", executionReconciliation: { runId: source.runId } } });
       await db.update(issueRecoveryActions).set({ evidence: { ...actions[0]!.evidence, continuationDelivery: "invalidated" } }).where(eq(issueRecoveryActions.id, action!.id));
+    });
+    it("settles a stopped legacy run exactly once and never re-blocks after an external repair", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled", errorCode: "agent_paused" }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      await settleUnrecoverableExecutions(db);
+      const [blocked] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      expect(blocked.status).toBe("blocked");
+      expect(blocked.blockedTransitionAt).toBeInstanceOf(Date);
+      expect(blocked.unblockDescriptor).toMatchObject({ owner: { agentId: source.agentId } });
+      expect(blocked.unblockDescriptor!.action).toContain(source.runId);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, source.issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]).toMatchObject({ authorType: "system" });
+      expect(comments[0]!.body).toContain(source.runId);
+      const [first] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      expect(first).toMatchObject({ status: "resolved", outcome: "blocked" });
+
+      await db.update(issues).set({ status: "in_review", blockedTransitionAt: null, unblockDescriptor: null }).where(eq(issues.id, source.issueId));
+      const [repaired] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      for (let sweep = 0; sweep < 2; sweep++) {
+        await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+        await settleUnrecoverableExecutions(db);
+      }
+      const [after] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      expect(after).toMatchObject({ status: "in_review", statusVersion: repaired.statusVersion, unblockDescriptor: null, blockedTransitionAt: null });
+      const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      expect(actions.map((action) => action.id)).toEqual([first!.id]);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, source.issueId))).toHaveLength(1);
     });
     it("surfaces a failed current reviewer without transferring the original assignment", async () => {
       const source = await seed();

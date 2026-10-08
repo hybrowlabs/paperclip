@@ -85,6 +85,22 @@ describe("execution truth projection", () => {
     expect(source.status).toBe("failed");
   });
 
+  it.each([
+    { returnOwnerAgentId: "agent-1", recoveryOwner: "agent" },
+    { returnOwnerAgentId: null, recoveryOwner: "board" },
+  ])("names the recovery owner and inspect action for a settled no-replay hold: $returnOwnerAgentId", ({ returnOwnerAgentId, recoveryOwner }) => {
+    expect(projectExecution(run({ id: "old", status: "cancelled", runtimeMode: "legacy" }), undefined, [], {
+      status: "resolved",
+      cause: "legacy_execution_requires_reconciliation",
+      nextAction: "Inspect the stopped run.",
+      returnOwnerAgentId,
+      evidence: { runId: "old", automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked" } },
+    }, now)).toMatchObject({
+      phase: "recovery_needed", label: "Stopped", recoveryOwner,
+      permittedActions: ["inspect_run", "inspect_recovery"],
+    });
+  });
+
   it("shows a reconciled continuation as queued until its durable delivery is recorded", () => {
     const action = {
       cause: "native_session_retry_exhausted",

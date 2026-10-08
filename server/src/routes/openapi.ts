@@ -1228,6 +1228,7 @@ function registerCurrentRoute(input: {
   path: string;
   tags: string[];
   summary: string;
+  description?: string;
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
@@ -1246,6 +1247,7 @@ function registerCurrentRoute(input: {
     path: input.path,
     tags: input.tags,
     summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
     ...(request ? { request } : {}),
     responses: input.responses ?? {
       200: r.ok(),
@@ -10132,7 +10134,19 @@ registerCurrentRoute({
   path: "/api/issues/{id}/recovery-actions/resolve",
   tags: ["issues"],
   summary: "Resolve an issue recovery action",
+  description:
+    "Board or agent callers may use this route; an agent must use a run-bound token and pass the normal issue-mutation checks. " +
+    "Board-only branches return 403 `Board access required` to agents: outcomes `false_positive` and `cancelled`, " +
+    "and any request that carries `executionReconciliation` (verified outcomes of a stopped run are attested by the board).",
   body: resolveIssueRecoveryActionSchema,
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registerCurrentRoute({

@@ -39,7 +39,10 @@ type Recovery = Pick<
   "cause" | "nextAction"
 > &
   Partial<
-    Pick<typeof issueRecoveryActions.$inferSelect, "status" | "evidence">
+    Pick<
+      typeof issueRecoveryActions.$inferSelect,
+      "status" | "evidence" | "returnOwnerAgentId"
+    >
   >;
 
 /** Batched reads; list consumers do not perform per-task polling. */
@@ -99,6 +102,7 @@ export async function executionProjectionsForRuns(
           nextAction: issueRecoveryActions.nextAction,
           evidence: issueRecoveryActions.evidence,
           status: issueRecoveryActions.status,
+          returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
         })
         .from(issueRecoveryActions)
         .where(
@@ -195,7 +199,9 @@ export function projectExecution(
       projection.nextAction = null;
       return set("completed", "Continued in another run");
     }
-    // Diagnostic projection only: no user decision or replay affordance.
+    // No replay affordance: the settled hold only names who inspects it.
+    projection.recoveryOwner = recoveryAction.returnOwnerAgentId ? "agent" : "board";
+    projection.permittedActions.push("inspect_recovery");
     return set("recovery_needed", "Stopped");
   }
   if (
