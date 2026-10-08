@@ -52,9 +52,10 @@
 
 import { and, eq, gt, isNull, lte, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import { pluginJobs, pluginJobRuns, pluginLogs } from "@paperclipai/db";
 import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { buildJobFailureLogRow } from "./plugin-job-health.js";
 import { parseCron, nextCronTick, validateCron } from "./cron.js";
 import { logger } from "../middleware/logger.js";
 
@@ -447,6 +448,41 @@ export function createPluginJobScheduler(
   }
 
   /**
+   * Write an error row to `plugin_logs` for a failed run, so a plugin that stays
+   * `ready` while its jobs fail is still visible. Never throws.
+   */
+  async function recordJobFailureLog(
+    job: typeof pluginJobs.$inferSelect,
+    runId: string | undefined,
+    trigger: string,
+    durationMs: number,
+    error: string,
+  ): Promise<void> {
+    try {
+      await db.insert(pluginLogs).values(
+        buildJobFailureLogRow({
+          pluginId: job.pluginId,
+          jobId: job.id,
+          jobKey: job.jobKey,
+          runId,
+          trigger,
+          durationMs,
+          error,
+        }),
+      );
+    } catch (logErr) {
+      log.error(
+        {
+          jobId: job.id,
+          runId,
+          err: logErr instanceof Error ? logErr.message : String(logErr),
+        },
+        "failed to write job failure to plugin_logs",
+      );
+    }
+  }
+
+  /**
    * Execute a scheduled run after the slot claim and overlap guard have
    * passed: create the run record, call the worker, record the result.
    */
@@ -504,6 +540,7 @@ export function createPluginJobScheduler(
         { runId, durationMs, err: errorMessage },
         "job execution failed",
       );
+      await recordJobFailureLog(job, runId, "schedule", durationMs, errorMessage);
 
       // Record the failure
       if (runId) {
@@ -647,6 +684,7 @@ export function createPluginJobScheduler(
       const durationMs = Date.now() - startedAt;
       const errorMessage = err instanceof Error ? err.message : String(err);
       jobLog.error({ durationMs, err: errorMessage }, "manual job failed");
+      await recordJobFailureLog(job, runId, trigger, durationMs, errorMessage);
 
       try {
         await jobStore.completeRun(runId, {

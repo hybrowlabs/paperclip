@@ -2409,3 +2409,192 @@ describe("plugin worker manager login pseudo-terminal pre-bind queue", () => {
     }
   });
 });
+
+describe("plugin scheduled-job invocation scope (HYBA-876)", () => {
+  // A scheduled job (`runJob`) carries no company, so the host used to register
+  // no invocation for it. Its nested host calls then went out without an id, and
+  // the host rejected them whenever an unrelated `onEvent` notification
+  // invocation (15-minute TTL) was still registered. Each case drives a real
+  // worker so the nested call flows through the manager's context resolution.
+  const ALL_COMPANIES = [
+    { id: "company-1", name: "One" },
+    { id: "company-2", name: "Two" },
+    { id: "company-3", name: "Three" },
+  ];
+
+  function makeHandle(configuredCompanies: readonly string[] = ["company-1", "company-2"]) {
+    const companiesGet = vi.fn(async (params: { companyId: string }) => ({ id: params.companyId, name: "Co" }));
+    const companiesList = vi.fn(async () => ALL_COMPANIES);
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["companies.read"],
+      services: {
+        companies: { get: companiesGet, list: companiesList },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers,
+      proactiveCompanyScopes: configuredCompanies,
+    });
+    return { handle, companiesGet, companiesList };
+  }
+
+  function runJob(
+    handle: ReturnType<typeof createPluginWorkerHandle>,
+    params: Record<string, unknown>,
+  ) {
+    return handle.call("runJob", {
+      job: {
+        jobKey: "inbound-poll",
+        runId: "run-1",
+        trigger: "schedule",
+        scheduledAt: new Date().toISOString(),
+        params,
+      },
+    } as unknown as HostToWorkerMethods["runJob"][0]);
+  }
+
+  function pendingEvent(handle: ReturnType<typeof createPluginWorkerHandle>, companyId: string) {
+    handle.notify("onEvent", {
+      event: { eventType: "issue.updated", companyId, payload: {} },
+    });
+  }
+
+  it("a job's companies.list succeeds with no unrelated activity", async () => {
+    const { handle } = makeHandle();
+    try {
+      await handle.start();
+      const result = await runJob(handle, { mode: "echo", hostMethod: "companies.list" });
+      expect((result as Array<{ id: string }>).map((c) => c.id)).toEqual(["company-1", "company-2"]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("a job's host calls succeed while an onEvent invocation is still pending", async () => {
+    const { handle, companiesGet } = makeHandle();
+    try {
+      await handle.start();
+      pendingEvent(handle, "company-3");
+      pendingEvent(handle, "company-1");
+
+      const listed = await runJob(handle, { mode: "echo", hostMethod: "companies.list" });
+      expect((listed as Array<{ id: string }>).map((c) => c.id)).toEqual(["company-1", "company-2"]);
+
+      const got = await runJob(handle, {
+        mode: "echo",
+        hostMethod: "companies.get",
+        requestedCompanyId: "company-2",
+      });
+      expect(got).toMatchObject({ id: "company-2" });
+      expect(companiesGet).toHaveBeenCalledTimes(1);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("a job's id-less proactive call succeeds while an onEvent invocation is still pending", async () => {
+    const { handle } = makeHandle();
+    try {
+      await handle.start();
+      pendingEvent(handle, "company-3");
+      const result = await runJob(handle, {
+        mode: "omit",
+        hostMethod: "companies.get",
+        requestedCompanyId: "company-1",
+      });
+      expect(result).toMatchObject({ id: "company-1" });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("a job's companies.list exposes only the configured companies", async () => {
+    const { handle } = makeHandle(["company-2"]);
+    try {
+      await handle.start();
+      const result = await runJob(handle, { mode: "echo", hostMethod: "companies.list" });
+      expect((result as Array<{ id: string }>).map((c) => c.id)).toEqual(["company-2"]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("a job's companies.list returns nothing when no company is configured", async () => {
+    const { handle } = makeHandle([]);
+    try {
+      await handle.start();
+      const result = await runJob(handle, { mode: "echo", hostMethod: "companies.list" });
+      expect(result).toEqual([]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("a proactive id-less companies.list is also limited to configured companies", async () => {
+    const { handle } = makeHandle(["company-1"]);
+    try {
+      await handle.start();
+      const result = await runJob(handle, { mode: "omit", hostMethod: "companies.list" });
+      expect((result as Array<{ id: string }>).map((c) => c.id)).toEqual(["company-1"]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("still denies a job's call for a company that is not configured", async () => {
+    const { handle, companiesGet } = makeHandle(["company-1"]);
+    try {
+      await handle.start();
+      pendingEvent(handle, "company-3");
+      for (const mode of ["echo", "omit"]) {
+        await expect(runJob(handle, {
+          mode,
+          hostMethod: "companies.get",
+          requestedCompanyId: "company-3",
+        })).rejects.toMatchObject({
+          code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+        });
+      }
+      expect(companiesGet).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("still denies a job call that carries a forged invocation id", async () => {
+    const { handle, companiesList } = makeHandle();
+    try {
+      await handle.start();
+      await expect(runJob(handle, { mode: "unknown", hostMethod: "companies.list" })).rejects.toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+        message: expect.stringContaining("missing, expired, or unknown invocation scope"),
+      });
+      expect(companiesList).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("still rejects an id-less call while a company-scoped call invocation is in flight", async () => {
+    const { handle, companiesGet } = makeHandle(["company-1"]);
+    try {
+      await handle.start();
+      await expect(handle.call("getData", {
+        companyId: "company-1",
+        params: { mode: "omit", hostMethod: "companies.list" },
+      } as unknown as HostToWorkerMethods["getData"][0])).rejects.toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+        message: expect.stringContaining("missing, expired, or unknown invocation scope"),
+      });
+      expect(companiesGet).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});

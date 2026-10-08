@@ -809,10 +809,18 @@ export function createHostClientHandlers(
     "companies.list": gated("companies.list", async (params, context) => {
       const rows = await services.companies.list(params);
       const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
-      if (!allowedCompanyId) return rows;
-      return rows.filter((company) =>
-        isRecord(company) && company.id === allowedCompanyId,
-      ) as WorkerToHostMethods["companies.list"][1];
+      if (allowedCompanyId) {
+        return rows.filter((company) =>
+          isRecord(company) && company.id === allowedCompanyId,
+        ) as WorkerToHostMethods["companies.list"][1];
+      }
+      if (context?.allowedCompanyIds) {
+        const allowed = new Set(context.allowedCompanyIds);
+        return rows.filter((company) =>
+          isRecord(company) && typeof company.id === "string" && allowed.has(company.id),
+        ) as WorkerToHostMethods["companies.list"][1];
+      }
+      return rows;
     }),
     "companies.get": gated("companies.get", async (params) => {
       return services.companies.get(params);

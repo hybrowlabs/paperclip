@@ -290,7 +290,12 @@ export interface PluginInvocationScope {
  */
 export interface PluginInvocationContext {
   id: string;
-  scope: PluginInvocationScope;
+  /**
+   * Company scope of the invocation. Null/absent for invocations that are not
+   * tied to one company (a scheduled `runJob`): the host then judges each nested
+   * call against the plugin's configured companies.
+   */
+  scope?: PluginInvocationScope | null;
   /**
    * An optional W3C `traceparent` for the active host span. The host mints it
    * per call from the active startup span. The worker treats it as opaque: it
@@ -308,6 +313,12 @@ export interface PluginInvocationContext {
 export interface WorkerHostCallContext {
   invocationScope?: PluginInvocationScope | null;
   invalidInvocationScope?: boolean;
+  /**
+   * The companies this plugin is configured for. The host sets it on calls made
+   * outside a company-scoped invocation (a scheduled job or a proactive loop) so
+   * a wildcard read such as `companies.list` returns only these companies.
+   */
+  allowedCompanyIds?: readonly string[];
   /**
    * The W3C `traceparent` the host minted for the echoed invocation. The host
    * recovers it from its own invocation record, not from the worker, so a worker

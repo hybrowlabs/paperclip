@@ -58,6 +58,7 @@ import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
 import type { PluginJobScheduler } from "../services/plugin-job-scheduler.js";
 import type { PluginJobStore } from "../services/plugin-job-store.js";
+import { evaluateScheduledJobHealth } from "../services/plugin-job-health.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import type { PluginStreamBus } from "../services/plugin-stream-bus.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
@@ -2100,6 +2101,25 @@ export function pluginRoutes(
    * Response: PluginHealthCheckResult
    * Errors: 404 if plugin not found
    */
+  async function appendScheduledJobCheck(
+    pluginDbId: string,
+    checks: PluginHealthCheckResult["checks"],
+  ): Promise<boolean> {
+    if (!jobDeps) return true;
+    try {
+      const runs = await jobDeps.jobStore.listRunsByPlugin(pluginDbId, undefined, 100);
+      const jobs = await jobDeps.jobStore.listJobs(pluginDbId);
+      const check = evaluateScheduledJobHealth(
+        runs,
+        new Map(jobs.map((j) => [j.id, j.jobKey])),
+      );
+      if (!check.passed) checks.push(check);
+      return check.passed;
+    } catch {
+      return true;
+    }
+  }
+
   router.get("/plugins/:pluginId/health", async (req, res) => {
     assertBoardOrgAccess(req);
     const { pluginId } = req.params;
@@ -2145,10 +2165,13 @@ export function pluginRoutes(
       });
     }
 
+    // Check 5: scheduled jobs are not failing repeatedly
+    const jobsHealthy = await appendScheduledJobCheck(plugin.id, checks);
+
     const result: PluginHealthCheckResult = {
       pluginId: plugin.id,
       status: plugin.status,
-      healthy: isHealthy && hasValidManifest && hasNoError,
+      healthy: isHealthy && hasValidManifest && hasNoError && jobsHealthy,
       checks,
       lastError: plugin.lastError ?? undefined,
     };
@@ -3222,10 +3245,12 @@ export function pluginRoutes(
       });
     }
 
+    const jobsHealthy = await appendScheduledJobCheck(plugin.id, checks);
+
     const health: PluginHealthCheckResult = {
       pluginId: plugin.id,
       status: plugin.status,
-      healthy: isHealthy && hasValidManifest && hasNoError,
+      healthy: isHealthy && hasValidManifest && hasNoError && jobsHealthy,
       checks,
       lastError: plugin.lastError ?? undefined,
     };
