@@ -200,7 +200,10 @@ import {
   type QueuedCommentIssueContext,
 } from "../modules/wake-queue/index.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
-import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
+import {
+  assertCanResolveProposal,
+  hasSecretDefinitionAdminAccess,
+} from "../services/secret-proposal-authorization.js";
 import {
   buildDocumentReviewContext,
   buildPlanReviewContext,
@@ -16205,8 +16208,32 @@ export function issueRoutes(
             ) {
               throw notFound("Secret proposal not found");
             }
+            const dependency = proposal.secretProposalId
+              ? await secretProposals.getById(
+                  issue.companyId,
+                  proposal.secretProposalId,
+                )
+              : null;
+            const cascade =
+              dependency?.kind === "secret" &&
+              dependency.status === "pending" &&
+              dependency.originIssueId === issue.id;
+            if (cascade && dependency) {
+              await assertCanResolveProposal({
+                db,
+                actor: req.actor,
+                companyId: issue.companyId,
+                proposal: dependency,
+                assertSecretDefinitionAdmin: () => {
+                  if (!hasSecretDefinitionAdminAccess(req.actor, issue.companyId)) {
+                    throw forbidden("Company admin access required");
+                  }
+                },
+              });
+            }
             await secretProposals.approve(issue.companyId, proposal.id, {
               resolvedByUserId,
+              cascade,
               assertCanResolve: (lockedProposal, txDb) =>
                 assertCanResolveProposal({
                   db: txDb,

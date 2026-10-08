@@ -25,6 +25,7 @@ import {
 } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { issueRoutes } from "../routes/issues.js";
 import { secretRoutes } from "../routes/secrets.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
 import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
@@ -219,6 +220,49 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     app.use("/api", secretRoutes(db, { heartbeat: options?.heartbeat, issues: options?.issues }));
     app.use(errorHandler);
     return app;
+  }
+
+  function createIssueBoardApp(fixture: Awaited<ReturnType<typeof seedRun>>, options?: { admin?: boolean }) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        companyIds: [fixture.companyId],
+        source: options?.admin === false ? "session" : "local_implicit",
+        memberships: options?.admin === false
+          ? [{ companyId: fixture.companyId, status: "active", membershipRole: "member" }]
+          : undefined,
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never));
+    app.use(errorHandler);
+    return app;
+  }
+
+  async function proposeSecretAndBinding(fixture: Awaited<ReturnType<typeof seedRun>>) {
+    const secretResponse = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "secret",
+        name: "dev/card/token",
+        key: "CARD_TOKEN",
+        value: "card-top-secret",
+        justification: "Needed by task",
+      });
+    expect(secretResponse.status).toBe(201);
+    const bindingResponse = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretProposalId: secretResponse.body.id,
+        configPath: "env.CARD_TOKEN",
+        justification: "Inject for the task",
+      });
+    expect(bindingResponse.status).toBe(201);
+    return { secretProposalId: secretResponse.body.id as string, binding: bindingResponse.body };
   }
 
   it("requires company admin access to reject secret proposals", async () => {
@@ -1546,5 +1590,47 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     ]);
     expect(await db.select({ reportsTo: agents.reportsTo }).from(agents).where(eq(agents.id, targetAgentId)))
       .toEqual([{ reportsTo: null }]);
+  });
+
+  it("cascades a pending secret proposal when the binding confirmation card is accepted", async () => {
+    const fixture = await seedRun();
+    const { secretProposalId, binding } = await proposeSecretAndBinding(fixture);
+
+    const accepted = await request(createIssueBoardApp(fixture))
+      .post(`/api/issues/${fixture.issueId}/interactions/${binding.interactionId}/accept`)
+      .send({});
+    expect(accepted.status).toBe(200);
+    expect(JSON.stringify(accepted.body)).not.toContain("card-top-secret");
+    expect(accepted.body.result).toMatchObject({
+      outcome: "accepted",
+      secretProposal: expect.objectContaining({ status: "executed" }),
+    });
+    expect(await db.select().from(companySecretProposals)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: secretProposalId, status: "approved", valueCiphertext: null }),
+      expect.objectContaining({ id: binding.id, status: "approved" }),
+    ]));
+    const [secret] = await db.select().from(companySecrets);
+    expect(await db.select().from(companySecretBindings)).toEqual([
+      expect.objectContaining({ secretId: secret.id, targetId: fixture.agentId, configPath: "env.CARD_TOKEN" }),
+    ]);
+  });
+
+  it("records a readable http_403 and approves nothing when a non-admin accepts the binding card", async () => {
+    const fixture = await seedRun();
+    const { secretProposalId, binding } = await proposeSecretAndBinding(fixture);
+
+    const accepted = await request(createIssueBoardApp(fixture, { admin: false }))
+      .post(`/api/issues/${fixture.issueId}/interactions/${binding.interactionId}/accept`)
+      .send({});
+    expect(accepted.status).toBe(200);
+    expect(JSON.stringify(accepted.body)).not.toContain("card-top-secret");
+    expect(accepted.body.result).toMatchObject({
+      secretProposal: expect.objectContaining({ status: "failed", errorCode: "http_403" }),
+    });
+    expect(await db.select().from(companySecrets)).toHaveLength(0);
+    expect(await db.select().from(companySecretBindings)).toHaveLength(0);
+    expect(await db.select().from(companySecretProposals)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: secretProposalId, status: "pending" }),
+    ]));
   });
 });
