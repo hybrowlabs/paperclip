@@ -62,3 +62,28 @@ describe("dynamic adapter type validation schemas", () => {
     expect(AGENT_ROLE_LABELS.security).toBe("Security");
   });
 });
+
+describe("updateAgentSchema adapterConfig env removal", () => {
+  it("accepts a null env entry as a removal request on update", () => {
+    const parsed = updateAgentSchema.parse({
+      adapterConfig: { env: { OLD_SECRET: null } },
+    });
+    expect(parsed.adapterConfig).toEqual({ env: { OLD_SECRET: null } });
+  });
+
+  it("still rejects a malformed env binding on update", () => {
+    expect(() =>
+      updateAgentSchema.parse({ adapterConfig: { env: { BAD: 42 } } }),
+    ).toThrow();
+  });
+
+  it("still rejects a null env entry on create", () => {
+    expect(() =>
+      createAgentSchema.parse({
+        name: "Null Env",
+        adapterType: "process",
+        adapterConfig: { env: { OLD_SECRET: null } },
+      }),
+    ).toThrow();
+  });
+});

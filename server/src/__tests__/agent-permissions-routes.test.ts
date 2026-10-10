@@ -651,6 +651,48 @@ describe.sequential("agent permission routes", () => {
     expect(JSON.stringify(updateCallArgs?.adapterConfig ?? {})).not.toContain("***REDACTED***");
   }, 20_000);
 
+  it("removes exactly one env binding when it is set to null and keeps every other stored value", async () => {
+    const plaintextValue = "stored-value-must-be-preserved";
+    const secretRef = { type: "secret_ref", secretId: "66666666-6666-4666-8666-666666666666", version: "latest" };
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        model: "m1",
+        "access.stale_credentials": secretRef,
+        env: {
+          ANTHROPIC_BASE_URL: { type: "plain", value: plaintextValue },
+          ROOT_PASSWORD: secretRef,
+        },
+      },
+    });
+    mockAgentService.update.mockResolvedValue(baseAgent);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send({
+        adapterConfig: { env: { ROOT_PASSWORD: null }, "access.stale_credentials": null },
+      }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updateCallArgs = mockAgentService.update.mock.calls[0]?.[1] as
+      | { adapterConfig?: Record<string, unknown> }
+      | undefined;
+    expect(updateCallArgs?.adapterConfig?.env).toEqual({
+      ANTHROPIC_BASE_URL: { type: "plain", value: plaintextValue },
+    });
+    expect(updateCallArgs?.adapterConfig).not.toHaveProperty("access.stale_credentials");
+    expect(updateCallArgs?.adapterConfig?.model).toBe("m1");
+    expect(JSON.stringify(updateCallArgs?.adapterConfig ?? {})).not.toContain("***REDACTED***");
+  }, 20_000);
+
   it("redacts company agent list for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
