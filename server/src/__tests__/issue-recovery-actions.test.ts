@@ -35,6 +35,7 @@ import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbe
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
@@ -2771,6 +2772,25 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "pending", currentStageId: stageId, changesRequestedCount: 2, lastDecisionOutcome: "changes_requested",
     });
     expect(row.assigneeAgentId).toBe(coderId);
+  });
+
+  it("rejects cause_removed while a pure ancestor cycle (child -> parent -> blocked-by -> child) remains", async () => {
+    const { companyId, coderId, sourceIssueId, parentId, recheckId, action } = await seedCancelledByDependencyCycle();
+    await db.delete(issueRelations).where(eq(issueRelations.issueId, recheckId));
+    await db.insert(issueRelations).values([
+      { companyId, issueId: recheckId, relatedIssueId: parentId, type: "blocks" },
+    ]);
+    const readiness = await issueService(db).getDependencyReadiness(sourceIssueId);
+    expect(readiness.unresolvedBlockerCount).toBe(0);
+    const actor = await agentActor(companyId, coderId, sourceIssueId);
+    const rejected = await asAgent(request(createApp(actor))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`), actor)
+      .send({ actionId: action.id, outcome: "cause_removed", sourceIssueStatus: "todo" })
+      .expect(409);
+    expect(rejected.body.details?.code ?? rejected.body.code).toBe("recovery_cause_still_present");
+    expect(rejected.body.details?.cycle?.viaAncestor?.id).toBe(parentId);
+    const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(row).toMatchObject({ status: "active", outcome: null });
   });
 
   it("does not let cause_removed claim a cause it cannot verify", async () => {

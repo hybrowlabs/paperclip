@@ -3708,9 +3708,13 @@ async function terminalExplicitBlockersByRoot(
 type IssueBlockerAttentionCycleResult = NonNullable<IssueBlockerAttention["cycle"]>;
 
 /**
- * Finds the shortest dependency cycle that returns to `rootId`, walking the
- * graph dependency gating reads: unresolved blocked-by edges plus the parent
- * chain. Returns null when the root sits on no cycle.
+ * Finds the shortest dependency cycle that returns to `rootId`, walking
+ * unresolved blocked-by edges plus the parent chain (the graph
+ * `blockerAttention` reports over). This is wider than the dispatch gate:
+ * `listIssueDependencyReadinessMap` reads direct blocked-by edges only, so a
+ * pure ancestor cycle is a liveness hazard the gate does not itself cancel on.
+ * `assertRecoveryCauseRemoved` uses this wider walk so `cause_removed` fails
+ * closed while either shape remains. Returns null when the root sits on no cycle.
  */
 async function findIssueDependencyCycle(
   dbOrTx: any,

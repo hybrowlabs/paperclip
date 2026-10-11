@@ -6740,7 +6740,7 @@ export function issueRoutes(
       );
     }
     const readiness = await svc.getDependencyReadiness(issue.id, tx);
-    const cycle = await svc.findDependencyCycle(issue.companyId, issue.id, tx, { includeParents: false });
+    const cycle = await svc.findDependencyCycle(issue.companyId, issue.id, tx);
     if (readiness.unresolvedBlockerCount > 0 || cycle) {
       throw conflict(
         "The dependency that cancelled the run is still present",
