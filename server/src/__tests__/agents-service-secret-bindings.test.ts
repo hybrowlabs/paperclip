@@ -20,6 +20,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
 import { secretService } from "../services/secrets.js";
+import { applyAdapterConfigPatch } from "../services/adapter-config-patch.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -323,6 +324,60 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       secretId: nextSecret.id,
       configPath: "env.NEW_KEY",
     });
+  });
+
+  it("revokes exactly one env binding and one top-level binding when a null merge patch is applied, preserving plain values", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const rootSecret = await secrets.create(companyId, {
+      name: `root-${randomUUID()}`, provider: "local_encrypted", value: "root-value",
+    });
+    const keepSecret = await secrets.create(companyId, {
+      name: `keep-${randomUUID()}`, provider: "local_encrypted", value: "keep-value",
+    });
+    const accessSecret = await secrets.create(companyId, {
+      name: `access-${randomUUID()}`, provider: "local_encrypted", value: "access-value",
+    });
+    const ref = (id: string) => ({ type: "secret_ref", secretId: id, version: "latest" });
+    const created = await agentService(db).create(companyId, {
+      name: "Null Merge Revoker",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {
+        model: "m1",
+        "access.stale_credentials": ref(accessSecret.id),
+        env: {
+          ANTHROPIC_BASE_URL: { type: "plain", value: "https://real.example" },
+          ROOT_PASSWORD: ref(rootSecret.id),
+          KEEP_ME: ref(keepSecret.id),
+        },
+      },
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+
+    const merged = applyAdapterConfigPatch(
+      created.adapterConfig as Record<string, unknown>,
+      { env: { ROOT_PASSWORD: null }, "access.stale_credentials": null },
+    );
+    const updated = await agentService(db).update(created.id, { adapterConfig: merged });
+
+    const config = updated?.adapterConfig as Record<string, any>;
+    expect(config.env.ANTHROPIC_BASE_URL).toEqual({ type: "plain", value: "https://real.example" });
+    expect(config.env).not.toHaveProperty("ROOT_PASSWORD");
+    expect(config).not.toHaveProperty("access.stale_credentials");
+    expect(JSON.stringify(config)).not.toContain("***REDACTED***");
+
+    const bindings = await db
+      .select()
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, created.id),
+      ));
+    expect(bindings.map((b) => b.configPath)).toEqual(["env.KEEP_ME"]);
   });
 
   it("backfills missing secret bindings when a legacy pending agent is approved", async () => {

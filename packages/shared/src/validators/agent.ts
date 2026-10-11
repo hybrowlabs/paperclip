@@ -62,6 +62,19 @@ const adapterConfigSchema = z.record(z.string(), z.unknown()).superRefine((value
   }
 });
 
+const adapterConfigPatchSchema = z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
+  const envValue = value.env;
+  if (envValue === undefined) return;
+  const parsed = z.record(z.string(), envConfigSchema.valueType.nullable()).safeParse(envValue);
+  if (!parsed.success) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "adapterConfig.env must be a map of valid env bindings (null removes a binding)",
+      path: ["env"],
+    });
+  }
+});
+
 export const createAgentInstructionsBundleSchema = z.object({
   entryFile: z.string().trim().min(1).optional(),
   files: z.record(z.string(), z.string()).refine((files) => Object.keys(files).length > 0, {
@@ -154,6 +167,7 @@ export const updateAgentSchema = objectWithoutDefaults(
   .partial()
   .extend({
     permissions: z.never().optional(),
+    adapterConfig: adapterConfigPatchSchema.optional(),
     replaceAdapterConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),
