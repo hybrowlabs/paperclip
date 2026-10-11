@@ -10137,7 +10137,10 @@ registerCurrentRoute({
   description:
     "Board or agent callers may use this route; an agent must use a run-bound token and pass the normal issue-mutation checks. " +
     "Board-only branches return 403 `Board access required` to agents: outcomes `false_positive` and `cancelled`, " +
-    "and any request that carries `executionReconciliation` (verified outcomes of a stopped run are attested by the board).",
+    "and any request that carries `executionReconciliation` (verified outcomes of a stopped run are attested by the board). " +
+    "Outcome `cause_removed` is agent-usable: it means the cause of a dependency-cancelled run is gone but the work is not done. " +
+    "It returns the source issue to `todo` (or `in_review` when the assignee holds the pending stage) without advancing, satisfying or spending a round of a pending review/approval stage. " +
+    "It is rejected with 409 `recovery_cause_still_present` while the issue still has unresolved blockers or sits on a blocked-by cycle, and with 409 `recovery_cause_not_verifiable` for causes the server cannot verify.",
   body: resolveIssueRecoveryActionSchema,
   responses: {
     200: r.ok(),

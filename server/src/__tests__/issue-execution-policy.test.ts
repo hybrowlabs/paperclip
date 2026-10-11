@@ -1840,6 +1840,38 @@ describe("review round circuit breaker", () => {
     });
   });
 
+  it("does not spend a changes-requested round on a recovery repair write", () => {
+    const issue = reviewPendingIssue({ status: "blocked" }, { changesRequestedCount: 2 });
+    const result = applyIssueExecutionPolicyTransition({
+      issue,
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Cause removed; handing the task back.",
+      recoveryRepair: true,
+    });
+
+    expect(result.decision).toBeUndefined();
+    expect(result.patch.executionState).toBeUndefined();
+    expect(result.patch.assigneeUserId).toBeUndefined();
+    expect(result.workflowControlledAssignment).toBeUndefined();
+  });
+
+  it("still counts the same write as a verdict when it is not a recovery repair", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue({}, { changesRequestedCount: 1 }),
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Round two feedback",
+    });
+
+    expect(result.decision).toMatchObject({ outcome: "changes_requested" });
+    expect(result.patch.executionState).toMatchObject({ changesRequestedCount: 2 });
+  });
+
   it("carries the round count through the executor's resubmission", () => {
     const result = applyIssueExecutionPolicyTransition({
       issue: {

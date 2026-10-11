@@ -511,6 +511,51 @@ const support = externalDatabaseUrl
       expect(actions.map((action) => action.id)).toEqual([first!.id]);
       expect(await db.select().from(issueComments).where(eq(issueComments.issueId, source.issueId))).toHaveLength(1);
     });
+    it("words the settled descriptor only with actions the named agent owner may perform", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled", errorCode: "agent_paused" }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      await settleUnrecoverableExecutions(db);
+      const [blocked] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      const action = blocked.unblockDescriptor!.action;
+      expect(action).toContain(source.runId);
+      expect(action).not.toMatch(/recovery-actions|resolve endpoint/i);
+      expect(action).toMatch(/return the task to (todo|in_progress)/i);
+    });
+    it("delivers exactly one unblock wake for a settled hold and never re-notifies", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled", errorCode: "agent_paused" }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const wake = vi.fn(async () => undefined);
+      await settleUnrecoverableExecutions(db, undefined, { wakeup: wake });
+      await settleUnrecoverableExecutions(db, undefined, { wakeup: wake });
+      await settleUnrecoverableExecutions(db, undefined, { wakeup: wake });
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(wake).toHaveBeenCalledWith(source.agentId, expect.objectContaining({
+        reason: "issue_unblock_requested",
+        payload: expect.objectContaining({ issueId: source.issueId }),
+      }));
+      const [row] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      expect(row.blockedOwnerNotifiedAt).toBeInstanceOf(Date);
+    });
+    it("retries a failed unblock wake on a later sweep until it is recorded once", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled", errorCode: "agent_paused" }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      await terminalizeLegacyExecution({ db, run, status: "cancelled" });
+      const wake = vi.fn().mockRejectedValueOnce(new Error("wake unavailable")).mockResolvedValue(undefined);
+      await settleUnrecoverableExecutions(db, undefined, { wakeup: wake });
+      const [first] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      expect(first.status).toBe("blocked");
+      expect(first.blockedOwnerNotifiedAt).toBeNull();
+      await settleUnrecoverableExecutions(db, undefined, { wakeup: wake });
+      await settleUnrecoverableExecutions(db, undefined, { wakeup: wake });
+      expect(wake).toHaveBeenCalledTimes(2);
+      const [second] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      expect(second.blockedOwnerNotifiedAt).toBeInstanceOf(Date);
+    });
     it("surfaces a failed current reviewer without transferring the original assignment", async () => {
       const source = await seed();
       const reviewerId = randomUUID();
