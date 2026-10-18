@@ -184,19 +184,37 @@ function buildOpenCodeSkillConfigContent(env: Record<string, string>, denied: Se
   });
 }
 
-function selectOpenCodeSkills(
-  entries: Array<{ key: string; runtimeName: string; source: string; sourceStatus?: "available" | "missing" }>,
-  desired: string[],
-) {
+const OPENCODE_SKILL_RUNTIME_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:--[a-f0-9]{10})?$/;
+
+type OpenCodeSkillEntry = { key: string; runtimeName: string; source: string; sourceStatus?: "available" | "missing" };
+
+function fallbackOpenCodeSkillName(runtimeName: string): string {
+  return runtimeName.replace(/--[a-f0-9]{10}$/, "");
+}
+
+async function readOpenCodeSkillNames(entry: OpenCodeSkillEntry): Promise<Set<string>> {
+  const names = new Set([entry.runtimeName, fallbackOpenCodeSkillName(entry.runtimeName)]);
+  try {
+    const content = await fs.readFile(path.join(entry.source, "SKILL.md"), "utf8");
+    const frontmatter = /^---\r?\n([\s\S]*?)^---\s*(?:\r?\n|$)/m.exec(content)?.[1] ?? "";
+    const name = /^name:\s*([^\r\n]+)\s*$/m.exec(frontmatter)?.[1]?.trim().replace(/^['"]|['"]$/g, "");
+    if (name) names.add(name);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return names;
+}
+
+async function selectOpenCodeSkills(entries: OpenCodeSkillEntry[], desired: string[]) {
   const selected = new Set(desired);
   const denied = new Set<string>();
   const included: typeof entries = [];
   for (const entry of entries) {
-    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(entry.runtimeName)) {
+    if (!OPENCODE_SKILL_RUNTIME_NAME.test(entry.runtimeName)) {
       throw new Error(`Invalid OpenCode skill name: ${entry.runtimeName}`);
     }
     if (!selected.has(entry.key) || isPaperclipSkillSourceMissing(entry)) {
-      denied.add(entry.runtimeName);
+      for (const name of await readOpenCodeSkillNames(entry)) denied.add(name);
     } else {
       included.push(entry);
     }
@@ -215,7 +233,7 @@ export async function prepareOpenCodeSkillIsolation(
   const skillsDir = path.join(configDir, "skills");
   try {
     await fs.mkdir(skillsDir, { recursive: true });
-    const { denied, included } = selectOpenCodeSkills(entries, desired);
+    const { denied, included } = await selectOpenCodeSkills(entries, desired);
     for (const entry of included) {
       try {
         await fs.access(path.join(entry.source, "SKILL.md"));
@@ -234,10 +252,13 @@ export async function prepareOpenCodeSkillIsolation(
         throw error;
       }
       for (const name of personal) {
-        if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || denied.has(name)) continue;
+        if (!OPENCODE_SKILL_RUNTIME_NAME.test(name)) continue;
+        const source = path.join(personalDir, name);
+        const personalNames = await readOpenCodeSkillNames({ key: name, runtimeName: name, source });
+        if ([...personalNames].some((personalName) => denied.has(personalName))) continue;
         const target = path.join(skillsDir, name);
         try {
-          await fs.symlink(path.join(personalDir, name), target);
+          await fs.symlink(source, target);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         }

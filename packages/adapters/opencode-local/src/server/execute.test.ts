@@ -16,10 +16,10 @@ import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixt
 
 const runProcessMock = vi.mocked(runAdapterExecutionTargetProcess);
 
-async function createSkillDir(root: string, name: string): Promise<string> {
+async function createSkillDir(root: string, name: string, skillName = name): Promise<string> {
   const skillDir = path.join(root, name);
   await fs.mkdir(skillDir, { recursive: true });
-  await fs.writeFile(path.join(skillDir, "SKILL.md"), `# ${name}\n`, "utf8");
+  await fs.writeFile(path.join(skillDir, "SKILL.md"), `---\nname: ${skillName}\ndescription: Test ${skillName}\n---\n# ${name}\n`, "utf8");
   return skillDir;
 }
 
@@ -182,11 +182,12 @@ describe("OpenCode local skill injection", () => {
   it("isolates four agents' selections across runs without altering personal skills", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-isolation-"));
     const names = Array.from({ length: 16 }, (_, index) => `skill-${index.toString().padStart(2, "0")}`);
+    const companyId = "6bdc4d83-9ca6-4f5a-a961-b2088709c621";
     try {
-      const entries = await Promise.all(names.map(async (name) => ({
-        key: name,
-        runtimeName: name,
-        source: await createSkillDir(root, name),
+      const entries = await Promise.all(names.map(async (name, index) => ({
+        key: `company/${companyId}/${name}`,
+        runtimeName: `${name}--${index.toString(16).padStart(10, "0")}`,
+        source: await createSkillDir(root, `${name}--${index.toString(16).padStart(10, "0")}`, name),
       })));
       const personalHome = path.join(root, "home");
       const personal = await createSkillDir(path.join(personalHome, ".claude", "skills"), "personal");
@@ -197,17 +198,18 @@ describe("OpenCode local skill injection", () => {
         ["Compass", names.slice(0, 2)],
       ] as const;
       for (const [agent, selected] of selections) {
-        const isolated = await prepareOpenCodeSkillIsolation({}, entries, selected);
+        const selectedKeys = entries.filter((entry) => selected.includes(entry.runtimeName.split("--")[0]!)).map((entry) => entry.key);
+        const isolated = await prepareOpenCodeSkillIsolation({}, entries, selectedKeys);
         try {
           const visible = await fs.readdir(isolated.skillsDir);
-          expect(visible.sort(), agent).toEqual([...selected].sort());
-          for (const name of names) {
-            if (selected.includes(name)) expect(await fs.realpath(path.join(isolated.skillsDir, name))).toBe(await fs.realpath(path.join(root, name)));
-            else await expect(fs.lstat(path.join(isolated.skillsDir, name))).rejects.toThrow();
+          expect(visible.sort(), agent).toEqual(entries.filter((entry) => selectedKeys.includes(entry.key)).map((entry) => entry.runtimeName).sort());
+          for (const entry of entries) {
+            if (selectedKeys.includes(entry.key)) expect(await fs.realpath(path.join(isolated.skillsDir, entry.runtimeName))).toBe(await fs.realpath(entry.source));
+            else await expect(fs.lstat(path.join(isolated.skillsDir, entry.runtimeName))).rejects.toThrow();
           }
           const policy = JSON.parse(isolated.env.OPENCODE_CONFIG_CONTENT).permission.skill;
-          expect(Object.keys(policy).sort()).toEqual(names.filter((name) => !selected.includes(name)).sort());
-          expect(Object.values(policy)).toEqual(Array(names.length - selected.length).fill("deny"));
+          expect(Object.keys(policy).sort()).toEqual(entries.filter((entry) => !selectedKeys.includes(entry.key)).flatMap((entry) => [entry.runtimeName, entry.runtimeName.split("--")[0]!]).sort());
+          expect(Object.values(policy)).toEqual(Array((names.length - selected.length) * 2).fill("deny"));
           expect(await fs.readFile(path.join(personal, "SKILL.md"), "utf8")).toContain("personal");
         } finally {
           await isolated.cleanup();
@@ -224,23 +226,23 @@ describe("OpenCode local skill injection", () => {
     const home = path.join(root, "home");
     const workspace = path.join(root, "project", "workspace");
     const skillText = (name: string) => `---\nname: ${name}\ndescription: Test ${name}\n---\nSecret marker for ${name}\n`;
-    const add = async (directory: string, name: string) => {
-      const skill = path.join(directory, name);
+    const add = async (directory: string, directoryName: string, skillName = directoryName) => {
+      const skill = path.join(directory, directoryName);
       await fs.mkdir(skill, { recursive: true });
-      await fs.writeFile(path.join(skill, "SKILL.md"), skillText(name));
+      await fs.writeFile(path.join(skill, "SKILL.md"), skillText(skillName));
       return skill;
     };
     try {
       await fs.mkdir(workspace, { recursive: true });
       const allowed = await add(path.join(root, "sources"), "assigned");
-      await add(path.join(home, ".claude", "skills"), "unassigned");
+      await add(path.join(home, ".claude", "skills"), "unassigned-dir--cccccccccc", "unassigned");
       await add(path.join(home, ".claude", "skills"), "personal");
       await add(path.join(home, ".agents", "skills"), "stale-agent");
       await add(path.join(root, "project", ".claude", "skills"), "adjacent");
       await add(path.join(root, "project", ".agents", "skills"), "adjacent-agent");
       const isolated = await prepareOpenCodeSkillIsolation({ HOME: home }, [
         { key: "assigned", runtimeName: "assigned", source: allowed },
-        { key: "unassigned", runtimeName: "unassigned", source: path.join(home, ".claude", "skills", "unassigned") },
+        { key: "unassigned", runtimeName: "unassigned-dir--cccccccccc", source: path.join(home, ".claude", "skills", "unassigned-dir--cccccccccc") },
       ], ["assigned"], true);
       try {
         const baseEnv = {
@@ -283,9 +285,10 @@ describe("OpenCode local skill injection", () => {
     const home = path.join(root, "home");
     const workspace = path.join(root, "workspace");
     const names = ["assigned", "bundled", "unassigned"];
+    const runtimeNames = ["assigned--aaaaaaaaaa", "bundled--bbbbbbbbbb", "unassigned-dir--cccccccccc"];
     let modelCalls = 0;
-    const add = async (name: string) => {
-      const directory = path.join(root, "sources", name);
+    const add = async (runtimeName: string, name: string) => {
+      const directory = path.join(root, "sources", runtimeName);
       await fs.mkdir(directory, { recursive: true });
       await fs.writeFile(path.join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: Test ${name}\n---\nLoader marker for ${name}\n`);
       return directory;
@@ -321,10 +324,12 @@ describe("OpenCode local skill injection", () => {
       await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("OpenCode fixture server did not bind to TCP");
-      const entries = await Promise.all(names.map(async (name) => ({
-        key: name, runtimeName: name, source: await add(name),
+      const entries = await Promise.all(names.map(async (name, index) => ({
+        key: `company/6bdc4d83-9ca6-4f5a-a961-b2088709c621/${name}`,
+        runtimeName: runtimeNames[index]!,
+        source: await add(runtimeNames[index]!, name),
       })));
-      const isolated = await prepareOpenCodeSkillIsolation({ HOME: home }, entries, ["assigned", "bundled"]);
+      const isolated = await prepareOpenCodeSkillIsolation({ HOME: home }, entries, entries.slice(0, 2).map((entry) => entry.key));
       try {
         const env = {
           ...process.env,
@@ -372,6 +377,11 @@ describe("OpenCode local skill injection", () => {
         expect(result("bundled")?.output).toContain("Loader marker for bundled");
         expect(result("unassigned")?.output ?? "").not.toContain("Loader marker for unassigned");
         expect(result("unassigned")?.error).toBeTruthy();
+        const config = JSON.parse(execFileSync("opencode", ["debug", "config", "--pure"], {
+          cwd: workspace, env, encoding: "utf8", timeout: 20000,
+        })) as { permission: { skill: Record<string, string> } };
+        expect(config.permission.skill["unassigned-dir--cccccccccc"]).toBe("deny");
+        expect(config.permission.skill.unassigned).toBe("deny");
       } finally {
         await isolated.cleanup();
       }
