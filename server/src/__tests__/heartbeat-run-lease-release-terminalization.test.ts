@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -222,5 +224,49 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
       .where(eq(heartbeatRunEvents.runId, runId))
       .then((rows) => rows.length);
     expect(eventCount).toBe(0);
+  });
+
+  async function attachClaimedWake(input: { companyId: string; agentId: string; issueId: string; runId: string }) {
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId: input.companyId,
+      agentId: input.agentId,
+      source: "automation",
+      reason: "issue_commented",
+      status: "claimed",
+      payload: { issueId: input.issueId },
+      runId: input.runId,
+      claimedAt: new Date(Date.now() - 77 * 3_600_000),
+    }).returning();
+    await db.update(heartbeatRuns).set({ wakeupRequestId: wake!.id }).where(eq(heartbeatRuns.id, input.runId));
+    return wake!.id;
+  }
+
+  it("AC5: terminalizing an interrupted run closes the claimed wake row", async () => {
+    const { companyId, agentId, issueId, runId, run } = await seed({ issueStatus: "in_progress", runStatus: "running" });
+    const wakeId = await attachClaimedWake({ companyId, agentId, issueId, runId });
+    const terminal = await heartbeatService(db).terminalizeRunOnLeaseRelease({ ...run, wakeupRequestId: wakeId });
+    expect(terminal.status).toBe("interrupted");
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake?.status).toBe("failed");
+    expect(wake?.finishedAt).not.toBeNull();
+    expect(wake?.error).toContain("lease_released_before_terminal");
+  });
+
+  it("AC5: terminalizing a run whose issue is done completes the claimed wake row", async () => {
+    const { companyId, agentId, issueId, runId, run } = await seed({ issueStatus: "done", runStatus: "running" });
+    const wakeId = await attachClaimedWake({ companyId, agentId, issueId, runId });
+    const terminal = await heartbeatService(db).terminalizeRunOnLeaseRelease({ ...run, wakeupRequestId: wakeId });
+    expect(terminal.status).toBe("succeeded");
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake?.status).toBe("completed");
+  });
+
+  it("AC5: a wake row that already left claimed keeps its status", async () => {
+    const { companyId, agentId, issueId, runId, run } = await seed({ issueStatus: "in_progress", runStatus: "running" });
+    const wakeId = await attachClaimedWake({ companyId, agentId, issueId, runId });
+    await db.update(agentWakeupRequests).set({ status: "cancelled", error: "revoked" }).where(eq(agentWakeupRequests.id, wakeId));
+    await heartbeatService(db).terminalizeRunOnLeaseRelease({ ...run, wakeupRequestId: wakeId });
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake).toMatchObject({ status: "cancelled", error: "revoked" });
   });
 });

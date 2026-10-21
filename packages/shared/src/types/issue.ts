@@ -428,7 +428,28 @@ export interface IssueBlockerAttention {
   terminalBlocker?: IssueBlockerAttentionIssueSummary | null;
 }
 
-export type IssueReviewAttentionState = "none" | "covered" | "stalled";
+export type IssueReviewAttentionState = "none" | "covered" | "stalled" | "held";
+
+export type IssueReviewDeliveryFailureKind =
+  | "participant_without_delivery_path"
+  | "execution_blocker_hold"
+  | "stale_deferred_wake"
+  | "stale_wake"
+  | "claimed_wake_terminal_run";
+
+export interface IssueReviewDeliveryFailure {
+  kind: IssueReviewDeliveryFailureKind;
+  reason: string;
+  ref: string | null;
+  responder: string | null;
+}
+
+export interface IssueReviewHold {
+  recoveryActionId: string | null;
+  runId: string | null;
+  cause: string;
+  reason: string;
+}
 
 export type IssueReviewAttentionPathKind =
   | "execution_participant"
@@ -452,6 +473,8 @@ export interface IssueReviewAttention {
   state: IssueReviewAttentionState;
   paths: IssueReviewAttentionPath[];
   reason: string | null;
+  deliveryFailures?: IssueReviewDeliveryFailure[];
+  hold?: IssueReviewHold | null;
 }
 
 export type StalledReviewDecisionAction = "approve" | "request_changes" | "send_back";

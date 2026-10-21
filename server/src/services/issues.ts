@@ -85,6 +85,8 @@ import type {
   IssueCommentPresentation,
   IssueBlockerAttention,
   IssueReviewAttention,
+  IssueReviewDeliveryFailure,
+  IssueReviewHold,
   IssueReviewAttentionPath,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
@@ -180,11 +182,12 @@ import {
 } from "./recovery/origins.js";
 import {
   classifyIssueGraphLiveness,
-  classifyIssueReviewPaths,
+  classifyIssueReviewDelivery,
   type IssueGraphLivenessInput,
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { executionBlockerPredicate } from "./execution-blocker.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -4488,6 +4491,7 @@ async function listIssueReviewAttentionMap(
     approvalRows,
     recoveryActionRows,
     recoveryIssueRows,
+    executionHoldRows,
   ] = await Promise.all([
     dbOrTx
       .select({
@@ -4537,8 +4541,17 @@ async function listIssueReviewAttentionMap(
         status: agentWakeupRequests.status,
         reason: agentWakeupRequests.reason,
         createdAt: agentWakeupRequests.requestedAt,
+        runId: agentWakeupRequests.runId,
+        runStatus: heartbeatRuns.status,
       })
       .from(agentWakeupRequests)
+      .leftJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.id, agentWakeupRequests.runId),
+          eq(heartbeatRuns.companyId, agentWakeupRequests.companyId),
+        ),
+      )
       .where(
         and(
           eq(agentWakeupRequests.companyId, companyId),
@@ -4637,16 +4650,56 @@ async function listIssueReviewAttentionMap(
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       ),
+    dbOrTx
+      .select({
+        id: issueRecoveryActions.id,
+        issueId: issueRecoveryActions.sourceIssueId,
+        cause: issueRecoveryActions.cause,
+        evidence: issueRecoveryActions.evidence,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          inArray(issueRecoveryActions.sourceIssueId, reviewIds),
+          executionBlockerPredicate(),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)),
   ]);
 
+  const executionHoldByIssueId = new Map<
+    string,
+    { recoveryActionId: string | null; runId: string | null; cause: string }
+  >();
+  for (const row of executionHoldRows as Array<{
+    id: string;
+    issueId: string;
+    cause: string;
+    evidence: Record<string, unknown> | null;
+  }>) {
+    if (executionHoldByIssueId.has(row.issueId)) continue;
+    const evidenceRunId = row.evidence?.runId ?? row.evidence?.sourceRunId;
+    executionHoldByIssueId.set(row.issueId, {
+      recoveryActionId: row.id,
+      runId: typeof evidenceRunId === "string" ? evidenceRunId : null,
+      cause: row.cause,
+    });
+  }
+
+  const executionHoldActionIds = new Set(
+    (executionHoldRows as Array<{ id: string }>).map((row) => row.id),
+  );
   const recoveryPaths = [
-    ...(recoveryActionRows as Array<{
-      id: string;
-      companyId: string;
-      issueId: string;
-      status: string;
-      createdAt: Date;
-    }>),
+    ...(
+      recoveryActionRows as Array<{
+        id: string;
+        companyId: string;
+        issueId: string;
+        status: string;
+        createdAt: Date;
+      }>
+    ).filter((row) => !executionHoldActionIds.has(row.id)),
   ];
   for (const recovery of recoveryIssueRows as Array<{
     id: string;
@@ -4691,6 +4744,8 @@ async function listIssueReviewAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      executionRunId: issue.executionRunId,
+      executionBlocker: executionHoldByIssueId.get(issue.id) ?? null,
     })),
     relations: [],
     agents: agentRows,
@@ -4765,10 +4820,9 @@ async function listIssueReviewAttentionMap(
   );
 
   for (const issue of reviewIssues) {
-    const pathFacts = classifyIssueReviewPaths(
-      livenessInput,
-      livenessInput.issues.find((entry) => entry.id === issue.id)!,
-    );
+    const liveIssue = livenessInput.issues.find((entry) => entry.id === issue.id)!;
+    const delivery = classifyIssueReviewDelivery(livenessInput, liveIssue);
+    const pathFacts = delivery.paths;
     const paths: IssueReviewAttentionPath[] = pathFacts.map((path) => {
       const interactionAudience =
         path.kind === "interaction" && path.ref
@@ -4814,6 +4868,28 @@ async function listIssueReviewAttentionMap(
         ref: path.ref,
       };
     });
+    const deliveryFailures: IssueReviewDeliveryFailure[] = delivery.failures.map(
+      (failure) => ({
+        kind: failure.kind,
+        reason: failure.reason,
+        ref: failure.ref,
+        responder: failure.responderAgentId
+          ? (agentNameById.get(failure.responderAgentId) ?? failure.responderAgentId)
+          : null,
+      }),
+    );
+    const hold: IssueReviewHold | null = delivery.hold
+      ? {
+          recoveryActionId: delivery.hold.recoveryActionId,
+          runId: delivery.hold.runId,
+          cause: delivery.hold.cause,
+          reason: "held: execution reconciliation needed",
+        }
+      : null;
+    const extras = {
+      ...(deliveryFailures.length > 0 ? { deliveryFailures } : {}),
+      ...(hold ? { hold } : {}),
+    };
 
     if (paths.length > 0) {
       result.set(issue.id, {
@@ -4823,6 +4899,17 @@ async function listIssueReviewAttentionMap(
           paths.length === 1
             ? "Review has a maintained action path."
             : `Review has ${paths.length} maintained action paths.`,
+        ...extras,
+      });
+      continue;
+    }
+
+    if (hold) {
+      result.set(issue.id, {
+        state: "held",
+        paths: [],
+        reason: `${hold.reason}${hold.recoveryActionId ? ` (recovery action ${hold.recoveryActionId})` : ""}. Wakes on this issue wait until someone records a reconciliation.`,
+        ...extras,
       });
       continue;
     }
@@ -4834,6 +4921,7 @@ async function listIssueReviewAttentionMap(
       reason:
         finding?.reason ??
         "Issue is in review without a maintained action path.",
+      ...extras,
     });
   }
 

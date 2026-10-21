@@ -193,7 +193,7 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-wake-diagnostics-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
@@ -279,6 +279,39 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(res.status).toBe(200);
     expect(res.body.events).toMatchObject([{ reason, status: "deferred_issue_execution", source: "automation" }]);
     expect(JSON.stringify(res.body)).not.toContain("PRIVATE_DELIVERY_ID");
+  });
+
+  it.each([
+    "issue_state_guard_mismatch",
+    "issue_rewake_throttled",
+    "execution_reconciliation_required",
+    "execution_review_requested",
+    "execution_approval_requested",
+    "issue_execution_deferred",
+  ])("AC6: returns the real %s reason instead of other", async reason => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, { companyId: company.id, title: "Reason target", assigneeAgentId: agent.id });
+    await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+      source: "automation", reason, status: "skipped", finishedAt: new Date(),
+      payload: { issueId: issue.id, heartbeatSkip: { reason: "PRIVATE_SKIP_DETAIL" } } });
+    const res = await request(createApp(db, boardActor(company))).get(`/api/issues/${issue.id}/diagnostics/wakes`);
+    expect(res.status).toBe(200);
+    expect(res.body.events).toMatchObject([{ reason, status: "skipped" }]);
+    expect(JSON.stringify(res.body)).not.toContain("PRIVATE_SKIP_DETAIL");
+  });
+
+  it("AC6: an unknown reason still maps to other and is not echoed", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, { companyId: company.id, title: "Unknown reason", assigneeAgentId: agent.id });
+    await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+      source: "automation", reason: "PRIVATE_FREE_TEXT_REASON", status: "skipped", finishedAt: new Date(),
+      payload: { issueId: issue.id } });
+    const res = await request(createApp(db, boardActor(company))).get(`/api/issues/${issue.id}/diagnostics/wakes`);
+    expect(res.status).toBe(200);
+    expect(res.body.events).toMatchObject([{ reason: "other" }]);
+    expect(JSON.stringify(res.body)).not.toContain("PRIVATE_FREE_TEXT_REASON");
   });
 
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {

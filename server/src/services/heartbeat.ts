@@ -10762,6 +10762,163 @@ export function heartbeatService(
     return { resumed };
   }
 
+  /**
+   * Deferred wakes are normally promoted when the lock holder releases. A wake
+   * written after that release (the HYBA-1916 assignment wake landed 0.25 s
+   * after the previous run was cancelled), or one whose release path failed,
+   * has no later trigger. This sweep gives every such row, whatever its
+   * payload (assignment, stage, agent comment), the same admission a fresh wake
+   * gets, and closes rows a newer wake has made redundant. It adds no timer:
+   * it runs inside the existing resumeQueuedRuns tick.
+   */
+  async function resumeDeferredIssueWakes(scope?: { companyId: string; issueId: string }) {
+    const outcome = { resumed: 0, cancelled: 0, closedSuperseded: 0 };
+    if ((await getSchedulingSuppression()).suppressed) return outcome;
+    const cutoff = await getWorktreeExecutionCutoff();
+    const issueIdSql = sql<string>`${agentWakeupRequests.payload}->>'issueId'`;
+    const sweepable = and(
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+      sql`${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId' is null`,
+      sql`not coalesce(${agentWakeupRequests.requestedByActorType} = 'user' and (
+        (jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'
+          and ${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb)
+        or ${agentWakeupRequests.payload}->>'mutation' = 'interaction'), false)`,
+      scope ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
+      scope ? sql`${issueIdSql} = ${scope.issueId}` : undefined,
+      cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
+    );
+
+    // AC4: a newer wake for the same agent and issue already ran, so the
+    // older deferred row is redundant. Close it with the run that superseded it.
+    const supersededBy = sql<string | null>`(
+      select n.run_id from agent_wakeup_requests n
+      join heartbeat_runs r on r.id = n.run_id and r.company_id = n.company_id
+      where n.company_id = ${agentWakeupRequests.companyId}
+        and n.agent_id = ${agentWakeupRequests.agentId}
+        and n.payload->>'issueId' = ${agentWakeupRequests.payload}->>'issueId'
+        and n.id <> ${agentWakeupRequests.id}
+        and n.requested_at > ${agentWakeupRequests.requestedAt}
+        and (r.started_at is not null or r.status in ('succeeded', 'failed', 'timed_out', 'interrupted'))
+      order by n.requested_at desc limit 1)`;
+    const redundant = await db
+      .select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId, runId: supersededBy })
+      .from(agentWakeupRequests)
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(sweepable, sql`${supersededBy} is not null`))
+      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .limit(200);
+    for (const row of redundant) {
+      const now = new Date();
+      const [closed] = await db.update(agentWakeupRequests).set({
+        status: "coalesced",
+        runId: row.runId,
+        finishedAt: now,
+        updatedAt: now,
+        error: `Superseded by a newer wake that already ran as run ${row.runId}`,
+      }).where(and(
+        eq(agentWakeupRequests.id, row.id),
+        eq(agentWakeupRequests.companyId, row.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      )).returning({ id: agentWakeupRequests.id });
+      if (closed) outcome.closedSuperseded += 1;
+    }
+
+    // AC3: promote what nobody revisited. Only rows whose issue lock is free,
+    // and only for the issue's current agent assignee.
+    const candidates = await db.select({ wake: agentWakeupRequests, issue: issues })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(
+        eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${issueIdSql}`,
+      ))
+      .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
+      .where(and(sweepable, isNull(issues.executionRunId)))
+      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .limit(200);
+    const handledIssues = new Set<string>();
+    for (const { wake, issue } of candidates) {
+      if (handledIssues.has(issue.id)) continue;
+      const liveStage = isExecutionStageWakeReason(wake.reason);
+      if (["done", "cancelled"].includes(issue.status)) continue;
+      const wakeStageId = readNonEmptyString(parseObject(parseObject(wake.payload).executionStage).stageId);
+      const issueStageId = readNonEmptyString(parseObject(issue.executionState).currentStageId);
+      const stageMovedOn = liveStage && wakeStageId !== null && wakeStageId !== issueStageId;
+      if (issue.assigneeAgentId !== wake.agentId || issue.assigneeUserId || stageMovedOn) {
+        if (liveStage) {
+          const [dropped] = await db.update(agentWakeupRequests).set({
+            status: "cancelled", finishedAt: new Date(), updatedAt: new Date(),
+            error: "Execution stage moved on before the deferred wake could start",
+          }).where(and(eq(agentWakeupRequests.id, wake.id),
+            eq(agentWakeupRequests.status, "deferred_issue_execution")))
+            .returning({ id: agentWakeupRequests.id });
+          if (dropped) outcome.cancelled += 1;
+        }
+        continue;
+      }
+      if (await getExecutionBlocker(db, wake.companyId, issue.id)) continue;
+      const [liveRun] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, wake.companyId),
+        eq(heartbeatRuns.agentId, wake.agentId),
+        or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+        inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+      )).limit(1);
+      if (liveRun) continue;
+      const [latest] = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, wake.companyId),
+        eq(heartbeatRuns.agentId, wake.agentId),
+        or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      const stopped = latest && latest.status === "cancelled" && (
+        parseObject(latest.resultJson?.executionCancellation).state === "acknowledged" ||
+        isAcknowledgedNativeStop(latest) || hasAcknowledgedNativeReassignmentStopIntent(latest));
+      const stoppedAfterWake = stopped &&
+        (latest.finishedAt ?? latest.createdAt).getTime() >= wake.requestedAt.getTime();
+      if (stoppedAfterWake) continue;
+
+      handledIssues.add(issue.id);
+      const [claimed] = await db.update(agentWakeupRequests).set({
+        status: "coalesced", finishedAt: new Date(), updatedAt: new Date(),
+      }).where(and(eq(agentWakeupRequests.id, wake.id),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))
+        .returning({ id: agentWakeupRequests.id });
+      if (!claimed) continue;
+      const payload = { ...parseObject(wake.payload) };
+      const contextSnapshot = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+      delete payload[DEFERRED_WAKE_CONTEXT_KEY];
+      delete payload.executionWait;
+      try {
+        const run = await enqueueWakeup(wake.agentId, {
+          source: (wake.source as WakeupOptions["source"]) ?? "automation",
+          triggerDetail: (wake.triggerDetail as WakeupOptions["triggerDetail"]) ?? "system",
+          reason: wake.reason,
+          payload,
+          contextSnapshot,
+          requestedByActorType: (wake.requestedByActorType as WakeupOptions["requestedByActorType"]) ?? undefined,
+          requestedByActorId: wake.requestedByActorId,
+          idempotencyKey: wake.idempotencyKey,
+          issueStateGuard: { assigneeAgentId: wake.agentId, statuses: [issue.status] },
+        });
+        if (run) {
+          outcome.resumed += 1;
+          await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
+            .where(eq(agentWakeupRequests.id, wake.id));
+        } else {
+          await db.update(agentWakeupRequests).set({
+            updatedAt: new Date(),
+            error: "Deferred wake was re-admitted by the sweep but admission declined to start a run; see the newer wake row for the reason",
+          }).where(eq(agentWakeupRequests.id, wake.id));
+        }
+      } catch (err) {
+        await db.update(agentWakeupRequests).set({
+          status: "deferred_issue_execution", finishedAt: null, updatedAt: new Date(),
+        }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "coalesced")));
+        logger.warn({ err, wakeId: wake.id }, "failed to resume deferred issue wake");
+      }
+    }
+    return outcome;
+  }
+
   async function resumeExecutionWaitComments() {
     if ((await getSchedulingSuppression()).suppressed) return;
     const waits = await db.select({ wake: agentWakeupRequests })
@@ -13103,6 +13260,7 @@ export function heartbeatService(
             .then((rows) => rows[0] ?? null);
 
     if (updated) {
+      await closeClaimedWakeForTerminalRun(updated);
       publishLiveEvent({
         companyId: updated.companyId,
         type: "heartbeat.run.status",
@@ -13202,6 +13360,7 @@ export function heartbeatService(
             .then((rows) => rows[0] ?? null);
 
     if (updated) {
+      await closeClaimedWakeForTerminalRun(updated);
       publishLiveEvent({
         companyId: updated.companyId,
         type: "heartbeat.run.status",
@@ -13386,6 +13545,42 @@ export function heartbeatService(
       // Reassignment revokes requests transactionally. Late execution settlement
       // must not turn a revoked request back into authority for a later retry.
       .where(and(eq(agentWakeupRequests.id, wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
+  }
+
+  // A terminal run can never finish a wake row still marked claimed. Close it
+  // here, from the one place every terminal status write passes through, so the
+  // row stops reading as a live delivery path. Rows another path already moved
+  // (cancelled by reassignment, completed, failed) are left alone.
+  async function closeClaimedWakeForTerminalRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "wakeupRequestId" | "errorCode" | "error">,
+  ) {
+    if (!run.wakeupRequestId || !isHeartbeatRunTerminalStatus(run.status)) return;
+    const status =
+      run.status === "succeeded"
+        ? "completed"
+        : run.status === "cancelled"
+          ? "cancelled"
+          : "failed";
+    const detail = run.errorCode ?? run.error ?? run.status;
+    const now = new Date();
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status,
+        finishedAt: now,
+        updatedAt: now,
+        ...(status === "completed" ? {} : { error: `Run ${run.id} ended ${run.status} (${detail}) before the wake finished` }),
+      })
+      .where(
+        and(
+          eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.status, "claimed"),
+        ),
+      )
+      .catch((err) => {
+        logger.warn({ err, runId: run.id }, "failed to close claimed wake row for terminal run");
+      });
   }
 
   async function addContinuationExhaustedCommentOnce(input: {
@@ -19844,6 +20039,10 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to promote stranded legacy comments");
       });
     }
+
+    await resumeDeferredIssueWakes().catch((err) => {
+      logger.warn({ err }, "failed to resume deferred issue wakes");
+    });
 
     // The cancellation marker is durable intent. Retry while its exact queue
     // is still deferred, including after a failed cleanup promotion or restart.
@@ -30586,6 +30785,7 @@ export function heartbeatService(
 
     resumeQueuedRuns,
     resumeExecutionStageWaits,
+    resumeDeferredIssueWakes,
 
     scheduleBoundedRetry: async (
       runId: string,
