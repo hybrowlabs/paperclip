@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { classifyIssueGraphLiveness } from "../services/issue-liveness.ts";
+import { classifyIssueReviewDelivery } from "../services/recovery/issue-graph-liveness.ts";
 
 const companyId = "company-1";
 const managerId = "manager-1";
@@ -472,7 +473,7 @@ describe("issue graph liveness classifier", () => {
 
     const cases = [
       {
-        name: "typed agent participant",
+        name: "typed agent participant with a fresh wake",
         issue: {
           ...baseReviewIssue,
           executionState: {
@@ -480,6 +481,9 @@ describe("issue graph liveness classifier", () => {
             currentParticipant: { type: "agent", agentId: coderId },
           },
         },
+        queuedWakeRequests: [
+          { companyId, issueId: reviewIssueId, agentId: coderId, status: "queued", createdAt: new Date() },
+        ],
       },
       {
         name: "typed user participant",
@@ -626,5 +630,159 @@ describe("issue graph liveness classifier", () => {
       state: "in_review_without_action_path",
       recoveryIssueId: reviewIssueId,
     });
+  });
+});
+
+describe("review delivery paths (HYBA-2946)", () => {
+  const reviewIssueId = "review-1";
+  const now = new Date("2026-10-21T15:00:00.000Z");
+  const minutesAgo = (minutes: number) => new Date(now.getTime() - minutes * 60_000);
+  const participantState = {
+    status: "pending",
+    currentParticipant: { type: "agent", agentId: coderId },
+  };
+
+  function reviewIssue(overrides: Record<string, unknown> = {}) {
+    return issue({
+      id: reviewIssueId,
+      identifier: "PAP-2946",
+      title: "Review delivery",
+      status: "in_review",
+      assigneeAgentId: coderId,
+      executionState: participantState,
+      executionRunId: null,
+      ...overrides,
+    });
+  }
+
+  function classify(
+    reviewOverrides: Record<string, unknown>,
+    extra: Record<string, unknown> = {},
+  ) {
+    const input = {
+      issues: [reviewIssue(reviewOverrides)],
+      relations: [],
+      agents: [agent(), manager],
+      now,
+      ...extra,
+    };
+    return {
+      findings: classifyIssueGraphLiveness(input as never),
+      delivery: classifyIssueReviewDelivery(input as never, input.issues[0] as never),
+    };
+  }
+
+  it("AC1: a participant with no second live path is stalled with a named reason", () => {
+    const { findings, delivery } = classify({});
+    expect(delivery.paths).toEqual([]);
+    expect(delivery.failures).toEqual([
+      expect.objectContaining({ kind: "participant_without_delivery_path", responderAgentId: coderId }),
+    ]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ state: "in_review_without_action_path", issueId: reviewIssueId });
+    expect(findings[0]?.reason).toContain("participant named, no delivery path");
+  });
+
+  it.each([
+    ["an active run", { activeRuns: [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "running" }] }],
+    ["a fresh queued wake", { queuedWakeRequests: [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "queued", createdAt: minutesAgo(5) }] }],
+    ["a fresh deferred wake", { queuedWakeRequests: [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "deferred_issue_execution", createdAt: minutesAgo(5) }] }],
+    ["a pending interaction", { pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending" }] }],
+    ["a pending approval", { pendingApprovals: [{ companyId, issueId: reviewIssueId, status: "pending" }] }],
+  ])("AC1: a participant covered by %s is not flagged", (_name, extra) => {
+    const { findings, delivery } = classify({}, extra);
+    expect(findings).toEqual([]);
+    expect(delivery.paths.map((path) => path.kind)).toContain("execution_participant");
+  });
+
+  it("AC1: an armed monitor or a human reviewer is a second live path", () => {
+    const monitor = classify({
+      monitorNextCheckAt: new Date(now.getTime() + 60_000),
+      executionPolicy: { monitor: { maxAttempts: 3 } },
+    });
+    expect(monitor.findings).toEqual([]);
+    expect(monitor.delivery.paths.map((path) => path.kind)).toEqual(expect.arrayContaining(["monitor", "execution_participant"]));
+    const human = classify({ assigneeAgentId: null, assigneeUserId: "board-user" });
+    expect(human.findings).toEqual([]);
+  });
+
+  it("AC1: a wake that belongs to a different agent is not a delivery path for the participant", () => {
+    const { findings } = classify({}, {
+      queuedWakeRequests: [{ companyId, issueId: reviewIssueId, agentId: managerId, status: "queued", createdAt: minutesAgo(1) }],
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.reason).toContain("participant named, no delivery path");
+  });
+
+  it("AC1: a participant wake older than the bound is not a delivery path", () => {
+    const { findings } = classify({}, {
+      queuedWakeRequests: [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "queued", createdAt: minutesAgo(90) }],
+    });
+    expect(findings).toHaveLength(1);
+  });
+
+  it("AC2b: an orphaned deferred wake older than the bound stops counting as coverage", () => {
+    const stale = [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "deferred_issue_execution", createdAt: minutesAgo(312 * 60), runId: null }];
+    const { findings, delivery } = classify({ executionState: null }, { queuedWakeRequests: stale });
+    expect(delivery.paths).toEqual([]);
+    expect(delivery.failures).toEqual([expect.objectContaining({ kind: "stale_deferred_wake" })]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ state: "in_review_without_action_path" });
+  });
+
+  it("AC2b: a deferred wake waiting behind a live execution lock still counts, whatever its age", () => {
+    const waiting = [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "deferred_issue_execution", createdAt: minutesAgo(600), runId: null }];
+    const { findings, delivery } = classify({ executionState: null, executionRunId: "run-live" }, { queuedWakeRequests: waiting });
+    expect(findings).toEqual([]);
+    expect(delivery.paths.map((path) => path.kind)).toEqual(["queued_wake"]);
+  });
+
+  it("AC2b: the age bound is configurable", () => {
+    const wakes = [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "deferred_issue_execution", createdAt: minutesAgo(10), runId: null }];
+    const tight = classify({ executionState: null }, { queuedWakeRequests: wakes, wakeMaxAgeMs: 5 * 60_000 });
+    expect(tight.findings).toHaveLength(1);
+    const loose = classify({ executionState: null }, { queuedWakeRequests: wakes, wakeMaxAgeMs: 60 * 60_000 });
+    expect(loose.findings).toEqual([]);
+  });
+
+  it("AC2c: a claimed wake whose run is terminal is a delivery failure, not coverage", () => {
+    const claimed = [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "claimed", createdAt: minutesAgo(77 * 60), runId: "run-dead", runStatus: "failed" }];
+    const { findings, delivery } = classify({ executionState: null }, { queuedWakeRequests: claimed });
+    expect(delivery.failures).toEqual([expect.objectContaining({ kind: "claimed_wake_terminal_run", ref: null })]);
+    expect(findings).toHaveLength(1);
+    const live = classify({ executionState: null }, {
+      queuedWakeRequests: [{ ...claimed[0]!, runStatus: "running" }],
+    });
+    expect(live.findings).toEqual([]);
+  });
+
+  it("AC2a: an execution hold is reported as held, never as covered, and wakes do not count", () => {
+    const hold = { recoveryActionId: "action-1", runId: "run-9", cause: "legacy_execution_requires_reconciliation" };
+    const wakes = Array.from({ length: 7 }, () => ({
+      companyId, issueId: reviewIssueId, agentId: coderId, status: "deferred_issue_execution", createdAt: minutesAgo(2), runId: null,
+    }));
+    const { findings, delivery } = classify({ executionBlocker: hold }, { queuedWakeRequests: wakes });
+    expect(delivery.paths).toEqual([]);
+    expect(delivery.hold).toEqual(hold);
+    expect(delivery.failures).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "execution_blocker_hold", ref: "action-1" })]));
+    expect(findings).toEqual([]);
+  });
+
+  it("AC2a: a hold does not hide a human reviewer or a pending interaction", () => {
+    const hold = { recoveryActionId: "action-1", runId: null, cause: "uncertain_provider_action" };
+    const human = classify({ executionBlocker: hold, executionState: null, assigneeAgentId: null, assigneeUserId: "board-user" });
+    expect(human.delivery.hold).toEqual(hold);
+    expect(human.delivery.paths.map((path) => path.kind)).toEqual(["human_reviewer"]);
+    const interaction = classify({ executionBlocker: hold, executionState: null }, {
+      pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending" }],
+    });
+    expect(interaction.delivery.paths.map((path) => path.kind)).toEqual(["interaction"]);
+  });
+
+  it("a user participant stays a path on its own", () => {
+    const { findings } = classify({
+      executionState: { status: "pending", currentParticipant: { type: "user", userId: "board-user-1" } },
+    });
+    expect(findings).toEqual([]);
   });
 });

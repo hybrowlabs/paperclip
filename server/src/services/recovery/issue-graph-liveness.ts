@@ -31,6 +31,14 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  executionRunId?: string | null;
+  executionBlocker?: IssueLivenessExecutionHold | null;
+}
+
+export interface IssueLivenessExecutionHold {
+  recoveryActionId: string | null;
+  runId: string | null;
+  cause: string;
 }
 
 export interface IssueLivenessRelationInput {
@@ -56,6 +64,8 @@ export interface IssueLivenessExecutionPathInput {
   agentId?: string | null;
   status: string;
   createdAt?: Date | string | null;
+  runId?: string | null;
+  runStatus?: string | null;
 }
 
 export interface IssueLivenessWaitingPathInput {
@@ -83,6 +93,31 @@ export interface IssueReviewPathFact {
   userId: string | null;
   since: Date | string | null;
 }
+
+export type IssueReviewDeliveryFailureKind =
+  | "participant_without_delivery_path"
+  | "execution_blocker_hold"
+  | "stale_deferred_wake"
+  | "stale_wake"
+  | "claimed_wake_terminal_run";
+
+export interface IssueReviewDeliveryFailureFact {
+  kind: IssueReviewDeliveryFailureKind;
+  reason: string;
+  ref: string | null;
+  responderAgentId: string | null;
+}
+
+export interface IssueReviewDeliveryFacts {
+  paths: IssueReviewPathFact[];
+  failures: IssueReviewDeliveryFailureFact[];
+  hold: IssueLivenessExecutionHold | null;
+}
+
+/** A wake row older than this, with no run and no lock holder, no longer counts as a delivery path. */
+export const DEFAULT_REVIEW_WAKE_MAX_AGE_MS = 30 * 60_000;
+
+const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
 
 export interface IssueLivenessDependencyPathEntry {
   issueId: string;
@@ -130,6 +165,7 @@ export interface IssueGraphLivenessInput {
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
   now?: Date | string;
+  wakeMaxAgeMs?: number;
 }
 
 function issueLabel(issue: IssueLivenessIssueInput) {
@@ -153,14 +189,64 @@ function isInvokableAgent(
 }
 
 function hasActiveExecutionPath(
-  companyId: string,
-  issueId: string,
-  activeRuns: IssueLivenessExecutionPathInput[],
-  queuedWakeRequests: IssueLivenessExecutionPathInput[],
+  issue: IssueLivenessIssueInput,
+  input: IssueGraphLivenessInput,
 ) {
-  return [...activeRuns, ...queuedWakeRequests].some(
-    (entry) => entry.companyId === companyId && entry.issueId === issueId,
+  const matches = (entry: IssueLivenessExecutionPathInput) =>
+    entry.companyId === issue.companyId && entry.issueId === issue.id;
+  if ((input.activeRuns ?? []).some(matches)) return true;
+  const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
+  return (input.queuedWakeRequests ?? []).some(
+    (entry) => matches(entry) && evaluateWake(entry, issue, nowMs, input.wakeMaxAgeMs).live,
   );
+}
+
+type WakeEvaluation =
+  | { live: true }
+  | { live: false; failure: IssueReviewDeliveryFailureFact | null };
+
+function evaluateWake(
+  entry: IssueLivenessExecutionPathInput,
+  issue: IssueLivenessIssueInput,
+  nowMs: number,
+  maxAgeMs: number | undefined,
+): WakeEvaluation {
+  if (issue.executionBlocker) return { live: false, failure: null };
+  const responderAgentId = entry.agentId ?? null;
+  if (entry.status === "claimed") {
+    if (entry.runStatus && TERMINAL_RUN_STATUSES.has(entry.runStatus)) {
+      return {
+        live: false,
+        failure: {
+          kind: "claimed_wake_terminal_run",
+          reason: `A claimed wake points at run ${entry.runId ?? "(unknown)"}, which is ${entry.runStatus}. Nothing will finish it.`,
+          ref: entry.id ?? null,
+          responderAgentId,
+        },
+      };
+    }
+    return { live: true };
+  }
+  const queuedOrDeferred = entry.status === "queued" || entry.status === "deferred_issue_execution";
+  if (queuedOrDeferred && !entry.runId && !issue.executionRunId) {
+    const createdMs = readDateMs(entry.createdAt);
+    const bound = maxAgeMs ?? DEFAULT_REVIEW_WAKE_MAX_AGE_MS;
+    if (createdMs !== null && nowMs - createdMs > bound) {
+      const deferred = entry.status === "deferred_issue_execution";
+      return {
+        live: false,
+        failure: {
+          kind: deferred ? "stale_deferred_wake" : "stale_wake",
+          reason: deferred
+            ? "A deferred wake has no run, the issue lock is free and it is older than the delivery bound. Nothing will promote it."
+            : "A queued wake has no run and is older than the delivery bound.",
+          ref: entry.id ?? null,
+          responderAgentId,
+        },
+      };
+    }
+  }
+  return { live: true };
 }
 
 function hasWaitingPath(
@@ -215,16 +301,28 @@ export function classifyIssueReviewPaths(
   input: IssueGraphLivenessInput,
   issue: IssueLivenessIssueInput,
 ): IssueReviewPathFact[] {
-  if (issue.status !== "in_review") return [];
+  return classifyIssueReviewDelivery(input, issue).paths;
+}
+
+export function classifyIssueReviewDelivery(
+  input: IssueGraphLivenessInput,
+  issue: IssueLivenessIssueInput,
+): IssueReviewDeliveryFacts {
+  const hold = issue.executionBlocker ?? null;
+  const facts: IssueReviewDeliveryFacts = { paths: [], failures: [], hold };
+  if (issue.status !== "in_review") return facts;
   const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
-  const paths: IssueReviewPathFact[] = [];
   if (issue.conversationAgentId && issue.conversationUserId && issue.conversationState === "waiting") {
-    return [{ kind: "human_reviewer", ref: issue.conversationUserId, userId: issue.conversationUserId, agentId: null, since: null }];
+    facts.paths = [{ kind: "human_reviewer", ref: issue.conversationUserId, userId: issue.conversationUserId, agentId: null, since: null }];
+    return facts;
   }
 
+  const supporting: IssueReviewPathFact[] = [];
+  const wakes: IssueReviewPathFact[] = [];
+
   if (issue.assigneeUserId) {
-    paths.push({
+    supporting.push({
       kind: "human_reviewer",
       ref: issue.assigneeUserId,
       agentId: null,
@@ -233,53 +331,36 @@ export function classifyIssueReviewPaths(
     });
   }
 
-  const participant = issue.executionState?.status === "pending"
-    ? issue.executionState.currentParticipant
-    : null;
-  const participantAgentId = readPrincipalAgentId(participant);
-  if (participantAgentId) {
-    const participantAgent = agentsById.get(participantAgentId);
-    if (participantAgent?.companyId === issue.companyId && isInvokableAgent(participantAgent, agentsById)) {
-      paths.push({
-        kind: "execution_participant",
-        ref: participantAgentId,
-        agentId: participantAgentId,
-        userId: null,
-        since: null,
-      });
-    }
-  } else if (principalIsResolvableUser(participant)) {
-    const userId = (participant as Record<string, unknown>).userId as string;
-    paths.push({
-      kind: "execution_participant",
-      ref: userId,
-      agentId: null,
-      userId,
-      since: null,
+  if (hasScheduledIssueMonitorPath(issue, nowMs)) {
+    supporting.push({ kind: "monitor", ref: null, agentId: issue.assigneeAgentId ?? null, userId: null, since: null });
+  }
+
+  for (const entry of input.activeRuns ?? []) {
+    if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
+    supporting.push({
+      kind: "active_run",
+      ref: entry.id ?? null,
+      agentId: entry.agentId ?? null,
+      userId: null,
+      since: entry.createdAt ?? null,
     });
   }
 
-  if (hasScheduledIssueMonitorPath(issue, nowMs)) {
-    paths.push({ kind: "monitor", ref: null, agentId: issue.assigneeAgentId ?? null, userId: null, since: null });
-  }
-
-  const appendExecutionPaths = (
-    entries: IssueLivenessExecutionPathInput[],
-    kind: "active_run" | "queued_wake",
-  ) => {
-    for (const entry of entries) {
-      if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
-      paths.push({
-        kind,
-        ref: entry.id ?? null,
-        agentId: entry.agentId ?? null,
-        userId: null,
-        since: entry.createdAt ?? null,
-      });
+  for (const entry of input.queuedWakeRequests ?? []) {
+    if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
+    const evaluation = evaluateWake(entry, issue, nowMs, input.wakeMaxAgeMs);
+    if (!evaluation.live) {
+      if (evaluation.failure) facts.failures.push(evaluation.failure);
+      continue;
     }
-  };
-  appendExecutionPaths(input.activeRuns ?? [], "active_run");
-  appendExecutionPaths(input.queuedWakeRequests ?? [], "queued_wake");
+    wakes.push({
+      kind: "queued_wake",
+      ref: entry.id ?? null,
+      agentId: entry.agentId ?? null,
+      userId: null,
+      since: entry.createdAt ?? null,
+    });
+  }
 
   const appendWaitingPaths = (
     entries: IssueLivenessWaitingPathInput[],
@@ -287,7 +368,7 @@ export function classifyIssueReviewPaths(
   ) => {
     for (const entry of entries) {
       if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
-      paths.push({
+      supporting.push({
         kind,
         ref: entry.id ?? null,
         agentId: null,
@@ -300,7 +381,60 @@ export function classifyIssueReviewPaths(
   appendWaitingPaths(input.pendingApprovals ?? [], "approval");
   appendWaitingPaths(input.openRecoveryIssues ?? [], "recovery");
 
-  return paths;
+  if (hold) {
+    facts.failures.unshift({
+      kind: "execution_blocker_hold",
+      reason: "held: execution reconciliation needed",
+      ref: hold.recoveryActionId,
+      responderAgentId: null,
+    });
+  }
+
+  const participant = issue.executionState?.status === "pending"
+    ? issue.executionState.currentParticipant
+    : null;
+  const participantAgentId = readPrincipalAgentId(participant);
+  if (participantAgentId) {
+    const participantAgent = agentsById.get(participantAgentId);
+    if (participantAgent?.companyId === issue.companyId && isInvokableAgent(participantAgent, agentsById)) {
+      const participantWakes = wakes.filter((wake) => wake.agentId === participantAgentId);
+      const delivered = [...supporting, ...participantWakes];
+      if (delivered.length === 0) {
+        facts.failures.push({
+          kind: "participant_without_delivery_path",
+          reason: "participant named, no delivery path",
+          ref: participantAgentId,
+          responderAgentId: participantAgentId,
+        });
+        return facts;
+      }
+      facts.paths = [
+        {
+          kind: "execution_participant",
+          ref: participantAgentId,
+          agentId: participantAgentId,
+          userId: null,
+          since: null,
+        },
+        ...delivered,
+      ];
+      return facts;
+    }
+    facts.paths = [...supporting, ...wakes];
+    return facts;
+  }
+  if (principalIsResolvableUser(participant)) {
+    const userId = (participant as Record<string, unknown>).userId as string;
+    facts.paths = [
+      { kind: "execution_participant", ref: userId, agentId: null, userId, since: null },
+      ...supporting,
+      ...wakes,
+    ];
+    return facts;
+  }
+
+  facts.paths = [...supporting, ...wakes];
+  return facts;
 }
 
 function readPrincipalAgentId(principal: unknown): string | null {
@@ -481,8 +615,6 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const blockersByBlockedIssueId = new Map<string, IssueLivenessRelationInput[]>();
   const unresolvedBlockers = new Set<string>();
   const findings: IssueLivenessFinding[] = [];
-  const activeRuns = input.activeRuns ?? [];
-  const queuedWakeRequests = input.queuedWakeRequests ?? [];
   const pendingInteractions = input.pendingInteractions ?? [];
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
@@ -520,7 +652,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
     return Boolean(issue.assigneeUserId) ||
       hasScheduledIssueMonitorPath(issue, nowMs) ||
-      hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
+      hasActiveExecutionPath(issue, input) ||
       hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
       hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
       hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
@@ -532,7 +664,9 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     dependencyPath: IssueLivenessIssueInput[],
   ): IssueLivenessFinding | null {
     if (reviewIssue.status !== "in_review") return null;
-    if (classifyIssueReviewPaths(input, reviewIssue).length > 0) return null;
+    const delivery = classifyIssueReviewDelivery(input, reviewIssue);
+    if (delivery.paths.length > 0) return null;
+    if (delivery.hold) return null;
 
     const ownerCandidates = ownerCandidatesForRecoveryIssue(reviewIssue, input.agents, agentsById, {
       includeStalledAssignee: true,
@@ -545,7 +679,23 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const participantAgentId = readPrincipalAgentId(participant);
     if (participantAgentId) {
       const participantAgent = agentsById.get(participantAgentId);
-      if (isInvokableAgent(participantAgent, agentsById) && participantAgent?.companyId === reviewIssue.companyId) return null;
+      if (isInvokableAgent(participantAgent, agentsById) && participantAgent?.companyId === reviewIssue.companyId) {
+        const failure = delivery.failures.find((entry) => entry.kind === "participant_without_delivery_path");
+        if (!failure) return null;
+        return finding({
+          issue: source,
+          state: "in_review_without_action_path",
+          reason: `${issueLabel(reviewIssue)} is in review, participant named, no delivery path: no active run, wake that can still deliver, monitor, interaction or approval reaches ${participantAgent?.name ?? participantAgentId}.`,
+          dependencyPath,
+          recoveryIssue: reviewIssue,
+          recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+          recommendedOwnerCandidates: ownerCandidates,
+          recommendedAction:
+            `Re-wake ${participantAgent?.name ?? participantAgentId} for ${issueLabel(reviewIssue)}'s current review stage, or return the issue to its maker with a clear change request.`,
+          blockerIssueId: reviewIssue.id,
+          participantAgentId,
+        });
+      }
 
       return finding({
         issue: source,

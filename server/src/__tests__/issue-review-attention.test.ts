@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agentWakeupRequests,
@@ -159,6 +160,14 @@ describeEmbeddedPostgres("issue review attention", () => {
       identifier: "RVA-6",
       executionState: { status: "pending", currentParticipant: { type: "agent", agentId } },
     });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "assignment",
+      reason: "execution_review_requested",
+      status: "queued",
+      payload: { issueId: participantIssueId },
+    });
     const activeRunIssueId = await insertReview({ companyId, agentId, identifier: "RVA-7" });
     const recoveryIssueId = await insertReview({ companyId, agentId, identifier: "RVA-8" });
 
@@ -259,5 +268,147 @@ describeEmbeddedPostgres("issue review attention", () => {
       ...baseWake,
       status: "queued",
     })).resolves.toBeDefined();
+  });
+
+  const participantState = (agentId: string) => ({
+    status: "pending",
+    currentParticipant: { type: "agent", agentId },
+  });
+  const hoursAgo = (hours: number) => new Date(Date.now() - hours * 3_600_000);
+
+  async function attention(companyId: string, issueId: string) {
+    const rows = await svc.list(companyId, { status: "in_review" });
+    return rows.find((row) => row.id === issueId)?.reviewAttention;
+  }
+
+  it("AC1: a named participant with no wake, run, monitor, interaction or approval is stalled", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({
+      companyId, agentId, identifier: "RVA-10", executionState: participantState(agentId),
+    });
+    const result = await attention(companyId, issueId);
+    expect(result).toMatchObject({ state: "stalled", paths: [] });
+    expect(result?.reason).toContain("participant named, no delivery path");
+    expect(result?.deliveryFailures).toEqual([
+      expect.objectContaining({ kind: "participant_without_delivery_path", responder: "Review Agent" }),
+    ]);
+  });
+
+  it("AC1: a fresh deferred wake for the participant keeps the review covered", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({
+      companyId, agentId, identifier: "RVA-11", executionState: participantState(agentId),
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "assignment", reason: "execution_review_requested",
+      status: "deferred_issue_execution", payload: { issueId },
+    });
+    const result = await attention(companyId, issueId);
+    expect(result?.state).toBe("covered");
+    expect(result?.paths.map((path) => path.kind)).toEqual(
+      expect.arrayContaining(["execution_participant", "queued_wake"]),
+    );
+  });
+
+  it("AC2b: an old deferred wake with no run and a free issue lock stops counting (HYBA-1916 shape)", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({
+      companyId, agentId, identifier: "RVA-12", executionState: participantState(agentId),
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "assignment", reason: "issue_assigned",
+      status: "deferred_issue_execution", payload: { issueId }, requestedAt: hoursAgo(312),
+    });
+    const result = await attention(companyId, issueId);
+    expect(result).toMatchObject({ state: "stalled", paths: [] });
+    expect(result?.deliveryFailures?.map((failure) => failure.kind)).toEqual(
+      expect.arrayContaining(["stale_deferred_wake", "participant_without_delivery_path"]),
+    );
+  });
+
+  it("AC2b: an old deferred wake still counts while a live run holds the issue lock", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({ companyId, agentId, identifier: "RVA-13" });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "running", contextSnapshot: { issueId: randomUUID() },
+    }).returning();
+    await db.update(issues).set({ executionRunId: run!.id }).where(eq(issues.id, issueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", reason: "issue_commented",
+      status: "deferred_issue_execution", payload: { issueId }, requestedAt: hoursAgo(5),
+    });
+    const result = await attention(companyId, issueId);
+    expect(result?.state).toBe("covered");
+    expect(result?.paths).toEqual([expect.objectContaining({ kind: "queued_wake" })]);
+  });
+
+  it("AC2c: a claimed wake whose run is terminal is a delivery failure (HYBA-1185 shape)", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({ companyId, agentId, identifier: "RVA-14" });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "failed", contextSnapshot: { issueId },
+    }).returning();
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", reason: "issue_commented", status: "claimed",
+      payload: { issueId }, runId: run!.id, claimedAt: hoursAgo(77), requestedAt: hoursAgo(77),
+    });
+    const result = await attention(companyId, issueId);
+    expect(result).toMatchObject({ state: "stalled", paths: [] });
+    expect(result?.deliveryFailures).toEqual([
+      expect.objectContaining({ kind: "claimed_wake_terminal_run" }),
+    ]);
+  });
+
+  it("AC2a: an execution-reconciliation hold reports held with the recovery action id, not covered", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({
+      companyId, agentId, identifier: "RVA-15", executionState: participantState(agentId),
+    });
+    const stoppedRunId = randomUUID();
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "execution_reconciliation",
+      status: "active",
+      ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `hold-${randomUUID()}`,
+      evidence: { runId: stoppedRunId },
+      nextAction: "Record a reconciliation.",
+    }).returning();
+    for (let index = 0; index < 7; index += 1) {
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "automation", reason: "issue_commented",
+        status: "deferred_issue_execution", payload: { issueId },
+      });
+    }
+    const result = await attention(companyId, issueId);
+    expect(result?.state).toBe("held");
+    expect(result?.paths).toEqual([]);
+    expect(result?.hold).toMatchObject({
+      recoveryActionId: action!.id,
+      runId: stoppedRunId,
+      cause: "legacy_execution_requires_reconciliation",
+      reason: "held: execution reconciliation needed",
+    });
+    expect(result?.reason).toContain("held: execution reconciliation needed");
+    expect(result?.reason).toContain(action!.id);
+  });
+
+  it("AC2a: a hold does not mask a pending interaction", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await insertReview({ companyId, agentId, identifier: "RVA-16" });
+    await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "execution_reconciliation", status: "active",
+      ownerType: "board", cause: "uncertain_provider_action", fingerprint: `hold-${randomUUID()}`,
+      evidence: {}, nextAction: "Record a reconciliation.",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId, issueId, kind: "request_confirmation", status: "pending",
+      continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Approve?" },
+    });
+    const result = await attention(companyId, issueId);
+    expect(result?.state).toBe("covered");
+    expect(result?.hold).toMatchObject({ cause: "uncertain_provider_action" });
   });
 });

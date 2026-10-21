@@ -727,6 +727,13 @@ function interactionVerbs(kind: string, payload: Record<string, unknown>) {
  * resolution evaluator uses, so a pre-migration row cannot read as `Anyone`
  * here while the API still treats it as `not_creator`.
  */
+function readRecoveryEvidenceRunId(evidence: unknown): string | null {
+  if (!evidence || typeof evidence !== "object") return null;
+  const record = evidence as Record<string, unknown>;
+  const value = record.runId ?? record.sourceRunId ?? record.latestRunId;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 export function interactionResolverAudience(
   row: {
     addresseeAgentId: string | null;
@@ -1426,6 +1433,8 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
               ownerUserId: recovery.ownerUserId,
               sourceIssueId: recovery.sourceIssueId,
               recoveryIssueId: recovery.recoveryIssueId,
+              sourceIdentifier: sourceIssue?.identifier ?? null,
+              runId: readRecoveryEvidenceRunId(recovery.evidence),
             },
           },
           whyNow: recovery.status === "escalated"

@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   approvals,
   assets,
@@ -92,6 +93,7 @@ describeEmbeddedPostgres("attention service", () => {
     await db.delete(documents);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -336,13 +338,22 @@ describeEmbeddedPostgres("attention service", () => {
       executionState: pendingUserExecutionState(),
       updatedAt: new Date("2026-07-09T12:06:00.000Z"),
     });
-    await insertIssue({
+    const coveredAgentReviewId = await insertIssue({
       companyId,
       identifier: "ATN-7",
       title: "Agent review excluded",
       status: "in_review",
       executionState: pendingAgentExecutionState(reviewerId),
       updatedAt: new Date("2026-07-09T12:07:00.000Z"),
+    });
+    // HYBA-2946: a named participant only counts as covered with a live delivery path.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerId,
+      source: "assignment",
+      reason: "execution_review_requested",
+      status: "queued",
+      payload: { issueId: coveredAgentReviewId },
     });
 
     const pendingApprovalId = randomUUID();
@@ -439,7 +450,7 @@ describeEmbeddedPostgres("attention service", () => {
         ownerUserId: null,
         cause: "missing_disposition",
         fingerprint: "human-recovery",
-        evidence: {},
+        evidence: { runId: "11111111-2222-4333-8444-555555555555" },
         nextAction: "Choose the final disposition.",
         createdAt: new Date("2026-07-09T12:05:00.000Z"),
         updatedAt: new Date("2026-07-09T12:05:00.000Z"),
@@ -650,6 +661,11 @@ describeEmbeddedPostgres("attention service", () => {
       expect(item.decisionVerbs.length).toBeGreaterThan(0);
       expect(item.rank).toBeGreaterThan(0);
     }
+    const recoveryItem = feed.items.find((item) => item.sourceKind === "recovery_action");
+    expect(recoveryItem?.subject.metadata).toMatchObject({
+      sourceIssueId: recoverySourceIssueId,
+      runId: "11111111-2222-4333-8444-555555555555",
+    });
     expect(feed.items.some((item) => item.subject.title === "Revision requested")).toBe(false);
     expect(feed.items.some((item) => item.sourceKind === "productivity_review")).toBe(false);
     expect(feed.items.some((item) => item.subject.title === "Agent productivity review excluded")).toBe(false);
