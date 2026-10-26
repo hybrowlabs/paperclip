@@ -73,11 +73,25 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   const saved = savedIds.length ? await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     inArray(issueComments.id, savedIds), eq(issueComments.authorType, "user"), sql`${issueComments.deletedAt} is null`,
-    sql`not exists (select 1 from ${heartbeatRuns} consumed where consumed.company_id = ${companyId}
-      and consumed.context_snapshot->>'issueId' = ${issueId}
-      and not (consumed.status = 'cancelled' and consumed.started_at is null)
-      and (consumed.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text
-        or consumed.context_snapshot->'wakeCommentIds' @> jsonb_build_array(${issueComments.id}::text)))`,
+    // Extract each run snapshot once; repeated JSON checks detoast it for every queued comment.
+    sql`${issueComments.id}::text not in (
+      with consumed as materialized (
+        select context_snapshot->>'wakeCommentId' as single_id,
+          context_snapshot->'wakeCommentIds' as ids
+        from ${heartbeatRuns}
+        where company_id = ${companyId}
+          and context_snapshot->>'issueId' = ${issueId}
+          and not (status = 'cancelled' and started_at is null)
+      ), comment_ids as (
+        select single_id as id from consumed
+        union all
+        select element #>> '{}' as id from consumed,
+          lateral jsonb_array_elements(case when jsonb_typeof(ids) = 'array'
+            then ids else '[]'::jsonb end) as elements(element)
+        where jsonb_typeof(element) = 'string'
+      )
+      select id from comment_ids where id is not null
+    )`,
   )) : [];
   const cancellation = run ? readRunCancellation(run.resultJson) : null;
   const eligibleContinuation = Boolean(run && conversation?.assigneeAgentId === run.agentId &&
