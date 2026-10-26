@@ -375,6 +375,25 @@ The plugin runtime tracks plugin-owned database namespaces and migrations in `pl
 
 ## Backups
 
+### Comment-consumption lookup regression
+
+Execution blocker checks materialize the issue's consumed comment IDs once per
+query. This avoids decompressing large run context snapshots for every queued
+comment. Company and issue filters remain inside the materialized query.
+Cancelled runs that never started do not consume comments. Null IDs are excluded
+before the `NOT IN` comparison, and malformed non-array comment lists are ignored.
+
+Run the PostgreSQL semantic regression with:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/comment-consumption-equivalence.sql
+```
+
+The test uses a temporary table and rolls back its transaction. It covers scalar
+and array references, cancellation, tenant boundaries, nulls, duplicate runs,
+and malformed JSON values. Query-plan validation should also use representative
+run histories; small fixtures do not reproduce large JSON decompression costs.
+
 Paperclip supports automatic and manual logical database backups. These dumps include
 non-system database schemas such as `public`, the Drizzle migration journal, and
 plugin-owned database schemas. See `doc/DEVELOPING.md` for the current
